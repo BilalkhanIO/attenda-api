@@ -1,0 +1,228 @@
+// @ts-nocheck
+import { Router } from 'express';
+import { authenticate, requireRole } from '../middleware/auth';
+import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
+import { calculateWorkingDays } from '../utils/auth';
+import prisma from '../utils/prisma';
+
+const router = Router();
+router.use(authenticate);
+
+const LEAVE_INCLUDE = {
+  user: { select: { id: true, name: true, avatar_url: true, department: true } },
+  reviewer: { select: { id: true, name: true } },
+};
+
+// ─── GET /leave/requests/me ────────────────────────────
+router.get('/requests/me', async (req, res, next) => {
+  try {
+    const requests = await prisma.leaveRequest.findMany({
+      where: { user_id: req.user!.sub },
+      include: LEAVE_INCLUDE,
+      orderBy: { created_at: 'desc' },
+    });
+    ok(res, requests);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /leave/requests/team ──────────────────────────
+router.get('/requests/team', requireRole('manager'), async (req, res, next) => {
+  try {
+    const team = await prisma.user.findMany({
+      where: { manager_id: req.user!.sub, is_active: true, org_id: req.user!.org_id },
+      select: { id: true },
+    });
+    const requests = await prisma.leaveRequest.findMany({
+      where: { user_id: { in: team.map(u => u.id) } },
+      include: LEAVE_INCLUDE,
+      orderBy: { created_at: 'desc' },
+    });
+    ok(res, requests);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /leave/requests ───────────────────────────────
+router.get('/requests', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const { status, department } = req.query as Record<string, string>;
+    const where: Record<string, unknown> = { org_id: req.user!.org_id };
+    if (status) where.status = status;
+    if (department) {
+      const deptUsers = await prisma.user.findMany({ where: { org_id: req.user!.org_id, department }, select: { id: true } });
+      where.user_id = { in: deptUsers.map(u => u.id) };
+    }
+    const requests = await prisma.leaveRequest.findMany({ where, include: LEAVE_INCLUDE, orderBy: { created_at: 'desc' } });
+    ok(res, requests);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /leave/requests ──────────────────────────────
+router.post('/requests', async (req, res, next) => {
+  try {
+    const { leave_type, start_date, end_date, reason } = req.body;
+    if (!leave_type || !start_date || !end_date) throw new ValidationError('leave_type, start_date and end_date required');
+
+    const start = new Date(start_date);
+    const end   = new Date(end_date);
+    if (start > end) throw new ValidationError('start_date must be before end_date');
+
+    const working_days = calculateWorkingDays(start, end);
+
+    const request = await prisma.leaveRequest.create({
+      data: {
+        user_id: req.user!.sub, org_id: req.user!.org_id,
+        leave_type, start_date: start, end_date: end, working_days, reason,
+      },
+      include: LEAVE_INCLUDE,
+    });
+    ok(res, request, 201);
+  } catch (e) { next(e); }
+});
+
+// ─── DELETE /leave/requests/:id ────────────────────────
+router.delete('/requests/:id', async (req, res, next) => {
+  try {
+    const request = await prisma.leaveRequest.findFirst({
+      where: { id: req.params.id, user_id: req.user!.sub },
+    });
+    if (!request) throw new NotFoundError('Leave request');
+    if (request.status !== 'pending') throw new ValidationError('Only pending requests can be cancelled');
+    await prisma.leaveRequest.update({ where: { id: req.params.id }, data: { status: 'cancelled' } });
+    ok(res, { message: 'Leave request cancelled' });
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /leave/requests/:id/approve ──────────────────
+router.put('/requests/:id/approve', requireRole('manager'), async (req, res, next) => {
+  try {
+    const request = await prisma.leaveRequest.findFirst({
+      where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
+    });
+    if (!request) throw new NotFoundError('Leave request');
+
+    await prisma.$transaction(async (tx) => {
+      await tx.leaveRequest.update({
+        where: { id: req.params.id },
+        data: { status: 'approved', reviewed_by: req.user!.sub, reviewed_at: new Date() },
+      });
+      // Deduct from leave balance
+      await tx.leaveBalance.updateMany({
+        where: { user_id: request.user_id, leave_type: request.leave_type, year: request.start_date.getFullYear() },
+        data: { used_days: { increment: request.working_days } },
+      });
+      // Update attendance records to 'leave'
+      const cur = new Date(request.start_date);
+      while (cur <= request.end_date) {
+        if (cur.getDay() !== 0 && cur.getDay() !== 6) {
+          await tx.attendanceRecord.upsert({
+            where: { user_id_date: { user_id: request.user_id, date: new Date(cur) } },
+            update: { status: 'leave' },
+            create: {
+              user_id: request.user_id, org_id: req.user!.org_id,
+              date: new Date(cur), check_in_type: 'manual', status: 'leave',
+            },
+          });
+        }
+        cur.setDate(cur.getDate() + 1);
+      }
+    });
+
+    const updated = await prisma.leaveRequest.findUnique({ where: { id: req.params.id }, include: LEAVE_INCLUDE });
+
+    // Email + WhatsApp notification
+    if (updated?.user) {
+      const dates = `${updated.start_date.toDateString()} – ${updated.end_date.toDateString()}`;
+      const reviewer = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true } });
+      const { sendLeaveApprovedEmail } = await import('../services/email');
+      await sendLeaveApprovedEmail(updated.user.email, updated.user.name, updated.leave_type, dates, reviewer?.name || 'Your manager').catch(console.error);
+    }
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /leave/requests/:id/reject ───────────────────
+router.put('/requests/:id/reject', requireRole('manager'), async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+    if (!reason) throw new ValidationError('Rejection reason required');
+
+    const request = await prisma.leaveRequest.findFirst({
+      where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
+    });
+    if (!request) throw new NotFoundError('Leave request');
+
+    const updated = await prisma.leaveRequest.update({
+      where: { id: req.params.id },
+      data: { status: 'rejected', reviewed_by: req.user!.sub, reviewed_at: new Date(), rejection_reason: reason },
+      include: LEAVE_INCLUDE,
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /leave/balance/me ─────────────────────────────
+router.get('/balance/me', async (req, res, next) => {
+  try {
+    const year = new Date().getFullYear();
+    const balances = await prisma.leaveBalance.findMany({
+      where: { user_id: req.user!.sub, year },
+    });
+    ok(res, balances);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /leave/balance/:userId ────────────────────────
+router.get('/balance/:userId', requireRole('manager'), async (req, res, next) => {
+  try {
+    const year = parseInt((req.query.year as string) || String(new Date().getFullYear()));
+    const balances = await prisma.leaveBalance.findMany({
+      where: { user_id: req.params.userId, year },
+    });
+    ok(res, balances);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /leave/balance/:userId ────────────────────────
+router.put('/balance/:userId', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const { leave_type, adjustment, reason } = req.body;
+    if (!leave_type || adjustment === undefined || !reason) throw new ValidationError('leave_type, adjustment and reason required');
+
+    const year = new Date().getFullYear();
+    const balance = await prisma.leaveBalance.findFirst({
+      where: { user_id: req.params.userId, leave_type, year },
+    });
+    if (!balance) throw new NotFoundError('Leave balance');
+
+    const updated = await prisma.leaveBalance.update({
+      where: { id: balance.id },
+      data: { total_days: balance.total_days + adjustment },
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /leave/calendar ──────────────────────────────
+router.get('/calendar', requireRole('manager'), async (req, res, next) => {
+  try {
+    const { month, year } = req.query as { month?: string; year?: string };
+    const m = parseInt(month || String(new Date().getMonth() + 1));
+    const y = parseInt(year  || String(new Date().getFullYear()));
+
+    const start = new Date(y, m - 1, 1);
+    const end   = new Date(y, m, 0);
+
+    const requests = await prisma.leaveRequest.findMany({
+      where: {
+        org_id: req.user!.org_id,
+        status: 'approved',
+        start_date: { lte: end },
+        end_date:   { gte: start },
+      },
+      include: LEAVE_INCLUDE,
+    });
+    ok(res, requests);
+  } catch (e) { next(e); }
+});
+
+export default router;

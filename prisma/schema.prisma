@@ -1,0 +1,333 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Organisation {
+  id                 String   @id @default(uuid())
+  name               String   @db.VarChar(255)
+  logo_url           String?
+  timezone           String   @db.VarChar(100)
+  currency           String   @db.VarChar(10) @default("USD")
+  office_ips         String[] @default([])
+  wa_enabled         Boolean  @default(false)
+  wa_phone_number_id String?  @db.VarChar(255)
+  wa_access_token    String?
+  wa_group_ids       String[] @default([])
+  wa_events          Json     @default("{}")
+  payroll_day        Int      @default(28)
+  plan               String   @db.VarChar(50) @default("trial")
+  created_at         DateTime @default(now())
+
+  users               User[]
+  attendance_records  AttendanceRecord[]
+  leave_requests      LeaveRequest[]
+  leave_balances      LeaveBalance[]
+  shifts              Shift[]
+  payroll_records     PayrollRecord[]
+  whatsapp_logs       WhatsappLog[]
+  performance_reviews PerformanceReview[]
+
+  @@map("organisations")
+}
+
+model User {
+  id             String    @id @default(uuid())
+  org_id         String
+  name           String    @db.VarChar(255)
+  email          String    @unique @db.VarChar(255)
+  password_hash  String
+  role           String    @db.VarChar(50)
+  department     String?   @db.VarChar(100)
+  job_title      String?   @db.VarChar(100)
+  phone          String?   @db.VarChar(30)
+  manager_id     String?
+  hourly_rate    Decimal   @default(0) @db.Decimal(10, 2)
+  avatar_url     String?
+  is_active      Boolean   @default(true)
+  setup_complete Boolean   @default(false)
+  invite_token   String?   @unique
+  invite_expires DateTime?
+  reset_token    String?   @unique
+  reset_expires  DateTime?
+  login_attempts Int       @default(0)
+  locked_until   DateTime?
+  created_at     DateTime  @default(now())
+  deleted_at     DateTime?
+
+  org                     Organisation        @relation(fields: [org_id], references: [id])
+  manager                 User?               @relation("UserManager", fields: [manager_id], references: [id])
+  direct_reports          User[]              @relation("UserManager")
+  attendance_records      AttendanceRecord[]
+  leave_requests          LeaveRequest[]
+  leave_balances          LeaveBalance[]
+  reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
+  shift_assignments       ShiftAssignment[]
+  swap_requests_sent      ShiftSwap[]         @relation("SwapRequester")
+  swap_requests_received  ShiftSwap[]         @relation("SwapTarget")
+  payroll_records         PayrollRecord[]
+  processed_payrolls      PayrollRecord[]     @relation("PayrollProcessor")
+  performance_reviews     PerformanceReview[] @relation("ReviewSubject")
+  submitted_reviews       PerformanceReview[] @relation("ReviewSubmitter")
+  performance_goals       PerformanceGoal[]
+  remote_sessions         RemoteSession[]
+
+  @@map("users")
+}
+
+model AttendanceRecord {
+  id              String    @id @default(uuid())
+  user_id         String
+  org_id          String
+  date            DateTime  @db.Date
+  check_in_at     DateTime?
+  check_out_at    DateTime?
+  check_in_type   String    @db.VarChar(20)
+  status          String    @db.VarChar(20)
+  hours_worked    Decimal?  @db.Decimal(5, 2)
+  overtime_hours  Decimal   @default(0) @db.Decimal(5, 2)
+  ip_detected     String?   @db.VarChar(50)
+  is_overridden              Boolean   @default(false)
+  override_by                String?
+  override_reason            String?
+  shift_id                   String?
+  ip_checkout_pending_at     DateTime?
+  created_at                 DateTime  @default(now())
+
+  user           User          @relation(fields: [user_id], references: [id])
+  org            Organisation  @relation(fields: [org_id], references: [id])
+  shift          Shift?        @relation(fields: [shift_id], references: [id])
+  remote_session RemoteSession?
+
+  @@unique([user_id, date])
+  @@map("attendance_records")
+}
+
+model RemoteSession {
+  id               String    @id @default(uuid())
+  attendance_id    String    @unique
+  user_id          String
+  approved_by      String?
+  status           String    @default("pending")
+  duration_type    String    @db.VarChar(20)
+  morning_nudge_at DateTime?
+  midday_nudge_at  DateTime?
+  end_nudge_at     DateTime?
+  ai_summary       String?
+  created_at       DateTime  @default(now())
+
+  attendance   AttendanceRecord   @relation(fields: [attendance_id], references: [id])
+  user         User               @relation(fields: [user_id], references: [id])
+  checkin_logs RemoteCheckinLog[]
+
+  @@map("remote_sessions")
+}
+
+model RemoteCheckinLog {
+  id                String    @id @default(uuid())
+  remote_session_id String
+  nudge_type        String    @db.VarChar(20)
+  nudge_sent_at     DateTime
+  reply_text        String?
+  reply_at          DateTime?
+  task_summary      String?
+  blockers          String?
+  sentiment         String?   @db.VarChar(20)
+  no_reply_alerted  Boolean   @default(false)
+
+  remote_session RemoteSession @relation(fields: [remote_session_id], references: [id])
+
+  @@map("remote_checkin_logs")
+}
+
+model LeaveRequest {
+  id               String    @id @default(uuid())
+  user_id          String
+  org_id           String
+  leave_type       String    @db.VarChar(50)
+  start_date       DateTime  @db.Date
+  end_date         DateTime  @db.Date
+  working_days     Int
+  reason           String?
+  status           String    @default("pending")
+  reviewed_by      String?
+  rejection_reason String?
+  created_at       DateTime  @default(now())
+  reviewed_at      DateTime?
+
+  user     User         @relation(fields: [user_id], references: [id])
+  org      Organisation @relation(fields: [org_id], references: [id])
+  reviewer User?        @relation("LeaveReviewer", fields: [reviewed_by], references: [id])
+
+  @@map("leave_requests")
+}
+
+model LeaveBalance {
+  id         String   @id @default(uuid())
+  user_id    String
+  org_id     String
+  leave_type String   @db.VarChar(50)
+  year       Int
+  total_days Int
+  used_days  Int      @default(0)
+  updated_at DateTime @default(now()) @updatedAt
+
+  user User         @relation(fields: [user_id], references: [id])
+  org  Organisation @relation(fields: [org_id], references: [id])
+
+  @@unique([user_id, leave_type, year])
+  @@map("leave_balances")
+}
+
+model Shift {
+  id           String    @id @default(uuid())
+  org_id       String
+  name         String    @db.VarChar(100)
+  start_time   String    @db.VarChar(10)
+  end_time     String    @db.VarChar(10)
+  color        String    @default("#1D4ED8") @db.VarChar(20)
+  active_days  Int[]
+  is_published Boolean   @default(false)
+  created_by   String?
+  created_at   DateTime  @default(now())
+
+  org                Organisation       @relation(fields: [org_id], references: [id])
+  assignments        ShiftAssignment[]
+  attendance_records AttendanceRecord[]
+
+  @@map("shifts")
+}
+
+model ShiftAssignment {
+  id         String   @id @default(uuid())
+  shift_id   String
+  user_id    String
+  date       DateTime @db.Date
+  created_at DateTime @default(now())
+
+  shift             Shift      @relation(fields: [shift_id], references: [id])
+  user              User       @relation(fields: [user_id], references: [id])
+  swap_as_requester ShiftSwap? @relation("RequesterAssignment")
+  swap_as_target    ShiftSwap? @relation("TargetAssignment")
+
+  @@unique([user_id, date])
+  @@map("shift_assignments")
+}
+
+model ShiftSwap {
+  id                   String   @id @default(uuid())
+  requester_id         String
+  target_id            String
+  requester_assign_id  String   @unique
+  target_assign_id     String   @unique
+  status               String   @default("pending")
+  reason               String?
+  manager_id           String?
+  rejection_reason     String?
+  created_at           DateTime @default(now())
+
+  requester            User            @relation("SwapRequester", fields: [requester_id], references: [id])
+  target               User            @relation("SwapTarget", fields: [target_id], references: [id])
+  requester_assignment ShiftAssignment @relation("RequesterAssignment", fields: [requester_assign_id], references: [id])
+  target_assignment    ShiftAssignment @relation("TargetAssignment", fields: [target_assign_id], references: [id])
+
+  @@map("shift_swaps")
+}
+
+model PayrollRecord {
+  id                String    @id @default(uuid())
+  user_id           String
+  org_id            String
+  period_month      Int
+  period_year       Int
+  regular_hours     Decimal   @db.Decimal(6, 2)
+  overtime_hours    Decimal   @default(0) @db.Decimal(6, 2)
+  hourly_rate       Decimal   @db.Decimal(10, 2)
+  base_pay          Decimal   @db.Decimal(12, 2)
+  overtime_pay      Decimal   @default(0) @db.Decimal(12, 2)
+  unpaid_deduction  Decimal   @default(0) @db.Decimal(12, 2)
+  manual_adjustment Decimal   @default(0) @db.Decimal(12, 2)
+  adjustment_reason String?
+  gross_pay         Decimal   @db.Decimal(12, 2)
+  status            String    @default("draft")
+  is_incomplete     Boolean   @default(false)
+  payslip_url       String?
+  processed_at      DateTime?
+  processed_by      String?
+  created_at        DateTime  @default(now())
+
+  user      User         @relation(fields: [user_id], references: [id])
+  org       Organisation @relation(fields: [org_id], references: [id])
+  processor User?        @relation("PayrollProcessor", fields: [processed_by], references: [id])
+
+  @@unique([user_id, period_month, period_year])
+  @@map("payroll_records")
+}
+
+model PerformanceReview {
+  id               String    @id @default(uuid())
+  user_id          String
+  reviewer_id      String?
+  org_id           String
+  period_month     Int
+  period_year      Int
+  manager_rating   Int?
+  attendance_score Decimal?  @db.Decimal(5, 2)
+  overall_score    Decimal?  @db.Decimal(5, 2)
+  notes            String?   @db.Text
+  submitted_at     DateTime?
+  created_at       DateTime  @default(now())
+
+  user     User              @relation("ReviewSubject", fields: [user_id], references: [id])
+  reviewer User?             @relation("ReviewSubmitter", fields: [reviewer_id], references: [id])
+  org      Organisation      @relation(fields: [org_id], references: [id])
+  goals    PerformanceGoal[]
+
+  @@unique([user_id, period_month, period_year])
+  @@map("performance_reviews")
+}
+
+model PerformanceGoal {
+  id          String    @id @default(uuid())
+  review_id   String
+  user_id     String
+  title       String    @db.VarChar(255)
+  description String?   @db.Text
+  weight      Int
+  target_date DateTime? @db.Date
+  completion  String    @default("pending")
+  created_at  DateTime  @default(now())
+
+  review PerformanceReview @relation(fields: [review_id], references: [id])
+  user   User              @relation(fields: [user_id], references: [id])
+
+  @@map("performance_goals")
+}
+
+model WhatsappLog {
+  id             String    @id @default(uuid())
+  org_id         String
+  event_type     String    @db.VarChar(50)
+  recipient_type String    @db.VarChar(20)
+  recipient_id   String    @db.VarChar(255)
+  message_body   String    @db.Text
+  status         String    @default("pending")
+  attempts       Int       @default(0)
+  sent_at        DateTime?
+  created_at     DateTime  @default(now())
+
+  org Organisation @relation(fields: [org_id], references: [id])
+
+  @@map("whatsapp_notification_logs")
+}
+
+model TokenBlacklist {
+  jti        String   @id
+  expires_at DateTime
+  created_at DateTime @default(now())
+
+  @@map("token_blacklist")
+}
