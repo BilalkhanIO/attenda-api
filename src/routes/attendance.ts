@@ -1,8 +1,8 @@
 // @ts-nocheck
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
-import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
-import { startOfDay, endOfDay, calcHoursWorked } from '../utils/auth';
+import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
+import { startOfDay, calcHoursWorked } from '../utils/auth';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -13,7 +13,7 @@ const RECORD_INCLUDE = {
 };
 
 // ─── GET /attendance/today ─────────────────────────────
-router.get('/today', requireRole('manager'), async (req, res, next) => {
+router.get('/today', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const today = new Date();
     const date  = startOfDay(today);
@@ -23,7 +23,7 @@ router.get('/today', requireRole('manager'), async (req, res, next) => {
         where: { manager_id: req.user!.sub, is_active: true },
         select: { id: true },
       });
-      where.user_id = { in: teamIds.map(u => u.id) };
+      where.user_id = { in: teamIds.map((u: { id: string }) => u.id) };
     }
     const records = await prisma.attendanceRecord.findMany({ where, include: RECORD_INCLUDE, orderBy: { check_in_at: 'asc' } });
     ok(res, records);
@@ -31,7 +31,7 @@ router.get('/today', requireRole('manager'), async (req, res, next) => {
 });
 
 // ─── GET /attendance/me ────────────────────────────────
-router.get('/me', async (req, res, next) => {
+router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { days = '30' } = req.query as { days?: string };
     const since = new Date();
@@ -44,8 +44,97 @@ router.get('/me', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ─── GET /attendance/remote/sessions ──────────────────
+// Manager sees remote session requests for approval
+router.get('/remote/sessions', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status } = req.query as { status?: string };
+
+    const teamIds = req.user!.role === 'manager'
+      ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
+      : null;
+
+    const where: Record<string, unknown> = {};
+    if (status) where.status = status;
+    if (teamIds) where.user_id = { in: teamIds };
+
+    const sessions = await prisma.remoteSession.findMany({
+      where,
+      include: {
+        user:     { select: { id: true, name: true, department: true, avatar_url: true } },
+        attendance: { select: { date: true } },
+      },
+      orderBy: { created_at: 'desc' },
+      take: 50,
+    });
+    ok(res, sessions);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /attendance/remote/sessions/:id/approve ──────
+router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, res, next) => {
+  try {
+    const session = await prisma.remoteSession.findUnique({
+      where: { id: req.params.id },
+      include: { user: true },
+    });
+    if (!session) throw new NotFoundError('Remote session');
+    if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
+
+    await prisma.remoteSession.update({
+      where: { id: session.id },
+      data: { status: 'approved', approved_by: req.user!.sub },
+    });
+
+    // Notify team group via WhatsApp
+    const { notifyRemote } = await import('../services/whatsapp');
+    await notifyRemote(session.user.org_id, session.user.name).catch(console.error);
+
+    ok(res, { message: 'Remote session approved' });
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /attendance/remote/sessions/:id/reject ───────
+router.put('/remote/sessions/:id/reject', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const session = await prisma.remoteSession.findUnique({ where: { id: req.params.id } });
+    if (!session) throw new NotFoundError('Remote session');
+    if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
+
+    await prisma.remoteSession.update({
+      where: { id: session.id },
+      data: { status: 'rejected', approved_by: req.user!.sub },
+    });
+
+    // Revert attendance record status to 'absent' since remote was denied
+    await prisma.attendanceRecord.update({
+      where: { id: session.attendance_id },
+      data: { status: 'absent' },
+    });
+
+    ok(res, { message: 'Remote session rejected' });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/remote/sessions/me ───────────────
+// Employee views their own remote sessions
+router.get('/remote/sessions/me', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const sessions = await prisma.remoteSession.findMany({
+      where: { user_id: req.user!.sub },
+      include: {
+        attendance:    { select: { date: true } },
+        checkin_logs:  true,
+      },
+      orderBy: { created_at: 'desc' },
+      take: 30,
+    });
+    ok(res, sessions);
+  } catch (e) { next(e); }
+});
+
 // ─── GET /attendance/:userId ───────────────────────────
-router.get('/:userId', requireRole('manager'), async (req, res, next) => {
+router.get('/:userId', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = req.params;
     const { start, end } = req.query as { start?: string; end?: string };
@@ -68,9 +157,9 @@ router.get('/:userId', requireRole('manager'), async (req, res, next) => {
 });
 
 // ─── POST /attendance/checkin ──────────────────────────
-router.post('/checkin', async (req, res, next) => {
+router.post('/checkin', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { type = 'manual', qr_code } = req.body;
+    const { type = 'manual', qr_code, duration_type = 'full_day' } = req.body;
     const today = startOfDay(new Date());
 
     // Check no existing check-in today
@@ -80,10 +169,35 @@ router.post('/checkin', async (req, res, next) => {
     if (existing?.check_in_at) throw new ValidationError('Already checked in today');
 
     // Validate QR code if provided
-    if (type === 'qr' && !qr_code) throw new ValidationError('QR code required for QR check-in');
+    if (type === 'qr') {
+      if (!qr_code) throw new ValidationError('QR code required for QR check-in');
+      const { verifyQrCode } = await import('../services/qrcode');
+      const verification = verifyQrCode(qr_code, req.user!.org_id);
+      if (!verification.valid) throw new ValidationError(verification.reason || 'Invalid QR code');
+    }
 
-    const now    = new Date();
-    const status = 'in'; // TODO: compare with shift start to detect 'late'
+    const now = new Date();
+
+    // Detect status: check if this is a remote check-in
+    let status: string = type === 'remote' ? 'remote' : 'in';
+
+    // Detect late arrival by comparing with assigned shift
+    if (type !== 'remote') {
+      const assignment = await prisma.shiftAssignment.findFirst({
+        where: { user_id: req.user!.sub, date: today },
+        include: { shift: true },
+      });
+
+      if (assignment?.shift) {
+        const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
+        const shiftStartMins = sh * 60 + sm;
+        const nowMins        = now.getHours() * 60 + now.getMinutes();
+        const lateThreshold  = 15; // minutes
+        if (nowMins > shiftStartMins + lateThreshold) {
+          status = 'late';
+        }
+      }
+    }
 
     const record = existing
       ? await prisma.attendanceRecord.update({
@@ -99,18 +213,36 @@ router.post('/checkin', async (req, res, next) => {
           include: RECORD_INCLUDE,
         });
 
+    // Handle remote check-in: create RemoteSession pending manager approval
+    if (type === 'remote') {
+      const sessionExists = await prisma.remoteSession.findFirst({
+        where: { attendance_id: record.id },
+      });
+      if (!sessionExists) {
+        await prisma.remoteSession.create({
+          data: {
+            attendance_id: record.id,
+            user_id:       req.user!.sub,
+            status:        'pending',
+            duration_type,
+          },
+        });
+      }
+    }
+
     // Fire WhatsApp notification (non-blocking)
-    if (record.user) {
+    if (record.user && type !== 'remote') {
       const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
       const timeStr = formatTime12h(record.check_in_at || now);
       notifyCheckIn(req.user!.org_id, record.user.name, timeStr).catch(console.error);
     }
+
     ok(res, record);
   } catch (e) { next(e); }
 });
 
 // ─── POST /attendance/checkout ─────────────────────────
-router.post('/checkout', async (req, res, next) => {
+router.post('/checkout', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const today = startOfDay(new Date());
     const record = await prisma.attendanceRecord.findUnique({
@@ -127,6 +259,7 @@ router.post('/checkout', async (req, res, next) => {
       data: { check_out_at: now, hours_worked: hoursWorked, status: 'out' },
       include: RECORD_INCLUDE,
     });
+
     // Fire WhatsApp notification (non-blocking)
     if (updated.user) {
       const { notifyCheckOut, formatTime12h } = await import('../services/whatsapp');
@@ -139,9 +272,10 @@ router.post('/checkout', async (req, res, next) => {
 
 // ─── POST /attendance/ip-event ─────────────────────────
 // Called by Flutter app when IP match/unmatch detected
-router.post('/ip-event', async (req, res, next) => {
+router.post('/ip-event', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { event, ip } = req.body; // event: 'match' | 'unmatch'
+    if (!event || !ip) throw new ValidationError('event and ip are required');
     const today = startOfDay(new Date());
 
     // Verify IP against org registered IPs
@@ -165,9 +299,31 @@ router.post('/ip-event', async (req, res, next) => {
       }
 
       if (!existing?.check_in_at) {
+        const now = new Date();
+        // Detect late arrival for IP-based check-in
+        let status = 'in';
+        const assignment = await prisma.shiftAssignment.findFirst({
+          where: { user_id: req.user!.sub, date: today },
+          include: { shift: true },
+        });
+        if (assignment?.shift) {
+          const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
+          const shiftStartMins = sh * 60 + sm;
+          const nowMins        = now.getHours() * 60 + now.getMinutes();
+          if (nowMins > shiftStartMins + 15) status = 'late';
+        }
+
         const record = existing
-          ? await prisma.attendanceRecord.update({ where: { id: existing.id }, data: { check_in_at: new Date(), check_in_type: 'auto_ip', status: 'in', ip_detected: ip } })
-          : await prisma.attendanceRecord.create({ data: { user_id: req.user!.sub, org_id: req.user!.org_id, date: today, check_in_at: new Date(), check_in_type: 'auto_ip', status: 'in', ip_detected: ip } });
+          ? await prisma.attendanceRecord.update({ where: { id: existing.id }, data: { check_in_at: now, check_in_type: 'auto_ip', status, ip_detected: ip } })
+          : await prisma.attendanceRecord.create({ data: { user_id: req.user!.sub, org_id: req.user!.org_id, date: today, check_in_at: now, check_in_type: 'auto_ip', status, ip_detected: ip } });
+
+        // Notify WhatsApp
+        const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
+        if (user) {
+          const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
+          notifyCheckIn(req.user!.org_id, user.name, formatTime12h(now)).catch(console.error);
+        }
+
         return ok(res, { action: 'checked_in', record });
       }
       return ok(res, { action: 'already_in' });
@@ -193,7 +349,7 @@ router.post('/ip-event', async (req, res, next) => {
 });
 
 // ─── PUT /attendance/:id/override ─────────────────────
-router.put('/:id/override', requireRole('manager'), async (req, res, next) => {
+router.put('/:id/override', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const { check_in_at, check_out_at, reason } = req.body;
@@ -230,8 +386,8 @@ router.put('/:id/override', requireRole('manager'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ─── GET /attendance/report ────────────────────────────
-router.get('/report/export', requireRole('hr_admin'), async (req, res, next) => {
+// ─── GET /attendance/report/export ────────────────────
+router.get('/report/export', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { start_date, end_date, department } = req.query as Record<string, string>;
     if (!start_date || !end_date) throw new ValidationError('start_date and end_date required');
@@ -242,7 +398,7 @@ router.get('/report/export', requireRole('hr_admin'), async (req, res, next) => 
     };
     if (department) {
       const deptUsers = await prisma.user.findMany({ where: { org_id: req.user!.org_id, department }, select: { id: true } });
-      where.user_id = { in: deptUsers.map(u => u.id) };
+      where.user_id = { in: deptUsers.map((u: { id: string }) => u.id) };
     }
 
     const records = await prisma.attendanceRecord.findMany({

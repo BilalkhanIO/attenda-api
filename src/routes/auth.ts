@@ -119,12 +119,14 @@ router.post('/forgot-password', async (req: Request, res: Response, next: NextFu
 
     const user = await prisma.user.findUnique({ where: { email } });
     // Always return 200 to prevent email enumeration
-    if (user) {
+    if (user && user.is_active) {
       const token   = generateToken();
       const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 min
       await prisma.user.update({ where: { id: user.id }, data: { reset_token: token, reset_expires: expires } });
-      // TODO: Send email with reset link: ${process.env.FRONTEND_URL}/reset-password?token=${token}
-      console.log(`[AUTH] Password reset link for ${email}: /reset-password?token=${token}`);
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      const resetLink   = `${frontendUrl}/reset-password?token=${token}`;
+      const { sendPasswordResetEmail } = await import('../services/email');
+      await sendPasswordResetEmail(email, user.name, resetLink).catch(console.error);
     }
     ok(res, { message: 'If that email exists, a reset link has been sent' });
   } catch (e) { next(e); }
@@ -172,6 +174,27 @@ router.post('/setup-account', async (req: Request, res: Response, next: NextFunc
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
     const refreshToken = signRefreshToken(user.id);
     ok(res, { access_token: accessToken, refresh_token: refreshToken });
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /auth/change-password ─────────────────────────
+router.put('/change-password', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { current_password, new_password } = req.body;
+    if (!current_password || !new_password) throw new ValidationError('current_password and new_password required');
+    if (new_password.length < 8) throw new ValidationError('Password must be at least 8 characters');
+
+    const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
+    if (!user) throw new AppError('User not found', 404, 'NOT_FOUND');
+
+    const valid = await comparePassword(current_password, user.password_hash);
+    if (!valid) throw new UnauthorizedError('Current password is incorrect');
+
+    if (current_password === new_password) throw new ValidationError('New password must be different from current password');
+
+    const hash = await hashPassword(new_password);
+    await prisma.user.update({ where: { id: user.id }, data: { password_hash: hash } });
+    ok(res, { message: 'Password changed successfully' });
   } catch (e) { next(e); }
 });
 

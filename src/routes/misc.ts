@@ -52,10 +52,22 @@ performanceRouter.get('/reviews', requireRole('manager'), async (req, res, next)
 // POST /performance/reviews/:userId
 performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, res, next) => {
   try {
-    const { score, comments, month } = req.body;
+    const { score, comments, month, year } = req.body;
     if (!score || !comments || !month) throw new ValidationError('score, comments and month required');
+    if (score < 1 || score > 5) throw new ValidationError('score must be between 1 and 5');
 
-    const [m, y] = (month as string).split('-').map(Number);
+    // Accept month as "MM-YYYY", "YYYY-MM", or separate month + year fields
+    let m: number, y: number;
+    if (year) {
+      m = parseInt(month);
+      y = parseInt(year);
+    } else {
+      const parts = (month as string).split('-').map(Number);
+      // Detect format: if first part > 12 it's YYYY-MM, else MM-YYYY
+      if (parts[0] > 12) { y = parts[0]; m = parts[1]; }
+      else                { m = parts[0]; y = parts[1]; }
+    }
+    if (!m || !y || m < 1 || m > 12) throw new ValidationError('Invalid month/year format. Use MM-YYYY');
     const review = await prisma.performanceReview.findFirst({
       where: { user_id: req.params.userId, period_month: m, period_year: y },
     });
@@ -225,10 +237,16 @@ orgRouter.get('/settings', async (req, res, next) => {
 orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) => {
   try {
     const { name, timezone, currency, payroll_day } = req.body;
-    const updated = await prisma.organisation.update({
-      where: { id: req.user!.org_id },
-      data: { name, timezone, currency, payroll_day },
-    });
+    const data: Record<string, unknown> = {};
+    if (name       !== undefined) data.name        = name;
+    if (timezone   !== undefined) data.timezone    = timezone;
+    if (currency   !== undefined) data.currency    = currency;
+    if (payroll_day !== undefined) {
+      const day = parseInt(payroll_day);
+      if (day < 1 || day > 28) throw new ValidationError('payroll_day must be between 1 and 28');
+      data.payroll_day = day;
+    }
+    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, updated);
   } catch (e) { next(e); }
 });

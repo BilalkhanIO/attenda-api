@@ -65,8 +65,34 @@ router.post('/requests', async (req, res, next) => {
     const start = new Date(start_date);
     const end   = new Date(end_date);
     if (start > end) throw new ValidationError('start_date must be before end_date');
+    if (start < new Date(new Date().setHours(0, 0, 0, 0))) throw new ValidationError('Cannot request leave in the past');
 
     const working_days = calculateWorkingDays(start, end);
+
+    // Check leave balance (skip for unpaid leave)
+    if (leave_type !== 'unpaid') {
+      const year    = start.getFullYear();
+      const balance = await prisma.leaveBalance.findFirst({
+        where: { user_id: req.user!.sub, leave_type, year },
+      });
+      if (balance) {
+        const available = balance.total_days - balance.used_days;
+        if (working_days > available) {
+          throw new ValidationError(`Insufficient ${leave_type} leave balance. Available: ${available} days, requested: ${working_days} days`);
+        }
+      }
+    }
+
+    // Check no overlapping approved leave
+    const overlap = await prisma.leaveRequest.findFirst({
+      where: {
+        user_id: req.user!.sub,
+        status: { in: ['pending', 'approved'] },
+        start_date: { lte: end },
+        end_date:   { gte: start },
+      },
+    });
+    if (overlap) throw new ValidationError('You already have a leave request that overlaps with these dates');
 
     const request = await prisma.leaveRequest.create({
       data: {
@@ -135,6 +161,13 @@ router.put('/requests/:id/approve', requireRole('manager'), async (req, res, nex
       const reviewer = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true } });
       const { sendLeaveApprovedEmail } = await import('../services/email');
       await sendLeaveApprovedEmail(updated.user.email, updated.user.name, updated.leave_type, dates, reviewer?.name || 'Your manager').catch(console.error);
+
+      // WhatsApp to employee (if phone configured)
+      const employee = await prisma.user.findUnique({ where: { id: updated.user.id }, select: { phone: true } });
+      if (employee?.phone) {
+        const { notifyLeaveApproved } = await import('../services/whatsapp');
+        await notifyLeaveApproved(req.user!.org_id, updated.user.name, updated.leave_type, dates, employee.phone).catch(console.error);
+      }
     }
     ok(res, updated);
   } catch (e) { next(e); }
@@ -156,6 +189,14 @@ router.put('/requests/:id/reject', requireRole('manager'), async (req, res, next
       data: { status: 'rejected', reviewed_by: req.user!.sub, reviewed_at: new Date(), rejection_reason: reason },
       include: LEAVE_INCLUDE,
     });
+
+    // Email notification to employee
+    if (updated?.user) {
+      const dates = `${updated.start_date.toDateString()} – ${updated.end_date.toDateString()}`;
+      const { sendLeaveRejectedEmail } = await import('../services/email');
+      await sendLeaveRejectedEmail(updated.user.email, updated.user.name, updated.leave_type, dates, reason).catch(console.error);
+    }
+
     ok(res, updated);
   } catch (e) { next(e); }
 });

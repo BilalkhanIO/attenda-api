@@ -132,10 +132,43 @@ router.delete('/assignments/:id', requireRole('hr_admin'), async (req, res, next
 router.post('/schedule/publish', requireRole('hr_admin'), async (req, res, next) => {
   try {
     const { week_start } = req.body;
-    // Mark all shifts for this week as published
-    const ws = week_start ? new Date(week_start) : new Date();
-    // TODO: Send WhatsApp notifications to all employees with their shifts
-    ok(res, { message: 'Schedule published. Employees will be notified.', week_start: ws });
+    const ws = week_start ? new Date(week_start) : (() => { const d = new Date(); d.setDate(d.getDate() - d.getDay() + 1); return d; })();
+    const we = new Date(ws); we.setDate(we.getDate() + 6);
+
+    // Mark shift templates as published
+    await prisma.shift.updateMany({
+      where: { org_id: req.user!.org_id },
+      data: { is_published: true },
+    });
+
+    // Get all assignments for the week and notify employees
+    const assignments = await prisma.shiftAssignment.findMany({
+      where: {
+        date:  { gte: ws, lte: we },
+        shift: { org_id: req.user!.org_id },
+      },
+      include: {
+        user:  { select: { id: true, name: true, phone: true, org_id: true } },
+        shift: { select: { name: true, start_time: true } },
+      },
+    });
+
+    let notified = 0;
+    const { notifyShiftReminder } = await import('../services/whatsapp');
+    for (const a of assignments) {
+      if (a.user.phone) {
+        await notifyShiftReminder(a.user.org_id, a.user.name, a.shift.start_time, a.user.phone).catch(console.error);
+        notified++;
+      }
+    }
+
+    ok(res, {
+      message: `Schedule published. ${notified} employees notified via WhatsApp.`,
+      week_start:  ws.toISOString().split('T')[0],
+      week_end:    we.toISOString().split('T')[0],
+      assignments: assignments.length,
+      notified,
+    });
   } catch (e) { next(e); }
 });
 
