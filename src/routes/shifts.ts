@@ -186,6 +186,28 @@ router.get('/assignments/me', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ─── GET /shifts/swaps/me ──────────────────────────────
+router.get('/swaps/me', async (req, res, next) => {
+  try {
+    const swaps = await prisma.shiftSwap.findMany({
+      where: {
+        OR: [
+          { requester_id: req.user!.sub },
+          { target_id:    req.user!.sub },
+        ],
+      },
+      include: {
+        requester:            { select: { id: true, name: true } },
+        target:               { select: { id: true, name: true } },
+        requester_assignment: { include: { shift: true } },
+        target_assignment:    { include: { shift: true } },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+    ok(res, swaps);
+  } catch (e) { next(e); }
+});
+
 // ─── GET /shifts/swaps ─────────────────────────────────
 router.get('/swaps', requireRole('manager'), async (req, res, next) => {
   try {

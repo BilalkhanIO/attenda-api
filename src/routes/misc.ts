@@ -295,6 +295,23 @@ orgRouter.put('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
   } catch (e) { next(e); }
 });
 
+// GET /org/whatsapp/logs
+orgRouter.get('/whatsapp/logs', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const { page = '1', limit = '50', event_type, status } = req.query as Record<string, string>;
+    const take = Math.min(parseInt(limit) || 50, 200);
+    const skip = (Math.max(parseInt(page) || 1, 1) - 1) * take;
+    const where: Record<string, unknown> = { org_id: req.user!.org_id };
+    if (event_type) where.event_type = event_type;
+    if (status)     where.status     = status;
+    const [logs, total] = await Promise.all([
+      prisma.whatsappLog.findMany({ where, orderBy: { created_at: 'desc' }, take, skip }),
+      prisma.whatsappLog.count({ where }),
+    ]);
+    ok(res, { logs, total, page: parseInt(page) || 1, limit: take });
+  } catch (e) { next(e); }
+});
+
 // GET /org/departments
 orgRouter.get('/departments', async (req, res, next) => {
   try {

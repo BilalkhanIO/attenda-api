@@ -6,6 +6,7 @@ const config: Config = {
   roots: ['<rootDir>/src/__tests__'],
   testTimeout: 30_000,
   clearMocks: true,
+  testPathIgnorePatterns: ['/node_modules/', '/__mocks__/'],
   collectCoverageFrom: [
     'src/**/*.ts',
     '!src/__tests__/**',

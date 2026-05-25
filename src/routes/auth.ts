@@ -9,13 +9,20 @@ import prisma from '../utils/prisma';
 
 const router = Router();
 
+function validatePasswordStrength(password: string): void {
+  if (password.length < 8) throw new ValidationError('Password must be at least 8 characters');
+  if (!/[A-Z]/.test(password)) throw new ValidationError('Password must contain at least one uppercase letter');
+  if (!/[0-9]/.test(password)) throw new ValidationError('Password must contain at least one number');
+  if (!/[^A-Za-z0-9]/.test(password)) throw new ValidationError('Password must contain at least one special character');
+}
+
 // ─── POST /auth/register ───────────────────────────────
 // Register new organisation + Super Admin
 router.post('/register', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { org_name, timezone, currency, name, email, password } = req.body;
     if (!org_name || !name || !email || !password) throw new ValidationError('Missing required fields');
-    if (password.length < 8) throw new ValidationError('Password must be at least 8 characters');
+    validatePasswordStrength(password);
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) throw new AppError('Email already registered', 409, 'CONFLICT');
@@ -137,7 +144,7 @@ router.post('/reset-password', async (req: Request, res: Response, next: NextFun
   try {
     const { token, password } = req.body;
     if (!token || !password) throw new ValidationError('Token and password required');
-    if (password.length < 8) throw new ValidationError('Password must be at least 8 characters');
+    validatePasswordStrength(password);
 
     const user = await prisma.user.findFirst({
       where: { reset_token: token, reset_expires: { gt: new Date() } },
@@ -182,7 +189,7 @@ router.put('/change-password', authenticate, async (req: Request, res: Response,
   try {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) throw new ValidationError('current_password and new_password required');
-    if (new_password.length < 8) throw new ValidationError('Password must be at least 8 characters');
+    validatePasswordStrength(new_password);
 
     const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
     if (!user) throw new AppError('User not found', 404, 'NOT_FOUND');
