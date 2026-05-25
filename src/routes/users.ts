@@ -17,7 +17,7 @@ const USER_SELECT = {
 };
 
 // ─── GET /users/me ─────────────────────────────────────
-router.get('/me', async (req, res, next) => {
+router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: USER_SELECT });
     if (!user) throw new NotFoundError('User');
@@ -26,20 +26,38 @@ router.get('/me', async (req, res, next) => {
 });
 
 // ─── PUT /users/me ─────────────────────────────────────
-router.put('/me', async (req, res, next) => {
+router.put('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, phone, avatar_url } = req.body;
+    const update: Record<string, unknown> = {};
+    if (name !== undefined)       update.name       = name;
+    if (phone !== undefined)      update.phone      = phone;
+    if (avatar_url !== undefined) update.avatar_url = avatar_url;
+
     const user = await prisma.user.update({
       where: { id: req.user!.sub },
-      data: { name, phone, avatar_url },
+      data: update,
       select: USER_SELECT,
     });
     ok(res, user);
   } catch (e) { next(e); }
 });
 
+// ─── GET /users/meta/departments ──────────────────────
+// Must be before /:id to avoid route conflict
+router.get('/meta/departments', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const users = await prisma.user.findMany({
+      where: { org_id: req.user!.org_id, department: { not: null }, deleted_at: null },
+      select: { department: true },
+      distinct: ['department'],
+    });
+    ok(res, users.map(u => u.department).filter(Boolean));
+  } catch (e) { next(e); }
+});
+
 // ─── GET /users ────────────────────────────────────────
-router.get('/', requireRole('manager'), async (req, res, next) => {
+router.get('/', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { page = '1', limit = '50', department, role, status, search } = req.query as Record<string, string>;
     const pg = Math.max(1, parseInt(page));
@@ -72,18 +90,23 @@ router.get('/', requireRole('manager'), async (req, res, next) => {
 });
 
 // ─── POST /users ───────────────────────────────────────
-router.post('/', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, email, role, department, job_title, phone, hourly_rate, manager_id } = req.body;
     if (!name || !email || !role) throw new ValidationError('name, email and role are required');
 
+    const existing = await prisma.user.findUnique({ where: { email } });
+    if (existing) throw new ValidationError('Email already in use');
+
     const inviteToken   = generateToken();
     const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
 
     const user = await prisma.user.create({
       data: {
         org_id: req.user!.org_id, name, email,
-        password_hash: await hashPassword(inviteToken), // placeholder until setup
+        password_hash: await hashPassword(inviteToken),
         role, department, job_title, phone,
         hourly_rate: hourly_rate || 0,
         manager_id: manager_id || null,
@@ -97,7 +120,7 @@ router.post('/', requireRole('hr_admin'), async (req, res, next) => {
     const { sendWelcomeEmail } = await import('../services/email');
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const setupLink   = `${frontendUrl}/setup-account?token=${inviteToken}`;
-    await sendWelcomeEmail(email, name, req.user!.org_id, setupLink).catch(console.error);
+    await sendWelcomeEmail(email, name, org?.name || req.user!.org_id, setupLink).catch(console.error);
 
     // Create default leave balances
     const leaveTypes = ['annual', 'sick', 'wfh', 'unpaid'];
@@ -116,11 +139,11 @@ router.post('/', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // ─── GET /users/:id ────────────────────────────────────
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     // Users can see their own profile; managers/admins can see others in same org
-    if (id !== req.user!.sub && !['manager','hr_admin','super_admin'].includes(req.user!.role)) {
+    if (id !== req.user!.sub && !['manager', 'hr_admin', 'super_admin'].includes(req.user!.role)) {
       throw new ForbiddenError();
     }
     const user = await prisma.user.findFirst({
@@ -133,17 +156,25 @@ router.get('/:id', async (req, res, next) => {
 });
 
 // ─── PUT /users/:id ────────────────────────────────────
-router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
+router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const { name, role, department, job_title, phone, hourly_rate, manager_id } = req.body;
 
-    const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id } });
+    const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
     if (!user) throw new NotFoundError('User');
 
     const updated = await prisma.user.update({
       where: { id },
-      data: { name, role, department, job_title, phone, hourly_rate: hourly_rate ?? user.hourly_rate, manager_id: manager_id || null },
+      data: {
+        ...(name !== undefined       && { name }),
+        ...(role !== undefined       && { role }),
+        ...(department !== undefined && { department }),
+        ...(job_title !== undefined  && { job_title }),
+        ...(phone !== undefined      && { phone }),
+        ...(hourly_rate !== undefined && { hourly_rate }),
+        manager_id: manager_id !== undefined ? (manager_id || null) : user.manager_id,
+      },
       select: USER_SELECT,
     });
     ok(res, updated);
@@ -151,25 +182,46 @@ router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // ─── PATCH /users/:id/deactivate ───────────────────────
-router.patch('/:id/deactivate', requireRole('hr_admin'), async (req, res, next) => {
+router.patch('/:id/deactivate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     if (id === req.user!.sub) throw new ValidationError('Cannot deactivate yourself');
 
-    const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id } });
+    const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
     if (!user) throw new NotFoundError('User');
 
     await prisma.user.update({ where: { id }, data: { is_active: false } });
+
+    // Send deactivation email
+    const { sendDeactivationEmail } = await import('../services/email');
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
+    await sendDeactivationEmail(user.email, user.name, org?.name || 'your organisation').catch(console.error);
+
     ok(res, { message: 'User deactivated' });
   } catch (e) { next(e); }
 });
 
+// ─── PATCH /users/:id/activate ─────────────────────────
+router.patch('/:id/activate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+
+    const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
+    if (!user) throw new NotFoundError('User');
+    if (user.is_active) throw new ValidationError('User is already active');
+
+    await prisma.user.update({ where: { id }, data: { is_active: true } });
+    ok(res, { message: 'User activated' });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /users/import ────────────────────────────────
-router.post('/import', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/import', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { users } = req.body as { users: Array<{ name: string; email: string; role: string; department?: string }> };
     if (!Array.isArray(users) || users.length === 0) throw new ValidationError('No users provided');
 
+    const org   = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     const results = { created: 0, skipped: 0, errors: [] as string[] };
     const year = new Date().getFullYear();
 
@@ -186,13 +238,20 @@ router.post('/import', requireRole('hr_admin'), async (req, res, next) => {
           },
         });
         await prisma.leaveBalance.createMany({
-          data: ['annual','sick','wfh','unpaid'].map(lt => ({
+          data: ['annual', 'sick', 'wfh', 'unpaid'].map(lt => ({
             user_id: user.id, org_id: req.user!.org_id, leave_type: lt, year,
             total_days: lt === 'annual' ? 20 : lt === 'sick' ? 10 : lt === 'wfh' ? 5 : 0,
             used_days: 0,
           })),
           skipDuplicates: true,
         });
+
+        // Send welcome email
+        const { sendWelcomeEmail } = await import('../services/email');
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+        const setupLink   = `${frontendUrl}/setup-account?token=${token}`;
+        await sendWelcomeEmail(u.email, u.name, org?.name || req.user!.org_id, setupLink).catch(console.error);
+
         results.created++;
       } catch {
         results.skipped++;
@@ -203,15 +262,29 @@ router.post('/import', requireRole('hr_admin'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ─── GET /users/departments ────────────────────────────
-router.get('/meta/departments', async (req, res, next) => {
+// ─── POST /users/:id/resend-invite ─────────────────────
+router.post('/:id/resend-invite', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const users = await prisma.user.findMany({
-      where: { org_id: req.user!.org_id, department: { not: null }, deleted_at: null },
-      select: { department: true },
-      distinct: ['department'],
+    const { id } = req.params;
+    const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
+    if (!user) throw new NotFoundError('User');
+    if (user.setup_complete) throw new ValidationError('Account is already set up');
+
+    const inviteToken   = generateToken();
+    const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+    await prisma.user.update({
+      where: { id },
+      data: { invite_token: inviteToken, invite_expires: inviteExpires },
     });
-    ok(res, users.map(u => u.department).filter(Boolean));
+
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
+    const { sendWelcomeEmail } = await import('../services/email');
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const setupLink   = `${frontendUrl}/setup-account?token=${inviteToken}`;
+    await sendWelcomeEmail(user.email, user.name, org?.name || req.user!.org_id, setupLink).catch(console.error);
+
+    ok(res, { message: 'Invite resent' });
   } catch (e) { next(e); }
 });
 

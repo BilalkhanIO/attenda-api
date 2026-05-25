@@ -113,15 +113,15 @@ export async function notify(opts: SendOptions): Promise<void> {
 }
 
 // ─── High-level event dispatchers ────────────────────
-export async function notifyCheckIn(orgId: string, name: string, time: string): Promise<void> {
-  const org = await getOrgGroups(orgId);
+export async function notifyCheckIn(orgId: string, name: string, time: string, department?: string): Promise<void> {
+  const org = await getOrgGroups(orgId, department);
   for (const groupId of org.groupIds) {
     await notify({ orgId, event: 'check_in', message: Templates.CHECK_IN(name, time), recipientType: 'group', recipientId: groupId });
   }
 }
 
-export async function notifyCheckOut(orgId: string, name: string, time: string): Promise<void> {
-  const org = await getOrgGroups(orgId);
+export async function notifyCheckOut(orgId: string, name: string, time: string, department?: string): Promise<void> {
+  const org = await getOrgGroups(orgId, department);
   for (const groupId of org.groupIds) {
     await notify({ orgId, event: 'check_out', message: Templates.CHECK_OUT(name, time), recipientType: 'group', recipientId: groupId });
   }
@@ -136,8 +136,8 @@ export async function notifyAbsent(orgId: string, name: string, managerPhone: st
   await notify({ orgId, event: 'absent', message: Templates.ABSENT(name), recipientType: 'individual', recipientId: managerPhone });
 }
 
-export async function notifyRemote(orgId: string, name: string): Promise<void> {
-  const org = await getOrgGroups(orgId);
+export async function notifyRemote(orgId: string, name: string, department?: string): Promise<void> {
+  const org = await getOrgGroups(orgId, department);
   for (const groupId of org.groupIds) {
     await notify({ orgId, event: 'remote', message: Templates.REMOTE(name), recipientType: 'group', recipientId: groupId });
   }
@@ -288,9 +288,18 @@ Respond ONLY with valid JSON (no markdown):
 }
 
 // ─── Helpers ──────────────────────────────────────────
-async function getOrgGroups(orgId: string): Promise<{ groupIds: string[] }> {
+async function getOrgGroups(orgId: string, department?: string): Promise<{ groupIds: string[] }> {
   const org = await prisma.organisation.findUnique({ where: { id: orgId } });
-  return { groupIds: org?.wa_group_ids || [] };
+  if (!org) return { groupIds: [] };
+
+  // If a department is provided, prefer the department-specific group
+  if (department) {
+    const deptGroups = (org.wa_dept_groups as Record<string, string>) || {};
+    const deptGroupId = deptGroups[department];
+    if (deptGroupId) return { groupIds: [deptGroupId] };
+  }
+
+  return { groupIds: org.wa_group_ids || [] };
 }
 
 function sleep(ms: number): Promise<void> {

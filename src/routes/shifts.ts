@@ -132,10 +132,43 @@ router.delete('/assignments/:id', requireRole('hr_admin'), async (req, res, next
 router.post('/schedule/publish', requireRole('hr_admin'), async (req, res, next) => {
   try {
     const { week_start } = req.body;
-    // Mark all shifts for this week as published
-    const ws = week_start ? new Date(week_start) : new Date();
-    // TODO: Send WhatsApp notifications to all employees with their shifts
-    ok(res, { message: 'Schedule published. Employees will be notified.', week_start: ws });
+    const ws = week_start ? new Date(week_start) : (() => { const d = new Date(); d.setDate(d.getDate() - d.getDay() + 1); return d; })();
+    const we = new Date(ws); we.setDate(we.getDate() + 6);
+
+    // Mark shift templates as published
+    await prisma.shift.updateMany({
+      where: { org_id: req.user!.org_id },
+      data: { is_published: true },
+    });
+
+    // Get all assignments for the week and notify employees
+    const assignments = await prisma.shiftAssignment.findMany({
+      where: {
+        date:  { gte: ws, lte: we },
+        shift: { org_id: req.user!.org_id },
+      },
+      include: {
+        user:  { select: { id: true, name: true, phone: true, org_id: true } },
+        shift: { select: { name: true, start_time: true } },
+      },
+    });
+
+    let notified = 0;
+    const { notifyShiftReminder } = await import('../services/whatsapp');
+    for (const a of assignments) {
+      if (a.user.phone) {
+        await notifyShiftReminder(a.user.org_id, a.user.name, a.shift.start_time, a.user.phone).catch(console.error);
+        notified++;
+      }
+    }
+
+    ok(res, {
+      message: `Schedule published. ${notified} employees notified via WhatsApp.`,
+      week_start:  ws.toISOString().split('T')[0],
+      week_end:    we.toISOString().split('T')[0],
+      assignments: assignments.length,
+      notified,
+    });
   } catch (e) { next(e); }
 });
 
@@ -150,6 +183,28 @@ router.get('/assignments/me', async (req, res, next) => {
       orderBy: { date: 'asc' },
     });
     ok(res, assignments);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /shifts/swaps/me ──────────────────────────────
+router.get('/swaps/me', async (req, res, next) => {
+  try {
+    const swaps = await prisma.shiftSwap.findMany({
+      where: {
+        OR: [
+          { requester_id: req.user!.sub },
+          { target_id:    req.user!.sub },
+        ],
+      },
+      include: {
+        requester:            { select: { id: true, name: true } },
+        target:               { select: { id: true, name: true } },
+        requester_assignment: { include: { shift: true } },
+        target_assignment:    { include: { shift: true } },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+    ok(res, swaps);
   } catch (e) { next(e); }
 });
 
@@ -216,6 +271,47 @@ router.put('/swaps/:id/reject', requireRole('manager'), async (req, res, next) =
     if (!swap) throw new NotFoundError('Swap request');
     await prisma.shiftSwap.update({ where: { id: swap.id }, data: { status: 'rejected', manager_id: req.user!.sub, rejection_reason: reason } });
     ok(res, { message: 'Swap rejected' });
+  } catch (e) { next(e); }
+});
+
+// ─── POST /shifts/ai-schedule ─────────────────────────
+// Describe staffing needs in plain English; AI returns a shift plan
+router.post('/ai-schedule', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new ValidationError('AI service not configured');
+
+    const { description, week_start, department } = req.body;
+    if (!description) throw new ValidationError('description required (e.g. "Cover Mon-Fri 9-5 for Engineering, 3 people each day")');
+
+    const existingShifts = await prisma.shift.findMany({
+      where: { org_id: req.user!.org_id, ...(department ? {} : {}) },
+      select: { id: true, name: true, start_time: true, end_time: true, active_days: true },
+    });
+
+    const employees = await prisma.user.findMany({
+      where: { org_id: req.user!.org_id, is_active: true, deleted_at: null, ...(department ? { department } : {}) },
+      select: { id: true, name: true, department: true, job_title: true },
+    });
+
+    const axios = (await import('axios')).default;
+    const aiRes = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2048,
+        messages: [{
+          role: 'user',
+          content: `You are an HR scheduling AI. Create an optimal shift assignment plan based on this request.\n\nRequest: "${description}"\nWeek starting: ${week_start || 'next Monday'}\nDepartment filter: ${department || 'all'}\n\nAvailable shifts:\n${JSON.stringify(existingShifts, null, 2)}\n\nAvailable employees:\n${JSON.stringify(employees, null, 2)}\n\nReturn a JSON object with:\n- "plan": array of { user_id, user_name, shift_id, shift_name, dates: ["YYYY-MM-DD", ...] }\n- "summary": plain English explanation of the schedule (2-3 sentences)\n- "warnings": any coverage gaps or concerns\n\nEnsure fair distribution and no employee is double-booked. Use only the shift IDs and user IDs from the provided lists.`,
+        }],
+      },
+      { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } },
+    );
+
+    const text = aiRes.data.content?.[0]?.text || '{}';
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const result = jsonMatch ? JSON.parse(jsonMatch[0]) : { plan: [], summary: text, warnings: [] };
+    ok(res, result);
   } catch (e) { next(e); }
 });
 

@@ -24,6 +24,15 @@ app.use(cors({
   credentials: true,
   methods:     ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
 }));
+
+// Capture raw body for webhook signature verification
+app.use('/api/v1/webhooks', express.json({
+  limit: '5mb',
+  verify: (req: express.Request & { rawBody?: Buffer }, _res, buf) => {
+    req.rawBody = buf;
+  },
+}));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());

@@ -13,8 +13,8 @@
     "db:seed": "ts-node src/utils/seed.ts",
     "db:studio": "prisma studio",
     "test": "jest --runInBand",
-    "test:unit": "jest --runInBand --testPathPattern=unit",
-    "test:integration": "jest --runInBand --testPathPattern=integration",
+    "test:unit": "jest --runInBand --testPathPatterns=unit",
+    "test:integration": "jest --runInBand --testPathPatterns=integration",
     "test:coverage": "jest --runInBand --coverage"
   },
   "keywords": [],
@@ -25,6 +25,7 @@
     "@aws-sdk/s3-request-presigner": "^3.1051.0",
     "@prisma/adapter-pg": "^7.8.0",
     "@prisma/client": "^7.8.0",
+    "@types/otplib": "^7.0.0",
     "@types/pg": "^8.20.0",
     "axios": "^1.16.1",
     "bcryptjs": "^3.0.3",
@@ -43,6 +44,7 @@
     "multer": "^2.1.1",
     "node-cron": "^4.2.1",
     "nodemailer": "^8.0.7",
+    "otplib": "^13.4.0",
     "pdfkit": "^0.18.0",
     "pg": "^8.21.0",
     "qrcode": "^1.5.4",
@@ -54,6 +56,7 @@
     "@types/cookie-parser": "^1.4.10",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/jest": "^30.0.0",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/morgan": "^1.9.10",
     "@types/multer": "^2.1.0",
@@ -73,26 +76,5 @@
     "ts-jest": "^29.4.10",
     "ts-node": "^10.9.2",
     "typescript": "^6.0.3"
-  },
-  "jest": {
-    "preset": "ts-jest",
-    "testEnvironment": "node",
-    "roots": [
-      "<rootDir>/src/__tests__"
-    ],
-    "setupFilesAfterFramework": [],
-    "testTimeout": 30000,
-    "collectCoverageFrom": [
-      "src/**/*.ts",
-      "!src/__tests__/**",
-      "!src/utils/seed.ts"
-    ],
-    "coverageThreshold": {
-      "global": {
-        "branches": 60,
-        "functions": 70,
-        "lines": 70
-      }
-    }
   }
 }
