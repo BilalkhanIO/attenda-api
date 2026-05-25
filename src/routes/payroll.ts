@@ -51,9 +51,12 @@ router.post('/generate', requireRole('hr_admin'), async (req, res, next) => {
     const start = startOfMonth(y, m);
     const end   = endOfMonth(y, m);
 
-    const users = await prisma.user.findMany({
-      where: { org_id: req.user!.org_id, is_active: true, deleted_at: null },
-    });
+    const [users, org] = await Promise.all([
+      prisma.user.findMany({ where: { org_id: req.user!.org_id, is_active: true, deleted_at: null } }),
+      prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { tax_rate: true, pension_rate: true } }),
+    ]);
+    const taxRate     = (org?.tax_rate     ?? 0) / 100;
+    const pensionRate = (org?.pension_rate ?? 0) / 100;
 
     const created: string[] = [];
     const incomplete: string[] = [];
@@ -86,16 +89,20 @@ router.post('/generate', requireRole('hr_admin'), async (req, res, next) => {
       const basePay     = regularHours * hourlyRate;
       const overtimePay = overtimeHours * hourlyRate * 1.5;
       const deduction   = unpaidDays * dailyRate;
-      const grossPay    = Math.max(0, basePay + overtimePay - deduction);
+      const grossPay      = Math.max(0, basePay + overtimePay - deduction);
+      const taxDeduction  = grossPay * taxRate;
+      const pensionDeduct = grossPay * pensionRate;
+      const netPay        = Math.max(0, grossPay - taxDeduction - pensionDeduct);
 
       await prisma.payrollRecord.upsert({
         where: { user_id_period_month_period_year: { user_id: user.id, period_month: m, period_year: y } },
-        update: { regular_hours: regularHours, overtime_hours: overtimeHours, hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay, unpaid_deduction: deduction, gross_pay: grossPay, is_incomplete: Number(user.hourly_rate) === 0 },
+        update: { regular_hours: regularHours, overtime_hours: overtimeHours, hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay, unpaid_deduction: deduction, gross_pay: grossPay, tax_deduction: taxDeduction, pension_deduction: pensionDeduct, net_pay: netPay, is_incomplete: Number(user.hourly_rate) === 0 },
         create: {
           user_id: user.id, org_id: req.user!.org_id, period_month: m, period_year: y,
           regular_hours: regularHours, overtime_hours: overtimeHours,
           hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay,
           unpaid_deduction: deduction, gross_pay: grossPay,
+          tax_deduction: taxDeduction, pension_deduction: pensionDeduct, net_pay: netPay,
           is_incomplete: Number(user.hourly_rate) === 0,
         },
       });

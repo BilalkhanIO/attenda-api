@@ -234,7 +234,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     if (record.user && type !== 'remote') {
       const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
       const timeStr = formatTime12h(record.check_in_at || now);
-      notifyCheckIn(req.user!.org_id, record.user.name, timeStr).catch(console.error);
+      notifyCheckIn(req.user!.org_id, record.user.name, timeStr, record.user.department ?? undefined).catch(console.error);
     }
 
     ok(res, record);
@@ -264,7 +264,7 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
     if (updated.user) {
       const { notifyCheckOut, formatTime12h } = await import('../services/whatsapp');
       const timeStr = formatTime12h(updated.check_out_at || now);
-      notifyCheckOut(req.user!.org_id, updated.user.name, timeStr).catch(console.error);
+      notifyCheckOut(req.user!.org_id, updated.user.name, timeStr, updated.user.department ?? undefined).catch(console.error);
     }
     ok(res, updated);
   } catch (e) { next(e); }

@@ -128,6 +128,63 @@ performanceRouter.put('/goals/:id', requireRole('manager'), async (req, res, nex
   } catch (e) { next(e); }
 });
 
+// ─── AI: GET /performance/reviews/:userId/insights ────
+performanceRouter.get('/reviews/:userId/insights', requireRole('manager'), async (req, res, next) => {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.params.userId },
+      select: { id: true, name: true, department: true, job_title: true },
+    });
+    if (!user) throw new NotFoundError('User');
+
+    const [reviews, goals, attendance] = await Promise.all([
+      prisma.performanceReview.findMany({
+        where: { user_id: user.id },
+        orderBy: [{ period_year: 'desc' }, { period_month: 'desc' }],
+        take: 6,
+      }),
+      prisma.performanceGoal.findMany({
+        where: { user_id: user.id },
+        orderBy: { created_at: 'desc' },
+        take: 10,
+      }),
+      prisma.attendanceRecord.findMany({
+        where: { user_id: user.id, date: { gte: new Date(new Date().setMonth(new Date().getMonth() - 3)) } },
+      }),
+    ]);
+
+    const attendanceSummary = {
+      total_days: attendance.length,
+      present: attendance.filter(r => ['in','out'].includes(r.status)).length,
+      late: attendance.filter(r => r.status === 'late').length,
+      absent: attendance.filter(r => r.status === 'absent').length,
+      remote: attendance.filter(r => r.status === 'remote').length,
+    };
+
+    const axios = (await import('axios')).default;
+    const aiRes = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 768,
+        messages: [{
+          role: 'user',
+          content: `Generate a professional monthly performance insight summary for this employee. Be constructive, specific, and actionable.\n\nEmployee: ${user.name}\nRole: ${user.job_title || 'N/A'}\nDepartment: ${user.department || 'N/A'}\n\nReview history (last 6 months):\n${JSON.stringify(reviews.map(r => ({ month: `${r.period_year}-${r.period_month}`, rating: r.manager_rating, score: r.overall_score, notes: r.notes })), null, 2)}\n\nGoals (recent):\n${JSON.stringify(goals.map(g => ({ title: g.title, weight: g.weight, completion: g.completion })), null, 2)}\n\nAttendance (last 90 days): ${JSON.stringify(attendanceSummary)}\n\nProvide: 1) Performance trend summary (2-3 sentences), 2) Strengths (2 bullet points), 3) Areas to improve (2 bullet points), 4) Recommended action for manager (1-2 sentences).`,
+        }],
+      },
+      { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } },
+    );
+    ok(res, {
+      user: { id: user.id, name: user.name },
+      insights: aiRes.data.content?.[0]?.text,
+      data_summary: { reviews: reviews.length, goals: goals.length, attendance: attendanceSummary },
+    });
+  } catch (e) { next(e); }
+});
+
 async function calcAttendanceScore(userId: string, month: number, year: number): Promise<number> {
   const start = new Date(year, month - 1, 1);
   const end   = new Date(year, month, 0);
@@ -220,6 +277,153 @@ analyticsRouter.get('/payroll-cost', requireRole('hr_admin'), async (req, res, n
 });
 
 
+// ─── AI: GET /analytics/anomalies ─────────────────────
+analyticsRouter.get('/anomalies', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
+
+    const days = 30;
+    const since = new Date(); since.setDate(since.getDate() - days);
+
+    const records = await prisma.attendanceRecord.findMany({
+      where: { org_id: req.user!.org_id, date: { gte: since } },
+      include: { user: { select: { id: true, name: true, department: true } } },
+      orderBy: { date: 'desc' },
+    });
+
+    const summary = records.slice(0, 200).map(r => ({
+      user: r.user?.name,
+      dept: r.user?.department,
+      date: r.date,
+      status: r.status,
+      hours: r.hours_worked,
+      overtime: r.overtime_hours,
+      check_in: r.check_in_at,
+      ip: r.ip_detected,
+    }));
+
+    const axios = (await import('axios')).default;
+    const res2 = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: `You are an HR analytics AI. Analyze this attendance data from the last 30 days and identify anomalies: unusual hours, IP address inconsistencies, sudden schedule changes, suspicious patterns, excessive overtime, or concerning absenteeism.\n\nData:\n${JSON.stringify(summary, null, 2)}\n\nReturn a JSON array of anomalies with fields: user_name, type (e.g. "excessive_overtime", "ip_mismatch", "unusual_hours", "frequent_absence"), severity ("low","medium","high"), description, date.`,
+        }],
+      },
+      { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } },
+    );
+    const text = res2.data.content?.[0]?.text || '[]';
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    const anomalies = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    ok(res, { anomalies, analyzed_records: records.length, period_days: days });
+  } catch (e) { next(e); }
+});
+
+// ─── AI: GET /analytics/payroll-anomalies ─────────────
+analyticsRouter.get('/payroll-anomalies', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
+
+    const records = await prisma.payrollRecord.findMany({
+      where: { org_id: req.user!.org_id },
+      include: { user: { select: { name: true, department: true } } },
+      orderBy: [{ period_year: 'desc' }, { period_month: 'desc' }],
+      take: 100,
+    });
+
+    const summary = records.map(r => ({
+      user: r.user?.name,
+      dept: r.user?.department,
+      month: `${r.period_year}-${String(r.period_month).padStart(2,'0')}`,
+      regular_hours: Number(r.regular_hours),
+      overtime_hours: Number(r.overtime_hours),
+      gross_pay: Number(r.gross_pay),
+      adjustments: Number(r.manual_adjustment),
+    }));
+
+    const axios = (await import('axios')).default;
+    const aiRes = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1024,
+        messages: [{
+          role: 'user',
+          content: `You are an HR payroll AI. Analyze this payroll data and flag anomalies: unusual overtime, significant pay deviations from the same employee's history, unexplained manual adjustments, or outliers compared to peers.\n\nData:\n${JSON.stringify(summary, null, 2)}\n\nReturn a JSON array with fields: user_name, type, severity ("low","medium","high"), description, month.`,
+        }],
+      },
+      { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } },
+    );
+    const text = aiRes.data.content?.[0]?.text || '[]';
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    ok(res, { anomalies: jsonMatch ? JSON.parse(jsonMatch[0]) : [] });
+  } catch (e) { next(e); }
+});
+
+// ─── AI: POST /analytics/chat ─────────────────────────
+// HR assistant chatbot — natural language queries
+analyticsRouter.post('/chat', async (req, res, next) => {
+  try {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
+
+    const { message } = req.body;
+    if (!message) throw new ValidationError('message required');
+
+    const today = startOfDay(new Date());
+    const [todayRecords, totalUsers, pendingLeaves, recentPayroll] = await Promise.all([
+      prisma.attendanceRecord.findMany({
+        where: { org_id: req.user!.org_id, date: today },
+        include: { user: { select: { name: true, department: true } } },
+      }),
+      prisma.user.count({ where: { org_id: req.user!.org_id, is_active: true, deleted_at: null } }),
+      prisma.leaveRequest.count({ where: { org_id: req.user!.org_id, status: 'pending' } }),
+      prisma.payrollRecord.findMany({
+        where: { org_id: req.user!.org_id, status: 'processed' },
+        orderBy: [{ period_year: 'desc' }, { period_month: 'desc' }],
+        take: 5,
+        include: { user: { select: { name: true } } },
+      }),
+    ]);
+
+    const context = {
+      today: today.toISOString().split('T')[0],
+      total_employees: totalUsers,
+      pending_leaves: pendingLeaves,
+      today_attendance: {
+        present: todayRecords.filter(r => ['in','out','late'].includes(r.status)).length,
+        remote: todayRecords.filter(r => r.status === 'remote').length,
+        absent: todayRecords.filter(r => r.status === 'absent').length,
+        on_leave: todayRecords.filter(r => r.status === 'leave').length,
+        who_is_in: todayRecords.filter(r => r.status === 'in').map(r => r.user?.name),
+      },
+      recent_payroll_totals: recentPayroll.map(p => ({
+        user: p.user?.name,
+        month: `${p.period_year}-${p.period_month}`,
+        gross: Number(p.gross_pay),
+      })),
+    };
+
+    const axios = (await import('axios')).default;
+    const aiRes = await axios.post(
+      'https://api.anthropic.com/v1/messages',
+      {
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 512,
+        system: `You are an HR assistant for the Attenda attendance management system. Answer questions about employees, attendance, payroll, and leave based on the provided context. Be concise and helpful. Today's context: ${JSON.stringify(context)}`,
+        messages: [{ role: 'user', content: message }],
+      },
+      { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } },
+    );
+    ok(res, { reply: aiRes.data.content?.[0]?.text });
+  } catch (e) { next(e); }
+});
+
 // ─── ORG SETTINGS ─────────────────────────────────────
 export const orgRouter = Router();
 orgRouter.use(authenticate);
@@ -236,7 +440,7 @@ orgRouter.get('/settings', async (req, res, next) => {
 // PUT /org/settings
 orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) => {
   try {
-    const { name, timezone, currency, payroll_day } = req.body;
+    const { name, timezone, currency, payroll_day, tax_rate, pension_rate } = req.body;
     const data: Record<string, unknown> = {};
     if (name       !== undefined) data.name        = name;
     if (timezone   !== undefined) data.timezone    = timezone;
@@ -245,6 +449,16 @@ orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) =>
       const day = parseInt(payroll_day);
       if (day < 1 || day > 28) throw new ValidationError('payroll_day must be between 1 and 28');
       data.payroll_day = day;
+    }
+    if (tax_rate !== undefined) {
+      const rate = parseFloat(tax_rate);
+      if (rate < 0 || rate > 100) throw new ValidationError('tax_rate must be between 0 and 100');
+      data.tax_rate = rate;
+    }
+    if (pension_rate !== undefined) {
+      const rate = parseFloat(pension_rate);
+      if (rate < 0 || rate > 100) throw new ValidationError('pension_rate must be between 0 and 100');
+      data.pension_rate = rate;
     }
     const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, updated);
@@ -275,11 +489,12 @@ orgRouter.get('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     ok(res, {
-      enabled: org?.wa_enabled,
+      enabled:         org?.wa_enabled,
       phone_number_id: org?.wa_phone_number_id,
-      access_token: org?.wa_access_token ? '***redacted***' : null,
-      group_ids: org?.wa_group_ids,
-      events: org?.wa_events,
+      access_token:    org?.wa_access_token ? '***redacted***' : null,
+      group_ids:       org?.wa_group_ids,
+      events:          org?.wa_events,
+      dept_groups:     org?.wa_dept_groups ?? {},
     });
   } catch (e) { next(e); }
 });
@@ -287,10 +502,15 @@ orgRouter.get('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
 // PUT /org/whatsapp
 orgRouter.put('/whatsapp', requireRole('super_admin'), async (req, res, next) => {
   try {
-    const { enabled, phone_number_id, access_token, group_ids, events } = req.body;
-    const data: Record<string, unknown> = { wa_enabled: enabled, wa_phone_number_id: phone_number_id, wa_group_ids: group_ids, wa_events: events };
+    const { enabled, phone_number_id, access_token, group_ids, events, dept_groups } = req.body;
+    const data: Record<string, unknown> = {};
+    if (enabled          !== undefined) data.wa_enabled          = enabled;
+    if (phone_number_id  !== undefined) data.wa_phone_number_id  = phone_number_id;
+    if (group_ids        !== undefined) data.wa_group_ids        = group_ids;
+    if (events           !== undefined) data.wa_events           = events;
+    if (dept_groups      !== undefined) data.wa_dept_groups      = dept_groups; // { "Engineering": "group-id", ... }
     if (access_token && access_token !== '***redacted***') data.wa_access_token = access_token;
-    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
+    await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, { message: 'WhatsApp settings saved' });
   } catch (e) { next(e); }
 });
