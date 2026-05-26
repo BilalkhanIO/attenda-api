@@ -304,13 +304,46 @@ export function startPayrollAutoGenerate() {
         });
         if (existing) continue;
 
-        // Trigger payroll generation
+        // Generate payroll records for all active employees
+        const { startOfMonth, endOfMonth } = await import('../utils/auth');
+        const start = startOfMonth(year, month);
+        const end   = endOfMonth(year, month);
+
         const users = await prisma.user.findMany({
           where: { org_id: org.id, is_active: true, deleted_at: null },
         });
-        console.log(`[JOB] Auto-generating payroll for ${org.name} (${month}/${year}) — ${users.length} employees`);
+        const taxRate     = (Number(org.tax_rate)     || 0) / 100;
+        const pensionRate = (Number(org.pension_rate) || 0) / 100;
 
-        // Notify HR admin
+        for (const user of users) {
+          const attendance = await prisma.attendanceRecord.findMany({
+            where: { user_id: user.id, date: { gte: start, lte: end } },
+          });
+          const regularHours  = attendance.reduce((s, r) => s + Number(r.hours_worked || 0), 0);
+          const overtimeHours = attendance.reduce((s, r) => s + Number(r.overtime_hours || 0), 0);
+          const unpaidLeave   = await prisma.leaveRequest.findMany({
+            where: { user_id: user.id, status: 'approved', leave_type: 'unpaid', start_date: { lte: end }, end_date: { gte: start } },
+          });
+          const unpaidDays   = unpaidLeave.reduce((s, l) => s + l.working_days, 0);
+          const hourlyRate   = Number(user.hourly_rate);
+          const basePay      = regularHours * hourlyRate;
+          const overtimePay  = overtimeHours * hourlyRate * 1.5;
+          const deduction    = unpaidDays * hourlyRate * 8;
+          const grossPay     = Math.max(0, basePay + overtimePay - deduction);
+          const taxDed       = grossPay * taxRate;
+          const pensionDed   = grossPay * pensionRate;
+          const netPay       = Math.max(0, grossPay - taxDed - pensionDed);
+
+          await prisma.payrollRecord.upsert({
+            where: { user_id_period_month_period_year: { user_id: user.id, period_month: month, period_year: year } },
+            update: { regular_hours: regularHours, overtime_hours: overtimeHours, hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay, unpaid_deduction: deduction, gross_pay: grossPay, tax_deduction: taxDed, pension_deduction: pensionDed, net_pay: netPay, is_incomplete: hourlyRate === 0 },
+            create: { user_id: user.id, org_id: org.id, period_month: month, period_year: year, regular_hours: regularHours, overtime_hours: overtimeHours, hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay, unpaid_deduction: deduction, gross_pay: grossPay, tax_deduction: taxDed, pension_deduction: pensionDed, net_pay: netPay, is_incomplete: hourlyRate === 0 },
+          });
+        }
+
+        console.log(`[JOB] Auto-generated payroll for ${org.name} (${month}/${year}) — ${users.length} employees`);
+
+        // Notify HR admins
         const hrAdmins = await prisma.user.findMany({ where: { org_id: org.id, role: { in: ['hr_admin', 'super_admin'] } } });
         for (const admin of hrAdmins) {
           if (admin.phone) {

@@ -123,6 +123,10 @@ router.post('/assignments', requireRole('hr_admin'), async (req, res, next) => {
 // ─── DELETE /shifts/assignments/:id ───────────────────
 router.delete('/assignments/:id', requireRole('hr_admin'), async (req, res, next) => {
   try {
+    const assignment = await prisma.shiftAssignment.findFirst({
+      where: { id: req.params.id, shift: { org_id: req.user!.org_id } },
+    });
+    if (!assignment) throw new NotFoundError('Assignment');
     await prisma.shiftAssignment.delete({ where: { id: req.params.id } });
     ok(res, { message: 'Assignment removed' });
   } catch (e) { next(e); }
@@ -246,8 +250,8 @@ router.post('/swaps', async (req, res, next) => {
 // ─── PUT /shifts/swaps/:id/approve ────────────────────
 router.put('/swaps/:id/approve', requireRole('manager'), async (req, res, next) => {
   try {
-    const swap = await prisma.shiftSwap.findUnique({
-      where: { id: req.params.id },
+    const swap = await prisma.shiftSwap.findFirst({
+      where: { id: req.params.id, requester: { org_id: req.user!.org_id } },
       include: { requester_assignment: true, target_assignment: true },
     });
     if (!swap) throw new NotFoundError('Swap request');
@@ -267,7 +271,9 @@ router.put('/swaps/:id/reject', requireRole('manager'), async (req, res, next) =
   try {
     const { reason } = req.body;
     if (!reason) throw new ValidationError('Rejection reason required');
-    const swap = await prisma.shiftSwap.findUnique({ where: { id: req.params.id } });
+    const swap = await prisma.shiftSwap.findFirst({
+      where: { id: req.params.id, requester: { org_id: req.user!.org_id } },
+    });
     if (!swap) throw new NotFoundError('Swap request');
     await prisma.shiftSwap.update({ where: { id: swap.id }, data: { status: 'rejected', manager_id: req.user!.sub, rejection_reason: reason } });
     ok(res, { message: 'Swap rejected' });

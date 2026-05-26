@@ -166,7 +166,18 @@ router.put('/:id/adjust', requireRole('hr_admin'), async (req, res, next) => {
       Number(record.unpaid_deduction) +
       adj
     );
-    updateData.gross_pay = grossPay;
+    const org = await prisma.organisation.findUnique({
+      where: { id: record.org_id },
+      select: { tax_rate: true, pension_rate: true },
+    });
+    const taxRate     = (Number(org?.tax_rate)     || 0) / 100;
+    const pensionRate = (Number(org?.pension_rate) || 0) / 100;
+    const taxDeduction     = grossPay * taxRate;
+    const pensionDeduction = grossPay * pensionRate;
+    updateData.gross_pay          = grossPay;
+    updateData.tax_deduction      = taxDeduction;
+    updateData.pension_deduction  = pensionDeduction;
+    updateData.net_pay            = Math.max(0, grossPay - taxDeduction - pensionDeduction);
 
     const updated = await prisma.payrollRecord.update({
       where: { id: req.params.id },

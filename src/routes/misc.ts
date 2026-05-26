@@ -97,9 +97,17 @@ performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, r
 });
 
 // GET /performance/goals
-performanceRouter.get('/goals', authenticate, async (req, res, next) => {
+performanceRouter.get('/goals', async (req, res, next) => {
   try {
-    const userId = (req.query.user_id as string) || req.user!.sub;
+    const requestedUserId = req.query.user_id as string | undefined;
+    const isManager = ['manager', 'hr_admin', 'super_admin'].includes(req.user!.role);
+    // Non-managers can only read their own goals
+    const userId = (requestedUserId && isManager) ? requestedUserId : req.user!.sub;
+    // Verify the target user belongs to the same org
+    if (userId !== req.user!.sub) {
+      const target = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
+      if (!target) throw new NotFoundError('User');
+    }
     const goals = await prisma.performanceGoal.findMany({
       where: { user_id: userId },
       orderBy: { created_at: 'desc' },
@@ -123,7 +131,14 @@ performanceRouter.post('/goals', requireRole('manager'), async (req, res, next) 
 // PUT /performance/goals/:id
 performanceRouter.put('/goals/:id', requireRole('manager'), async (req, res, next) => {
   try {
-    const goal = await prisma.performanceGoal.update({ where: { id: req.params.id }, data: req.body });
+    const { title, description, weight, target_date, completion } = req.body;
+    const data: Record<string, unknown> = {};
+    if (title       !== undefined) data.title       = title;
+    if (description !== undefined) data.description = description;
+    if (weight      !== undefined) data.weight      = weight;
+    if (completion  !== undefined) data.completion  = completion;
+    if (target_date !== undefined) data.target_date = target_date ? new Date(target_date) : null;
+    const goal = await prisma.performanceGoal.update({ where: { id: req.params.id }, data });
     ok(res, goal);
   } catch (e) { next(e); }
 });
@@ -512,6 +527,25 @@ orgRouter.put('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
     if (access_token && access_token !== '***redacted***') data.wa_access_token = access_token;
     await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, { message: 'WhatsApp settings saved' });
+  } catch (e) { next(e); }
+});
+
+// POST /org/whatsapp/test
+orgRouter.post('/whatsapp/test', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
+    if (!org?.wa_phone_number_id || !org?.wa_access_token) {
+      throw new ValidationError('WhatsApp is not configured. Save credentials first.');
+    }
+    const { notify } = await import('../services/whatsapp');
+    const groups = (org.wa_groups as { id: string; phone: string; name: string }[] || []);
+    if (groups.length === 0) throw new ValidationError('No WhatsApp groups configured.');
+    let sent = 0;
+    for (const group of groups) {
+      await notify({ orgId: req.user!.org_id, event: 'check_in', recipientType: 'group', recipientId: group.phone, message: `✅ *Attenda Test Message*\nWhatsApp notifications are working correctly.\n_Sent by ${req.user!.name}_` }).catch(console.error);
+      sent++;
+    }
+    ok(res, { sent, message: `Test message sent to ${sent} group${sent !== 1 ? 's' : ''}.` });
   } catch (e) { next(e); }
 });
 
