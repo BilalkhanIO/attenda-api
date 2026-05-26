@@ -22,6 +22,7 @@ model Organisation {
   payroll_day        Int      @default(28)
   tax_rate           Float    @default(0)
   pension_rate       Float    @default(0)
+  late_threshold     Int      @default(15)
   plan               String   @db.VarChar(50) @default("trial")
   created_at         DateTime @default(now())
 

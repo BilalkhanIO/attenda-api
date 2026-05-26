@@ -455,7 +455,7 @@ orgRouter.get('/settings', async (req, res, next) => {
 // PUT /org/settings
 orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) => {
   try {
-    const { name, timezone, currency, payroll_day, tax_rate, pension_rate } = req.body;
+    const { name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold } = req.body;
     const data: Record<string, unknown> = {};
     if (name       !== undefined) data.name        = name;
     if (timezone   !== undefined) data.timezone    = timezone;
@@ -474,6 +474,11 @@ orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) =>
       const rate = parseFloat(pension_rate);
       if (rate < 0 || rate > 100) throw new ValidationError('pension_rate must be between 0 and 100');
       data.pension_rate = rate;
+    }
+    if (late_threshold !== undefined) {
+      const mins = parseInt(late_threshold);
+      if (mins < 0 || mins > 120) throw new ValidationError('late_threshold must be between 0 and 120 minutes');
+      data.late_threshold = mins;
     }
     const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, updated);
