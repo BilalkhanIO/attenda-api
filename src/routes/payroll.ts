@@ -84,7 +84,6 @@ router.post('/generate', requireRole('hr_admin'), async (req, res, next) => {
       });
       const unpaidDays  = unpaidLeave.reduce((s, l) => s + l.working_days, 0);
       const hourlyRate  = Number(user.hourly_rate);
-      const workingDays = 22; // average working days per month
       const dailyRate   = (hourlyRate * 8);
       const basePay     = regularHours * hourlyRate;
       const overtimePay = overtimeHours * hourlyRate * 1.5;

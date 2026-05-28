@@ -54,7 +54,7 @@ router.get('/remote/sessions', requireRole('manager'), async (req: Request, res:
       ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
       : null;
 
-    const where: Record<string, unknown> = {};
+    const where: Record<string, unknown> = { user: { org_id: req.user!.org_id } };
     if (status) where.status = status;
     if (teamIds) where.user_id = { in: teamIds };
 
@@ -313,7 +313,9 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
           const shiftStartMins = sh * 60 + sm;
           const nowMins        = now.getHours() * 60 + now.getMinutes();
-          if (nowMins > shiftStartMins + 15) status = 'late';
+          const ipOrg = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { late_threshold: true } });
+          const lateThreshold = ipOrg?.late_threshold ?? 15;
+          if (nowMins > shiftStartMins + lateThreshold) status = 'late';
         }
 
         const record = existing

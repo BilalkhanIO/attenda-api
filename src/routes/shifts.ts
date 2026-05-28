@@ -30,7 +30,7 @@ router.post('/', requireRole('hr_admin'), async (req, res, next) => {
     const { name, start_time, end_time, color, active_days } = req.body;
     if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
     const shift = await prisma.shift.create({
-      data: { org_id: req.user!.org_id, name, start_time, end_time, color: color || '#1D4ED8', active_days: active_days || [], created_by: req.user!.sub },
+      data: { org_id: req.user!.org_id, name, start_time, end_time, color: color || '#f15153', active_days: active_days || [], created_by: req.user!.sub },
     });
     created(res, shift);
   } catch (e) { next(e); }
