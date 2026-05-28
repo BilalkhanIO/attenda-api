@@ -15,8 +15,8 @@ const RECORD_INCLUDE = {
 // ─── GET /attendance/today ─────────────────────────────
 router.get('/today', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const today = new Date();
-    const date  = startOfDay(today);
+    const rawDate = req.query.date as string | undefined;
+    const date = rawDate ? startOfDay(new Date(rawDate)) : startOfDay(new Date());
     const where: Record<string, unknown> = { org_id: req.user!.org_id, date };
     if (req.user!.role === 'manager') {
       const teamIds = await prisma.user.findMany({
@@ -183,16 +183,19 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
 
     // Detect late arrival by comparing with assigned shift
     if (type !== 'remote') {
-      const assignment = await prisma.shiftAssignment.findFirst({
-        where: { user_id: req.user!.sub, date: today },
-        include: { shift: true },
-      });
+      const [assignment, org] = await Promise.all([
+        prisma.shiftAssignment.findFirst({
+          where: { user_id: req.user!.sub, date: today },
+          include: { shift: true },
+        }),
+        prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { late_threshold: true } }),
+      ]);
 
       if (assignment?.shift) {
         const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
         const shiftStartMins = sh * 60 + sm;
         const nowMins        = now.getHours() * 60 + now.getMinutes();
-        const lateThreshold  = 15; // minutes
+        const lateThreshold  = org?.late_threshold ?? 15;
         if (nowMins > shiftStartMins + lateThreshold) {
           status = 'late';
         }
