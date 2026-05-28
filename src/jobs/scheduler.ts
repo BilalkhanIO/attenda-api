@@ -41,8 +41,8 @@ export function startLateArrivalDetector() {
           });
 
           if (!record || !record.check_in_at) {
-            // Mark as late at 15 min threshold (configurable, default 15 per spec)
-            if (diffMins >= 15) {
+            // Mark as late at 15 min mark
+            if (diffMins === 15) {
               await prisma.attendanceRecord.upsert({
                 where: { user_id_date: { user_id: user.id, date: today } },
                 update: { status: 'late' },
@@ -50,8 +50,8 @@ export function startLateArrivalDetector() {
               });
             }
 
-            // Notify manager
-            if (user.manager?.phone) {
+            // Notify manager at 30 min mark only (avoids double-alerting)
+            if (diffMins === 30 && user.manager?.phone) {
               await notifyLateArrival(user.org_id, user.name, diffMins, user.manager.phone);
             }
           }
