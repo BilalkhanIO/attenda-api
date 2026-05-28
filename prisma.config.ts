@@ -5,9 +5,11 @@ dotenv.config();
 
 export default defineConfig({
   datasource: {
-    url: process.env.DATABASE_URL!,
+    // Fallback keeps prisma generate working at Docker build time (no DB needed).
+    // At runtime DATABASE_URL is always set by Railway.
+    url: process.env.DATABASE_URL ?? 'postgresql://localhost:5432/placeholder',
   },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
-  }
+  migrations: {
+    path: 'prisma/migrations',
+  },
 });
