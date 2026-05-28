@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import prisma from './prisma';
-import { hashPassword } from './auth';
+import { hashPassword } from './src/utils/auth';
 
 async function seed() {
   console.log('🌱 Seeding database...');
