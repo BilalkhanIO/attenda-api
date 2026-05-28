@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import prisma from './prisma';
+import prisma from '../src/utils/prisma';
 import { hashPassword } from '../src/utils/auth';
 
 async function seed() {
