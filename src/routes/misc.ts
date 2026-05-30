@@ -135,6 +135,14 @@ performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, r
 // GET /performance/goals
 performanceRouter.get('/goals', async (req, res, next) => {
   try {
+    // One-time runtime fix: sanitise legacy text 'pending' values left over
+    // from the original schema before the goal_completion_int migration runs.
+    await prisma.$executeRaw`
+      UPDATE performance_goals
+         SET completion = '0'
+       WHERE completion !~ '^[0-9]+$'
+    `;
+
     const requestedUserId = req.query.user_id as string | undefined;
     const isManager = ['manager', 'hr_admin', 'super_admin'].includes(req.user!.role);
     let goalWhere: Record<string, unknown>;
