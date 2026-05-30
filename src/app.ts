@@ -19,10 +19,22 @@ const app = express();
 
 // ─── Security & Parsing ───────────────────────────────
 app.use(helmet());
+const allowedOrigins = new Set(
+  (process.env.FRONTEND_URL || 'http://localhost:3000')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean)
+);
+
 app.use(cors({
-  origin:      process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: (origin, cb) => {
+    // Allow requests with no origin (mobile apps, curl, server-to-server)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.has(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
   credentials: true,
-  methods:     ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 
 // Capture raw body for webhook signature verification
