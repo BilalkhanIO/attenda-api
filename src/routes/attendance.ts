@@ -133,7 +133,88 @@ router.get('/remote/sessions/me', async (req: Request, res: Response, next: Next
   } catch (e) { next(e); }
 });
 
-// ─── POST /attendance/break/start ─────────────────────
+// ─── GET /attendance/remote/monitor ───────────────────
+// Live dashboard: today's sessions with nudge logs & computed online status
+router.get('/remote/monitor', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = startOfDay(new Date());
+    const now   = new Date();
+
+    const isManager = req.user!.role === 'manager';
+    const teamIds = isManager
+      ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
+      : null;
+
+    const where: Record<string, unknown> = { user: { org_id: req.user!.org_id }, created_at: { gte: today } };
+    if (teamIds) where.user_id = { in: teamIds };
+
+    const sessions = await prisma.remoteSession.findMany({
+      where,
+      include: {
+        user:         { select: { id: true, name: true, department: true, avatar_url: true, phone: true } },
+        attendance:   { select: { date: true } },
+        checkin_logs: { orderBy: { nudge_sent_at: 'asc' } },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+
+    const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+
+    const enriched = sessions.map(s => {
+      const logs      = s.checkin_logs;
+      const replies   = logs.filter(l => l.reply_at);
+      const lastReply = replies.sort((a, b) => new Date(b.reply_at!).getTime() - new Date(a.reply_at!).getTime())[0];
+      const is_online = lastReply ? new Date(lastReply.reply_at!).getTime() > twoHoursAgo.getTime() : false;
+      const latestLog = [...logs].filter(l => l.sentiment).reverse()[0];
+      return {
+        ...s,
+        is_online,
+        last_seen:           lastReply?.reply_at ?? null,
+        responded_count:     replies.length,
+        no_reply_count:      logs.filter(l => l.no_reply_alerted).length,
+        latest_sentiment:    latestLog?.sentiment ?? null,
+        latest_task_summary: latestLog?.task_summary ?? null,
+      };
+    });
+
+    const total       = enriched.length;
+    const responded   = enriched.filter(s => s.responded_count > 0).length;
+    const noReply     = enriched.filter(s => s.no_reply_count > 0).length;
+    const sentiments  = enriched.map(s => s.latest_sentiment).filter(Boolean);
+    const positives   = sentiments.filter(s => s === 'positive').length;
+    const negatives   = sentiments.filter(s => s === 'negative').length;
+    const avgSentiment = sentiments.length === 0 ? null
+      : positives > negatives ? 'positive'
+      : negatives > positives ? 'negative'
+      : 'neutral';
+
+    ok(res, {
+      date:  today,
+      stats: { total, responded, no_reply: noReply, avg_sentiment: avgSentiment },
+      sessions: enriched,
+    });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/remote/sessions/:id/logs ─────────
+// Full nudge log for one session — accessible by the employee or their manager
+router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const isEmployee = req.user!.role === 'employee';
+    const session = await prisma.remoteSession.findFirst({
+      where: isEmployee
+        ? { id: req.params.id, user_id: req.user!.sub }
+        : { id: req.params.id, user: { org_id: req.user!.org_id } },
+      include: {
+        user:         { select: { id: true, name: true, department: true, avatar_url: true } },
+        attendance:   { select: { date: true } },
+        checkin_logs: { orderBy: { nudge_sent_at: 'asc' } },
+      },
+    });
+    if (!session) throw new NotFoundError('Remote session');
+    ok(res, session);
+  } catch (e) { next(e); }
+});
 router.post('/break/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { break_type = 'rest' } = req.body;
