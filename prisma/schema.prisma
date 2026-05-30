@@ -13,6 +13,7 @@ model Organisation {
   timezone           String   @db.VarChar(100)
   currency           String   @db.VarChar(10) @default("USD")
   office_ips         String[] @default([])
+  office_ssids       String[] @default([])
   wa_enabled         Boolean  @default(false)
   wa_phone_number_id String?  @db.VarChar(255)
   wa_access_token    String?

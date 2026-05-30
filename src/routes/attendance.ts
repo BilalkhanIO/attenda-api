@@ -2,7 +2,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
-import { startOfDay, calcHoursWorked } from '../utils/auth';
+import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -360,17 +360,20 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
 });
 
 // ─── POST /attendance/ip-event ─────────────────────────
-// Called by Flutter app when IP match/unmatch detected
+// Called by Flutter app when WiFi connect/disconnect detected.
+// Accepts: event ('match'|'unmatch'), ip (device LAN IP or CIDR), ssid (WiFi network name)
+// SSID matching is preferred — more reliable than IP for orgs without static IPs.
 router.post('/ip-event', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { event, ip } = req.body; // event: 'match' | 'unmatch'
-    if (!event || !ip) throw new ValidationError('event and ip are required');
+    const { event, ip, ssid } = req.body;
+    if (!event) throw new ValidationError('event is required');
+    if (!ip && !ssid) throw new ValidationError('ip or ssid is required');
     const today = startOfDay(new Date());
 
-    // Verify IP against org registered IPs
+    // Check against org's registered office networks (SSID first, then IP/CIDR)
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
-    if (!org?.office_ips.includes(ip)) {
-      return ok(res, { action: 'none', reason: 'IP not in registered office IPs' });
+    if (!isOfficeNetwork(ip, ssid, org?.office_ips ?? [], (org as any)?.office_ssids ?? [])) {
+      return ok(res, { action: 'none', reason: 'Not on a registered office network' });
     }
 
     if (event === 'match') {

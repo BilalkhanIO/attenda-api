@@ -28,7 +28,7 @@ async function run() {
     `);
 
     if (tableRows[0].ready) {
-      console.log('[migrate] Schema already applied — skipping migration');
+      console.log('[migrate] Schema already applied — skipping initial migration');
     } else {
       console.log('[migrate] Applying initial migration …');
       const sql = fs.readFileSync(
@@ -40,6 +40,24 @@ async function run() {
       await client.query(sql);
       await client.query('COMMIT');
       console.log('[migrate] Done — all tables created');
+    }
+
+    // ── 1b. Incremental migrations (idempotent — use IF NOT EXISTS / ADD COLUMN IF NOT EXISTS)
+    const incrementalMigrations = [
+      'prisma/migrations/20260201000000_shift_breaks_overtime/migration.sql',
+      'prisma/migrations/20260301000000_ssid_support/migration.sql',
+    ];
+    for (const relPath of incrementalMigrations) {
+      const migPath = path.join(ROOT, relPath);
+      if (!fs.existsSync(migPath)) continue;
+      const sql = fs.readFileSync(migPath, 'utf8');
+      try {
+        await client.query(sql);
+        console.log(`[migrate] Applied: ${relPath}`);
+      } catch (err) {
+        // Non-fatal if already applied (IF NOT EXISTS guards handle most cases)
+        console.warn(`[migrate] Skipped (already applied?): ${relPath} — ${err.message}`);
+      }
     }
 
     // ── 2. Seed ───────────────────────────────────────────────────────────────
