@@ -1,10 +1,13 @@
 'use strict';
-// Applies the initial migration using pg directly.
+// Applies the initial migration using pg directly, then seeds demo data.
 // Prisma Migrate (migrate deploy) doesn't work reliably with the
 // PrismaPg driver-adapter in Prisma 7 — this script is the safe alternative.
-const { Pool } = require('pg');
-const fs       = require('fs');
-const path     = require('path');
+const { Pool }    = require('pg');
+const { execSync } = require('child_process');
+const fs           = require('fs');
+const path         = require('path');
+
+const ROOT = path.join(__dirname, '..');
 
 async function run() {
   if (!process.env.DATABASE_URL) {
@@ -14,6 +17,8 @@ async function run() {
 
   const pool   = new Pool({ connectionString: process.env.DATABASE_URL });
   const client = await pool.connect();
+
+  let freshInstall = false;
 
   try {
     // If the organisations table exists the schema is already applied.
@@ -25,20 +30,20 @@ async function run() {
     `);
 
     if (rows[0].ready) {
-      console.log('[migrate] Schema already applied — skipping');
-      return;
+      console.log('[migrate] Schema already applied — skipping migration');
+    } else {
+      console.log('[migrate] Applying initial migration …');
+      const sql = fs.readFileSync(
+        path.join(ROOT, 'prisma/migrations/20260101000000_init/migration.sql'),
+        'utf8'
+      );
+
+      await client.query('BEGIN');
+      await client.query(sql);
+      await client.query('COMMIT');
+      console.log('[migrate] Done — all tables created');
+      freshInstall = true;
     }
-
-    console.log('[migrate] Applying initial migration …');
-    const sql = fs.readFileSync(
-      path.join(__dirname, '../prisma/migrations/20260101000000_init/migration.sql'),
-      'utf8'
-    );
-
-    await client.query('BEGIN');
-    await client.query(sql);
-    await client.query('COMMIT');
-    console.log('[migrate] Done — all tables created');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('[migrate] Failed:', err.message);
@@ -46,6 +51,18 @@ async function run() {
   } finally {
     client.release();
     await pool.end();
+  }
+
+  // Seed demo data only on a fresh install so subsequent deploys stay fast.
+  if (freshInstall) {
+    console.log('[seed] Running initial seed …');
+    try {
+      execSync('node dist/utils/seed.js', { stdio: 'inherit', cwd: ROOT });
+      console.log('[seed] Done');
+    } catch (err) {
+      // Seed failure is non-fatal — tables exist, app will still start.
+      console.error('[seed] Seed failed (non-fatal):', err.message);
+    }
   }
 }
 

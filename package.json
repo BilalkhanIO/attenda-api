@@ -17,6 +17,9 @@
     "test:integration": "jest --runInBand --testPathPatterns=integration",
     "test:coverage": "jest --runInBand --coverage"
   },
+  "prisma": {
+    "seed": "node dist/utils/seed.js"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",

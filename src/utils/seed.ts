@@ -74,7 +74,7 @@ async function seed() {
       name: 'Day Shift',
       start_time: '09:00',
       end_time: '18:00',
-      color: '#1D4ED8',
+      color: '#f15153',
       active_days: [1, 2, 3, 4, 5], // Mon-Fri
       is_published: true,
       created_by: 'user-hradmin',
