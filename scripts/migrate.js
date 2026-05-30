@@ -2,7 +2,7 @@
 // Applies the initial migration using pg directly, then seeds demo data.
 // Prisma Migrate (migrate deploy) doesn't work reliably with the
 // PrismaPg driver-adapter in Prisma 7 — this script is the safe alternative.
-const { Pool }    = require('pg');
+const { Pool }     = require('pg');
 const { execSync } = require('child_process');
 const fs           = require('fs');
 const path         = require('path');
@@ -18,18 +18,16 @@ async function run() {
   const pool   = new Pool({ connectionString: process.env.DATABASE_URL });
   const client = await pool.connect();
 
-  let freshInstall = false;
-
   try {
-    // If the organisations table exists the schema is already applied.
-    const { rows } = await client.query(`
+    // ── 1. Migration ──────────────────────────────────────────────────────────
+    const { rows: tableRows } = await client.query(`
       SELECT EXISTS (
         SELECT 1 FROM information_schema.tables
         WHERE table_schema = 'public' AND table_name = 'organisations'
       ) AS ready
     `);
 
-    if (rows[0].ready) {
+    if (tableRows[0].ready) {
       console.log('[migrate] Schema already applied — skipping migration');
     } else {
       console.log('[migrate] Applying initial migration …');
@@ -42,27 +40,32 @@ async function run() {
       await client.query(sql);
       await client.query('COMMIT');
       console.log('[migrate] Done — all tables created');
-      freshInstall = true;
+    }
+
+    // ── 2. Seed ───────────────────────────────────────────────────────────────
+    // Run seed whenever demo org is missing, regardless of whether migration
+    // just ran (tables may have been created by an earlier deploy without seed).
+    const { rows: seedRows } = await client.query(
+      `SELECT EXISTS (SELECT 1 FROM organisations WHERE id = 'demo-org-001') AS seeded`
+    );
+
+    if (seedRows[0].seeded) {
+      console.log('[seed] Demo data already present — skipping seed');
+    } else {
+      console.log('[seed] Running initial seed …');
+      client.release();
+      await pool.end();
+      execSync('node dist/utils/seed.js', { stdio: 'inherit', cwd: ROOT });
+      console.log('[seed] Done');
+      return; // pool already closed above
     }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('[migrate] Failed:', err.message);
     process.exit(1);
   } finally {
-    client.release();
-    await pool.end();
-  }
-
-  // Seed demo data only on a fresh install so subsequent deploys stay fast.
-  if (freshInstall) {
-    console.log('[seed] Running initial seed …');
-    try {
-      execSync('node dist/utils/seed.js', { stdio: 'inherit', cwd: ROOT });
-      console.log('[seed] Done');
-    } catch (err) {
-      // Seed failure is non-fatal — tables exist, app will still start.
-      console.error('[seed] Seed failed (non-fatal):', err.message);
-    }
+    try { client.release(); } catch (_) {}
+    try { await pool.end(); } catch (_) {}
   }
 }
 
