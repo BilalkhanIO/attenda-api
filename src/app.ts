@@ -13,6 +13,7 @@ import shiftsRouter     from './routes/shifts';
 import payrollRouter    from './routes/payroll';
 import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './routes/misc';
 import webhooksRouter from './routes/webhooks';
+import adminRouter    from './routes/admin';
 import { errorHandler, notFound } from './middleware/errorHandler';
 
 const app = express();
@@ -86,6 +87,7 @@ app.use(`${API}/analytics`,   analyticsRouter);
 app.use(`${API}/org`,         orgRouter);
 app.use(`${API}/reports`,      reportsRouter);
 app.use(`${API}/webhooks`,    webhooksRouter);
+app.use(`${API}/admin`,      adminRouter);
 
 // ─── 404 & Error handler ──────────────────────────────
 app.use(notFound);
