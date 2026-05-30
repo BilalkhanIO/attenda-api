@@ -62,6 +62,19 @@ performanceRouter.get('/reviews', requireRole('manager'), async (req, res, next)
   } catch (e) { next(e); }
 });
 
+// GET /performance/reviews/me — employee sees their own reviews (no role restriction)
+performanceRouter.get('/reviews/me', async (req, res, next) => {
+  try {
+    const reviews = await prisma.performanceReview.findMany({
+      where: { user_id: req.user!.sub },
+      include: { reviewer: { select: { id: true, name: true } } },
+      orderBy: [{ period_year: 'desc' }, { period_month: 'desc' }],
+      take: 24,
+    });
+    ok(res, reviews);
+  } catch (e) { next(e); }
+});
+
 // POST /performance/reviews/:userId
 performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, res, next) => {
   try {
