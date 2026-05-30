@@ -7,6 +7,11 @@ import prisma from '../utils/prisma';
 const router = Router();
 router.use(authenticate);
 
+function timeToMins(t: string): number {
+  const [h, m] = t.split(':').map(Number);
+  return h * 60 + m;
+}
+
 const ASSIGN_INCLUDE = {
   shift: true,
   user: { select: { id: true, name: true, avatar_url: true, department: true } },
@@ -27,11 +32,13 @@ router.get('/', requireRole('manager'), async (req, res, next) => {
 // ─── POST /shifts ──────────────────────────────────────
 router.post('/', requireRole('hr_admin'), async (req, res, next) => {
   try {
-    const { name, start_time, end_time, color, active_days, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins } = req.body;
+    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins } = req.body;
     if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
     const shift = await prisma.shift.create({
       data: {
-        org_id: req.user!.org_id, name, start_time, end_time, color: color || '#f15153', active_days: active_days || [], created_by: req.user!.sub,
+        org_id: req.user!.org_id, name, start_time, end_time, color: color || '#f15153',
+        active_days: active_days ?? days_of_week ?? [],
+        created_by: req.user!.sub,
         ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
         ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
         ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
@@ -47,12 +54,15 @@ router.post('/', requireRole('hr_admin'), async (req, res, next) => {
 // ─── POST /shifts/:id/breaks ───────────────────────────
 router.post('/:id/breaks', requireRole('manager'), async (req, res, next) => {
   try {
-    const { name, break_minutes, is_paid, after_minutes } = req.body;
-    if (!name || !break_minutes || after_minutes === undefined) throw new ValidationError('name, break_minutes, after_minutes required');
+    const { name, start_time, end_time, is_paid } = req.body;
+    if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
     const shift = await prisma.shift.findUnique({ where: { id: req.params.id as string } });
     if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
+    const after_minutes = timeToMins(start_time) - timeToMins(shift.start_time);
+    const break_minutes = timeToMins(end_time) - timeToMins(start_time);
+    if (break_minutes <= 0) throw new ValidationError('end_time must be after start_time');
     const b = await prisma.shiftBreak.create({
-      data: { shift_id: shift.id, name, break_minutes: +break_minutes, is_paid: !!is_paid, after_minutes: +after_minutes },
+      data: { shift_id: shift.id, name, break_minutes, is_paid: !!is_paid, after_minutes, break_start_time: start_time, break_end_time: end_time },
     });
     created(res, b);
   } catch (e) { next(e); }
@@ -61,14 +71,24 @@ router.post('/:id/breaks', requireRole('manager'), async (req, res, next) => {
 // ─── PUT /shifts/:shiftId/breaks/:breakId ─────────────
 router.put('/:shiftId/breaks/:breakId', requireRole('manager'), async (req, res, next) => {
   try {
-    const { name, break_minutes, is_paid, after_minutes } = req.body;
+    const { name, start_time, end_time, is_paid } = req.body;
     const b = await prisma.shiftBreak.findFirst({
       where: { id: req.params.breakId as string, shift: { org_id: req.user!.org_id } },
+      include: { shift: true },
     });
     if (!b) throw new NotFoundError('ShiftBreak');
+    const timeData: Record<string, unknown> = {};
+    if (start_time && end_time) {
+      const bm = timeToMins(end_time) - timeToMins(start_time);
+      if (bm <= 0) throw new ValidationError('end_time must be after start_time');
+      timeData.break_minutes    = bm;
+      timeData.after_minutes    = timeToMins(start_time) - timeToMins(b.shift.start_time);
+      timeData.break_start_time = start_time;
+      timeData.break_end_time   = end_time;
+    }
     const updated = await prisma.shiftBreak.update({
       where: { id: b.id },
-      data: { name, break_minutes: break_minutes ? +break_minutes : undefined, is_paid, after_minutes: after_minutes !== undefined ? +after_minutes : undefined },
+      data: { ...(name !== undefined && { name }), ...(is_paid !== undefined && { is_paid: !!is_paid }), ...timeData },
     });
     ok(res, updated);
   } catch (e) { next(e); }
@@ -91,8 +111,20 @@ router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
   try {
     const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
-    const { name, start_time, end_time, color, active_days } = req.body;
-    const updated = await prisma.shift.update({ where: { id: req.params.id }, data: { name, start_time, end_time, color, active_days } });
+    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins } = req.body;
+    const updated = await prisma.shift.update({
+      where: { id: req.params.id },
+      data: {
+        name, start_time, end_time, color,
+        active_days: active_days ?? days_of_week,
+        ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
+        ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
+        ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
+        ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
+        ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
+        ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
+      },
+    });
     ok(res, updated);
   } catch (e) { next(e); }
 });
