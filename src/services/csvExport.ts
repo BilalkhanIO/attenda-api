@@ -2,9 +2,6 @@
 import { stringify } from 'csv-stringify/sync';
 import { format } from 'date-fns';
 import { uploadBuffer, S3Keys, getSignedDownloadUrl, isS3Configured } from './s3';
-import { writeFileSync } from 'fs';
-import { join } from 'path';
-import { tmpdir } from 'os';
 
 // ─── Attendance CSV ───────────────────────────────────
 export async function generateAttendanceCsv(
@@ -113,10 +110,7 @@ async function uploadCsv(orgId: string, type: string, rows: any[][]): Promise<st
     return getSignedDownloadUrl(key, 3600); // 1 hour
   }
 
-  // Dev fallback
-  const filename = `${type}-${ts}.csv`;
-  const path = join(tmpdir(), filename);
-  writeFileSync(path, buffer);
-  console.log(`[CSV] Saved locally: ${path}`);
-  return `/tmp/${filename}`;
+  // No S3 configured — return a data URI the browser can download directly
+  const b64 = buffer.toString('base64');
+  return `data:text/csv;charset=utf-8;base64,${b64}`;
 }

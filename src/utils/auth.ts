@@ -89,3 +89,32 @@ export function endOfMonth(year: number, month: number): Date {
 export function calcHoursWorked(checkIn: Date, checkOut: Date): number {
   return Math.round(((checkOut.getTime() - checkIn.getTime()) / 3_600_000) * 100) / 100;
 }
+
+// ─── Office network matching ───────────────────────────
+// Checks if a device IP matches an org's registered network entry.
+// entry can be: exact IP "192.168.1.5", or CIDR "192.168.1.0/24"
+function _ipToNum(ip: string): number {
+  return ip.split('.').reduce((acc, oct) => (acc * 256) + parseInt(oct, 10), 0) >>> 0;
+}
+
+export function ipMatchesEntry(deviceIp: string, entry: string): boolean {
+  if (!entry.includes('/')) return deviceIp === entry;
+  const [range, bitsStr] = entry.split('/');
+  const bits = parseInt(bitsStr, 10);
+  if (isNaN(bits) || bits < 0 || bits > 32) return false;
+  const mask = bits === 0 ? 0 : (~0 << (32 - bits)) >>> 0;
+  return (_ipToNum(deviceIp) & mask) === (_ipToNum(range) & mask);
+}
+
+// Returns true if the device is on an authorised office network.
+// Priority: SSID match first (most reliable), then IP/CIDR match.
+export function isOfficeNetwork(
+  deviceIp: string | undefined,
+  deviceSsid: string | undefined,
+  officeIps: string[],
+  officeSsids: string[],
+): boolean {
+  if (deviceSsid && officeSsids.length > 0 && officeSsids.includes(deviceSsid)) return true;
+  if (deviceIp && officeIps.length > 0 && officeIps.some(e => ipMatchesEntry(deviceIp, e))) return true;
+  return false;
+}

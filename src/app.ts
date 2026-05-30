@@ -13,16 +13,31 @@ import shiftsRouter     from './routes/shifts';
 import payrollRouter    from './routes/payroll';
 import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './routes/misc';
 import webhooksRouter from './routes/webhooks';
+import adminRouter         from './routes/admin';
+import overtimeRouter      from './routes/overtime';
+import notificationsRouter from './routes/notifications';
 import { errorHandler, notFound } from './middleware/errorHandler';
 
 const app = express();
 
 // ─── Security & Parsing ───────────────────────────────
 app.use(helmet());
+const allowedOrigins = new Set(
+  (process.env.FRONTEND_URL || 'http://localhost:3000')
+    .split(',')
+    .map(o => o.trim())
+    .filter(Boolean)
+);
+
 app.use(cors({
-  origin:      process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: (origin, cb) => {
+    // Allow requests with no origin (mobile apps, curl, server-to-server)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.has(origin)) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
   credentials: true,
-  methods:     ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
 }));
 
 // Capture raw body for webhook signature verification
@@ -74,6 +89,9 @@ app.use(`${API}/analytics`,   analyticsRouter);
 app.use(`${API}/org`,         orgRouter);
 app.use(`${API}/reports`,      reportsRouter);
 app.use(`${API}/webhooks`,    webhooksRouter);
+app.use(`${API}/admin`,      adminRouter);
+app.use(`${API}/overtime`,       overtimeRouter);
+app.use(`${API}/notifications`, notificationsRouter);
 
 // ─── 404 & Error handler ──────────────────────────────
 app.use(notFound);

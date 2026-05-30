@@ -34,11 +34,16 @@ export function startLateArrivalDetector() {
           include: { user: { include: { manager: true } } },
         });
 
+        // Batch-fetch all attendance records for these users to avoid N+1
+        const userIds = assignments.map(a => a.user.id);
+        const records = await prisma.attendanceRecord.findMany({
+          where: { user_id: { in: userIds }, date: today },
+        });
+        const recordByUserId = new Map(records.map(r => [r.user_id, r]));
+
         for (const assignment of assignments) {
           const { user } = assignment;
-          const record = await prisma.attendanceRecord.findUnique({
-            where: { user_id_date: { user_id: user.id, date: today } },
-          });
+          const record = recordByUserId.get(user.id);
 
           if (!record || !record.check_in_at) {
             // Mark as late at 15 min mark
@@ -51,8 +56,20 @@ export function startLateArrivalDetector() {
             }
 
             // Notify manager at 30 min mark only (avoids double-alerting)
-            if (diffMins === 30 && user.manager?.phone) {
-              await notifyLateArrival(user.org_id, user.name, diffMins, user.manager.phone);
+            if (diffMins === 30) {
+              if (user.manager?.phone) {
+                await notifyLateArrival(user.org_id, user.name, diffMins, user.manager.phone);
+              }
+              if (user.manager_id) {
+                const { createNotification } = await import('../services/notifications');
+                createNotification({
+                  userId: user.manager_id, orgId: user.org_id,
+                  type: 'attendance_late',
+                  title: 'Employee late',
+                  body: `${user.name} is ${diffMins} minutes late and has not checked in yet`,
+                  actionType: 'attendance', actionId: user.id,
+                }).catch(console.error);
+              }
             }
           }
         }
@@ -105,6 +122,16 @@ export function startAbsentDetector() {
             // Notify manager only (privacy — not group)
             if (user.manager?.phone) {
               await notifyAbsent(user.org_id, user.name, user.manager.phone);
+            }
+            if (user.manager_id) {
+              const { createNotification } = await import('../services/notifications');
+              createNotification({
+                userId: user.manager_id, orgId: user.org_id,
+                type: 'attendance_absent',
+                title: 'Employee absent',
+                body: `${user.name} has not checked in — marked absent`,
+                actionType: 'attendance', actionId: user.id,
+              }).catch(console.error);
             }
           }
         }
@@ -229,34 +256,79 @@ export function startRemoteNudgeJob() {
           await prisma.remoteSession.update({ where: { id: session.id }, data: { end_nudge_at: new Date() } });
         }
 
-        // No-reply alert: 60 min after nudge sent and no reply logged
+        // No-reply alert: 60 min after each nudge sent and no reply logged
         const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
-        if (session.morning_nudge_at && session.morning_nudge_at < oneHourAgo) {
+        const nudgeChecks: Array<{ sentAt: Date | null; type: string; event: string }> = [
+          { sentAt: session.morning_nudge_at, type: 'morning',      event: 'remote_morning' },
+          { sentAt: session.midday_nudge_at,  type: 'midday',       event: 'remote_midday'  },
+          { sentAt: session.end_nudge_at,     type: 'end_of_day',   event: 'remote_eod'     },
+        ];
+        for (const { sentAt, type, event } of nudgeChecks) {
+          if (!sentAt || sentAt >= oneHourAgo) continue;
           const replied = await prisma.remoteCheckinLog.findFirst({
-            where: { remote_session_id: session.id, nudge_type: 'morning', reply_at: { not: null } },
+            where: { remote_session_id: session.id, nudge_type: type, reply_at: { not: null } },
           });
           const alerted = await prisma.remoteCheckinLog.findFirst({
-            where: { remote_session_id: session.id, nudge_type: 'morning', no_reply_alerted: true },
+            where: { remote_session_id: session.id, nudge_type: type, no_reply_alerted: true },
           });
           if (!replied && !alerted) {
-            // Alert manager about no reply
             const manager = user.manager_id
               ? await prisma.user.findUnique({ where: { id: user.manager_id } })
               : null;
             if (manager?.phone) {
-              const { notify, Templates } = await import('../services/whatsapp');
+              const { notify } = await import('../services/whatsapp');
               await notify({
                 orgId: user.org_id,
-                event: 'remote_morning',
-                message: `⚠️ ${user.name} has not replied to their remote check-in nudge. Please follow up.`,
+                event: event as any,
+                message: `⚠️ ${user.name} has not replied to their ${type} remote check-in. Please follow up.`,
                 recipientType: 'individual',
                 recipientId: manager.phone,
               });
             }
-            await prisma.remoteCheckinLog.updateMany({
-              where: { remote_session_id: session.id, nudge_type: 'morning' },
-              data: { no_reply_alerted: true },
+            // Mark existing log or create a stub so we don't re-alert next minute
+            const upd = await prisma.remoteCheckinLog.updateMany({
+              where: { remote_session_id: session.id, nudge_type: type },
+              data:  { no_reply_alerted: true },
             });
+            if (upd.count === 0) {
+              await prisma.remoteCheckinLog.create({
+                data: { remote_session_id: session.id, nudge_type: type, nudge_sent_at: sentAt, no_reply_alerted: true },
+              });
+            }
+
+            // In-app notification to manager
+            if (manager) {
+              const { createNotification } = await import('../services/notifications');
+              createNotification({
+                userId: manager.id, orgId: user.org_id,
+                type: 'remote_no_reply',
+                title: 'Remote worker not responding',
+                body: `${user.name} has not replied to their ${type} check-in nudge`,
+                actionType: 'remote_session', actionId: session.id,
+              }).catch(console.error);
+            }
+          }
+        }
+
+        // EOD summary: 30 min after EOD nudge, consolidate AI-parsed task summaries
+        if (session.end_nudge_at && !session.ai_summary) {
+          const thirtyMinAfterEOD = new Date(session.end_nudge_at.getTime() + 30 * 60 * 1000);
+          if (now >= thirtyMinAfterEOD) {
+            const allLogs = await prisma.remoteCheckinLog.findMany({
+              where: { remote_session_id: session.id },
+              orderBy: { nudge_sent_at: 'asc' },
+            });
+            const summaryParts = [
+              allLogs.find(l => l.nudge_type === 'morning')?.task_summary,
+              allLogs.find(l => l.nudge_type === 'midday')?.task_summary,
+              allLogs.find(l => l.nudge_type === 'end_of_day')?.task_summary,
+            ].filter((s): s is string => !!s);
+            if (summaryParts.length > 0) {
+              await prisma.remoteSession.update({
+                where: { id: session.id },
+                data:  { ai_summary: summaryParts.join(' · ') },
+              });
+            }
           }
         }
       }

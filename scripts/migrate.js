@@ -17,6 +17,7 @@ async function run() {
 
   const pool   = new Pool({ connectionString: process.env.DATABASE_URL });
   const client = await pool.connect();
+  let poolClosed = false;
 
   try {
     // ── 1. Migration ──────────────────────────────────────────────────────────
@@ -28,7 +29,7 @@ async function run() {
     `);
 
     if (tableRows[0].ready) {
-      console.log('[migrate] Schema already applied — skipping migration');
+      console.log('[migrate] Schema already applied — skipping initial migration');
     } else {
       console.log('[migrate] Applying initial migration …');
       const sql = fs.readFileSync(
@@ -40,6 +41,26 @@ async function run() {
       await client.query(sql);
       await client.query('COMMIT');
       console.log('[migrate] Done — all tables created');
+    }
+
+    // ── 1b. Incremental migrations (idempotent — use IF NOT EXISTS / ADD COLUMN IF NOT EXISTS)
+    const incrementalMigrations = [
+      'prisma/migrations/20260201000000_shift_breaks_overtime/migration.sql',
+      'prisma/migrations/20260301000000_ssid_support/migration.sql',
+      'prisma/migrations/20260401000000_goal_completion_int/migration.sql',
+      'prisma/migrations/20260501000000_in_app_notifications/migration.sql',
+    ];
+    for (const relPath of incrementalMigrations) {
+      const migPath = path.join(ROOT, relPath);
+      if (!fs.existsSync(migPath)) continue;
+      const sql = fs.readFileSync(migPath, 'utf8');
+      try {
+        await client.query(sql);
+        console.log(`[migrate] Applied: ${relPath}`);
+      } catch (err) {
+        // Non-fatal if already applied (IF NOT EXISTS guards handle most cases)
+        console.warn(`[migrate] Skipped (already applied?): ${relPath} — ${err.message}`);
+      }
     }
 
     // ── 2. Seed ───────────────────────────────────────────────────────────────
@@ -54,6 +75,7 @@ async function run() {
     } else {
       console.log('[seed] Running initial seed …');
       client.release();
+      poolClosed = true;
       await pool.end();
       execSync('node dist/utils/seed.js', { stdio: 'inherit', cwd: ROOT });
       console.log('[seed] Done');
@@ -64,8 +86,10 @@ async function run() {
     console.error('[migrate] Failed:', err.message);
     process.exit(1);
   } finally {
-    try { client.release(); } catch (_) {}
-    try { await pool.end(); } catch (_) {}
+    if (!poolClosed) {
+      try { client.release(); } catch (_) {}
+      try { await pool.end(); } catch (_) {}
+    }
   }
 }
 

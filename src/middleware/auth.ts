@@ -13,10 +13,11 @@ declare global {
 }
 
 const ROLE_HIERARCHY: Record<string, number> = {
-  employee:   1,
-  manager:    2,
-  hr_admin:   3,
-  super_admin: 4,
+  employee:      1,
+  manager:       2,
+  hr_admin:      3,
+  super_admin:   4,
+  platform_admin: 99,
 };
 
 // ─── Authenticate ─────────────────────────────────────

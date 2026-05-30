@@ -2,7 +2,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
-import { startOfDay, calcHoursWorked } from '../utils/auth';
+import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -78,7 +78,7 @@ router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, r
       where: { id: req.params.id },
       include: { user: true },
     });
-    if (!session) throw new NotFoundError('Remote session');
+    if (!session || session.user.org_id !== req.user!.org_id) throw new NotFoundError('Remote session');
     if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
 
     await prisma.remoteSession.update({
@@ -90,6 +90,16 @@ router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, r
     const { notifyRemote } = await import('../services/whatsapp');
     await notifyRemote(session.user.org_id, session.user.name).catch(console.error);
 
+    // In-app notification to employee
+    const { createNotification } = await import('../services/notifications');
+    createNotification({
+      userId: session.user.id, orgId: session.user.org_id,
+      type: 'remote_approved',
+      title: 'Remote work approved',
+      body: `Your remote work request for today has been approved`,
+      actionType: 'remote_session', actionId: session.id,
+    }).catch(console.error);
+
     ok(res, { message: 'Remote session approved' });
   } catch (e) { next(e); }
 });
@@ -97,7 +107,7 @@ router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, r
 // ─── PUT /attendance/remote/sessions/:id/reject ───────
 router.put('/remote/sessions/:id/reject', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const session = await prisma.remoteSession.findUnique({ where: { id: req.params.id } });
+    const session = await prisma.remoteSession.findFirst({ where: { id: req.params.id, user: { org_id: req.user!.org_id } } });
     if (!session) throw new NotFoundError('Remote session');
     if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
 
@@ -111,6 +121,21 @@ router.put('/remote/sessions/:id/reject', requireRole('manager'), async (req: Re
       where: { id: session.attendance_id },
       data: { status: 'absent' },
     });
+
+    // In-app notification to employee
+    const rejectedSession = await prisma.remoteSession.findUnique({
+      where: { id: session.id }, select: { user: { select: { id: true, org_id: true } } },
+    });
+    if (rejectedSession?.user) {
+      const { createNotification } = await import('../services/notifications');
+      createNotification({
+        userId: rejectedSession.user.id, orgId: rejectedSession.user.org_id,
+        type: 'remote_rejected',
+        title: 'Remote work rejected',
+        body: `Your remote work request for today was not approved`,
+        actionType: 'remote_session', actionId: session.id,
+      }).catch(console.error);
+    }
 
     ok(res, { message: 'Remote session rejected' });
   } catch (e) { next(e); }
@@ -130,6 +155,173 @@ router.get('/remote/sessions/me', async (req: Request, res: Response, next: Next
       take: 30,
     });
     ok(res, sessions);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/remote/monitor ───────────────────
+// Live dashboard: today's sessions with nudge logs & computed online status
+router.get('/remote/monitor', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = startOfDay(new Date());
+    const now   = new Date();
+
+    const isManager = req.user!.role === 'manager';
+    const teamIds = isManager
+      ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
+      : null;
+
+    const where: Record<string, unknown> = { user: { org_id: req.user!.org_id }, created_at: { gte: today } };
+    if (teamIds) where.user_id = { in: teamIds };
+
+    const sessions = await prisma.remoteSession.findMany({
+      where,
+      include: {
+        user:         { select: { id: true, name: true, department: true, avatar_url: true, phone: true } },
+        attendance:   { select: { date: true } },
+        checkin_logs: { orderBy: { nudge_sent_at: 'asc' } },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+
+    const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+
+    const enriched = sessions.map(s => {
+      const logs      = s.checkin_logs;
+      const replies   = logs.filter(l => l.reply_at);
+      const lastReply = replies.sort((a, b) => new Date(b.reply_at!).getTime() - new Date(a.reply_at!).getTime())[0];
+      const is_online = lastReply ? new Date(lastReply.reply_at!).getTime() > twoHoursAgo.getTime() : false;
+      const latestLog = [...logs].filter(l => l.sentiment).reverse()[0];
+      return {
+        ...s,
+        is_online,
+        last_seen:           lastReply?.reply_at ?? null,
+        responded_count:     replies.length,
+        no_reply_count:      logs.filter(l => l.no_reply_alerted).length,
+        latest_sentiment:    latestLog?.sentiment ?? null,
+        latest_task_summary: latestLog?.task_summary ?? null,
+      };
+    });
+
+    const total       = enriched.length;
+    const responded   = enriched.filter(s => s.responded_count > 0).length;
+    const noReply     = enriched.filter(s => s.no_reply_count > 0).length;
+    const sentiments  = enriched.map(s => s.latest_sentiment).filter(Boolean);
+    const positives   = sentiments.filter(s => s === 'positive').length;
+    const negatives   = sentiments.filter(s => s === 'negative').length;
+    const avgSentiment = sentiments.length === 0 ? null
+      : positives > negatives ? 'positive'
+      : negatives > positives ? 'negative'
+      : 'neutral';
+
+    ok(res, {
+      date:  today,
+      stats: { total, responded, no_reply: noReply, avg_sentiment: avgSentiment },
+      sessions: enriched,
+    });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/remote/sessions/:id/logs ─────────
+// Full nudge log for one session — accessible by the employee or their manager
+router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const isEmployee = req.user!.role === 'employee';
+    const session = await prisma.remoteSession.findFirst({
+      where: isEmployee
+        ? { id: req.params.id, user_id: req.user!.sub }
+        : { id: req.params.id, user: { org_id: req.user!.org_id } },
+      include: {
+        user:         { select: { id: true, name: true, department: true, avatar_url: true } },
+        attendance:   { select: { date: true } },
+        checkin_logs: { orderBy: { nudge_sent_at: 'asc' } },
+      },
+    });
+    if (!session) throw new NotFoundError('Remote session');
+    ok(res, session);
+  } catch (e) { next(e); }
+});
+router.post('/break/start', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { break_type = 'rest' } = req.body;
+    const today = new Date(); today.setHours(0,0,0,0);
+    const record = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      include: { break_records: { where: { break_end: null } } },
+    });
+    if (!record || !record.check_in_at) throw new AppError('Not checked in', 400, 'NOT_CHECKED_IN');
+    if (record.check_out_at) throw new AppError('Already checked out', 400, 'CHECKED_OUT');
+    if (record.break_records.length > 0) throw new AppError('Break already in progress', 400, 'BREAK_IN_PROGRESS');
+
+    const breakRecord = await prisma.breakRecord.create({
+      data: {
+        attendance_id: record.id,
+        break_start: new Date(),
+        break_type,
+        is_paid: break_type === 'rest',
+      },
+    });
+    ok(res, breakRecord);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /attendance/break/end ───────────────────────
+router.post('/break/end', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const record = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      include: { break_records: { where: { break_end: null } } },
+    });
+    if (!record) throw new AppError('Not checked in today', 400, 'NOT_CHECKED_IN');
+    const activeBreak = record.break_records[0];
+    if (!activeBreak) throw new AppError('No break in progress', 400, 'NO_BREAK');
+
+    const now = new Date();
+    const durationMins = Math.round((now.getTime() - activeBreak.break_start.getTime()) / 60000);
+
+    const ended = await prisma.breakRecord.update({
+      where: { id: activeBreak.id },
+      data: { break_end: now, duration_mins: durationMins },
+    });
+
+    // Recalculate net_hours_worked
+    const allBreaks = await prisma.breakRecord.findMany({
+      where: { attendance_id: record.id, break_end: { not: null } },
+    });
+    const unpaidBreakMins = allBreaks.filter(b => !b.is_paid).reduce((sum, b) => sum + (b.duration_mins || 0), 0);
+    const paidBreakMins = allBreaks.filter(b => b.is_paid).reduce((sum, b) => sum + (b.duration_mins || 0), 0);
+    const totalMins = record.check_in_at ? Math.round((now.getTime() - record.check_in_at.getTime()) / 60000) : 0;
+    const netMins = totalMins - unpaidBreakMins;
+
+    await prisma.attendanceRecord.update({
+      where: { id: record.id },
+      data: {
+        break_minutes: unpaidBreakMins + paidBreakMins,
+        paid_break_minutes: paidBreakMins,
+        net_hours_worked: parseFloat((netMins / 60).toFixed(2)),
+      },
+    });
+
+    ok(res, ended);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/break/status ─────────────────────
+router.get('/break/status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const record = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      include: { break_records: { orderBy: { break_start: 'asc' } } },
+    });
+    if (!record) return ok(res, { on_break: false, breaks: [] });
+    const activeBreak = record.break_records.find(b => !b.break_end);
+    ok(res, {
+      on_break: !!activeBreak,
+      active_break: activeBreak || null,
+      breaks: record.break_records,
+      total_break_mins: record.break_minutes,
+    });
   } catch (e) { next(e); }
 });
 
@@ -233,11 +425,22 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
       }
     }
 
-    // Fire WhatsApp notification (non-blocking)
-    if (record.user && type !== 'remote') {
-      const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
-      const timeStr = formatTime12h(record.check_in_at || now);
-      notifyCheckIn(req.user!.org_id, record.user.name, timeStr, record.user.department ?? undefined).catch(console.error);
+    // Fire WhatsApp notifications (non-blocking)
+    if (record.user) {
+      if (type !== 'remote') {
+        const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
+        const timeStr = formatTime12h(record.check_in_at || now);
+        notifyCheckIn(req.user!.org_id, record.user.name, timeStr, record.user.department ?? undefined).catch(console.error);
+      } else {
+        // Notify manager that employee wants to work remotely
+        prisma.user.findUnique({ where: { id: req.user!.sub }, select: { manager: { select: { phone: true } } } })
+          .then(async userWithManager => {
+            if (userWithManager?.manager?.phone) {
+              const { notifyRemotePending } = await import('../services/whatsapp');
+              await notifyRemotePending(req.user!.org_id, record.user!.name, duration_type, userWithManager.manager.phone);
+            }
+          }).catch(console.error);
+      }
     }
 
     ok(res, record);
@@ -274,17 +477,20 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
 });
 
 // ─── POST /attendance/ip-event ─────────────────────────
-// Called by Flutter app when IP match/unmatch detected
+// Called by Flutter app when WiFi connect/disconnect detected.
+// Accepts: event ('match'|'unmatch'), ip (device LAN IP or CIDR), ssid (WiFi network name)
+// SSID matching is preferred — more reliable than IP for orgs without static IPs.
 router.post('/ip-event', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { event, ip } = req.body; // event: 'match' | 'unmatch'
-    if (!event || !ip) throw new ValidationError('event and ip are required');
+    const { event, ip, ssid } = req.body;
+    if (!event) throw new ValidationError('event is required');
+    if (!ip && !ssid) throw new ValidationError('ip or ssid is required');
     const today = startOfDay(new Date());
 
-    // Verify IP against org registered IPs
+    // Check against org's registered office networks (SSID first, then IP/CIDR)
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
-    if (!org?.office_ips.includes(ip)) {
-      return ok(res, { action: 'none', reason: 'IP not in registered office IPs' });
+    if (!isOfficeNetwork(ip, ssid, org?.office_ips ?? [], org?.office_ssids ?? [])) {
+      return ok(res, { action: 'none', reason: 'Not on a registered office network' });
     }
 
     if (event === 'match') {
@@ -313,8 +519,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
           const shiftStartMins = sh * 60 + sm;
           const nowMins        = now.getHours() * 60 + now.getMinutes();
-          const ipOrg = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { late_threshold: true } });
-          const lateThreshold = ipOrg?.late_threshold ?? 15;
+          const lateThreshold = org?.late_threshold ?? 15;
           if (nowMins > shiftStartMins + lateThreshold) status = 'late';
         }
 

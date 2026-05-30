@@ -13,6 +13,7 @@ model Organisation {
   timezone           String   @db.VarChar(100)
   currency           String   @db.VarChar(10) @default("USD")
   office_ips         String[] @default([])
+  office_ssids       String[] @default([])
   wa_enabled         Boolean  @default(false)
   wa_phone_number_id String?  @db.VarChar(255)
   wa_access_token    String?
@@ -34,6 +35,8 @@ model Organisation {
   payroll_records     PayrollRecord[]
   whatsapp_logs       WhatsappLog[]
   performance_reviews PerformanceReview[]
+  overtime_rules      OvertimeRule[]
+  notifications       InAppNotification[]
 
   @@map("organisations")
 }
@@ -81,6 +84,7 @@ model User {
   submitted_reviews       PerformanceReview[] @relation("ReviewSubmitter")
   performance_goals       PerformanceGoal[]
   remote_sessions         RemoteSession[]
+  notifications           InAppNotification[]
 
   @@map("users")
 }
@@ -104,13 +108,39 @@ model AttendanceRecord {
   ip_checkout_pending_at     DateTime?
   created_at                 DateTime  @default(now())
 
+  scheduled_start    DateTime?
+  scheduled_end      DateTime?
+  break_minutes      Int       @default(0)
+  paid_break_minutes Int       @default(0)
+  net_hours_worked   Decimal?  @db.Decimal(5, 2)
+  late_minutes       Int       @default(0)
+  early_out_minutes  Int       @default(0)
+  adherence_score    Int?
+  auto_checked_out   Boolean   @default(false)
+
   user           User          @relation(fields: [user_id], references: [id])
   org            Organisation  @relation(fields: [org_id], references: [id])
   shift          Shift?        @relation(fields: [shift_id], references: [id])
   remote_session RemoteSession?
+  break_records  BreakRecord[]
 
   @@unique([user_id, date])
   @@map("attendance_records")
+}
+
+model BreakRecord {
+  id            String    @id @default(uuid())
+  attendance_id String
+  break_start   DateTime
+  break_end     DateTime?
+  is_paid       Boolean   @default(false)
+  break_type    String    @db.VarChar(50)
+  duration_mins Int?
+  auto_ended    Boolean   @default(false)
+
+  attendance AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
+
+  @@map("break_records")
 }
 
 model RemoteSession {
@@ -201,11 +231,32 @@ model Shift {
   created_by   String?
   created_at   DateTime  @default(now())
 
+  overtime_multiplier           Decimal  @default(1.5) @db.Decimal(4, 2)
+  min_rest_hours                Int      @default(11)
+  late_tolerance_mins           Int      @default(15)
+  early_checkout_tolerance_mins Int      @default(15)
+  auto_checkout                 Boolean  @default(true)
+  auto_checkout_buffer_mins     Int      @default(30)
+
   org                Organisation       @relation(fields: [org_id], references: [id])
   assignments        ShiftAssignment[]
   attendance_records AttendanceRecord[]
+  breaks             ShiftBreak[]
 
   @@map("shifts")
+}
+
+model ShiftBreak {
+  id            String @id @default(uuid())
+  shift_id      String
+  name          String @db.VarChar(100)
+  break_minutes Int
+  is_paid       Boolean @default(false)
+  after_minutes Int     // minutes into shift before break is due
+
+  shift Shift @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+
+  @@map("shift_breaks")
 }
 
 model ShiftAssignment {
@@ -277,6 +328,22 @@ model PayrollRecord {
   @@map("payroll_records")
 }
 
+model OvertimeRule {
+  id              String   @id @default(uuid())
+  org_id          String
+  name            String   @db.VarChar(100)
+  rule_type       String   @db.VarChar(20)  // "daily" | "weekly" | "seventh_day"
+  threshold_hours Decimal  @db.Decimal(5, 2)
+  multiplier      Decimal  @db.Decimal(4, 2)
+  priority        Int      @default(1)
+  is_active       Boolean  @default(true)
+  created_at      DateTime @default(now())
+
+  org Organisation @relation(fields: [org_id], references: [id])
+
+  @@map("overtime_rules")
+}
+
 model PerformanceReview {
   id               String    @id @default(uuid())
   user_id          String
@@ -308,7 +375,7 @@ model PerformanceGoal {
   description String?   @db.Text
   weight      Int
   target_date DateTime? @db.Date
-  completion  String    @default("pending")
+  completion  Int       @default(0)
   created_at  DateTime  @default(now())
 
   review PerformanceReview @relation(fields: [review_id], references: [id])
@@ -340,4 +407,25 @@ model TokenBlacklist {
   created_at DateTime @default(now())
 
   @@map("token_blacklist")
+}
+
+model InAppNotification {
+  id          String    @id @default(uuid())
+  user_id     String
+  org_id      String
+  type        String    @db.VarChar(50)
+  title       String    @db.VarChar(255)
+  body        String    @db.Text
+  action_type String?   @db.VarChar(50)
+  action_id   String?   @db.VarChar(36)
+  metadata    Json?     @default("{}")
+  read_at     DateTime?
+  created_at  DateTime  @default(now())
+
+  user User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  org  Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, read_at])
+  @@index([user_id, created_at(sort: Desc)])
+  @@map("in_app_notifications")
 }
