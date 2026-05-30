@@ -319,11 +319,22 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
       }
     }
 
-    // Fire WhatsApp notification (non-blocking)
-    if (record.user && type !== 'remote') {
-      const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
-      const timeStr = formatTime12h(record.check_in_at || now);
-      notifyCheckIn(req.user!.org_id, record.user.name, timeStr, record.user.department ?? undefined).catch(console.error);
+    // Fire WhatsApp notifications (non-blocking)
+    if (record.user) {
+      if (type !== 'remote') {
+        const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
+        const timeStr = formatTime12h(record.check_in_at || now);
+        notifyCheckIn(req.user!.org_id, record.user.name, timeStr, record.user.department ?? undefined).catch(console.error);
+      } else {
+        // Notify manager that employee wants to work remotely
+        prisma.user.findUnique({ where: { id: req.user!.sub }, select: { manager: { select: { phone: true } } } })
+          .then(async userWithManager => {
+            if (userWithManager?.manager?.phone) {
+              const { notifyRemotePending } = await import('../services/whatsapp');
+              await notifyRemotePending(req.user!.org_id, record.user!.name, duration_type, userWithManager.manager.phone);
+            }
+          }).catch(console.error);
+      }
     }
 
     ok(res, record);

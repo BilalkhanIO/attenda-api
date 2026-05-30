@@ -190,11 +190,17 @@ router.put('/requests/:id/reject', requireRole('manager'), async (req, res, next
       include: LEAVE_INCLUDE,
     });
 
-    // Email notification to employee
+    // Email + WhatsApp notification to employee
     if (updated?.user) {
       const dates = `${updated.start_date.toDateString()} – ${updated.end_date.toDateString()}`;
       const { sendLeaveRejectedEmail } = await import('../services/email');
       await sendLeaveRejectedEmail(updated.user.email, updated.user.name, updated.leave_type, dates, reason).catch(console.error);
+
+      const employee = await prisma.user.findUnique({ where: { id: updated.user.id }, select: { phone: true } });
+      if (employee?.phone) {
+        const { notifyLeaveRejected } = await import('../services/whatsapp');
+        notifyLeaveRejected(req.user!.org_id, updated.user.name, updated.leave_type, dates, reason, employee.phone).catch(console.error);
+      }
     }
 
     ok(res, updated);

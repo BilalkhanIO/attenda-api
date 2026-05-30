@@ -8,23 +8,24 @@ const RETRY_DELAY_MS = 30_000;
 
 // ─── Message Templates ────────────────────────────────
 export const Templates = {
-  CHECK_IN:      (name: string, time: string)       => `✅ ${name} checked in — ${time}`,
-  CHECK_OUT:     (name: string, time: string)       => `🔴 ${name} checked out — ${time}`,
-  LATE_ARRIVAL:  (name: string, mins: number)       => `⚠️ ${name} has not checked in — shift started ${mins} min ago`,
-  ABSENT:        (name: string)                     => `❌ ${name} is absent — no check-in recorded today`,
-  REMOTE:        (name: string)                     => `🏠 ${name} is working remotely today`,
-  LEAVE_APPROVED:(name: string, type: string, dates: string) => `📋 Leave approved: ${name} — ${type}, ${dates}`,
-  LEAVE_REJECTED:(name: string, type: string, dates: string, reason: string) => `📋 Leave rejected: ${name} — ${type}, ${dates}. Reason: ${reason}`,
-  SHIFT_REMINDER:(name: string, time: string)       => `⏰ Reminder: ${name}, your shift starts in 30 minutes — ${time}`,
-  PAYSLIP_READY: (name: string, month: string)      => `💰 ${name}, your payslip for ${month} is now available in Attenda`,
-  REMOTE_MORNING:(name: string)                     => `Good morning ${name}! 👋 Quick check-in — what are you working on today?`,
-  REMOTE_MIDDAY: (name: string)                     => `Afternoon check-in ${name}! Any updates or blockers I should know about?`,
-  REMOTE_EOD:    (name: string)                     => `Wrapping up ${name}? What did you accomplish today? Any carry-overs for tomorrow?`,
+  CHECK_IN:       (name: string, time: string)       => `✅ ${name} checked in — ${time}`,
+  CHECK_OUT:      (name: string, time: string)       => `🔴 ${name} checked out — ${time}`,
+  LATE_ARRIVAL:   (name: string, mins: number)       => `⚠️ ${name} has not checked in — shift started ${mins} min ago`,
+  ABSENT:         (name: string)                     => `❌ ${name} is absent — no check-in recorded today`,
+  REMOTE:         (name: string)                     => `🏠 ${name} is working remotely today`,
+  REMOTE_REQUEST: (name: string, duration: string)   => `📋 Remote work request from ${name} (${duration.replace(/_/g, ' ')}) — please review and approve in Attenda`,
+  LEAVE_APPROVED: (name: string, type: string, dates: string) => `📋 Leave approved: ${name} — ${type}, ${dates}`,
+  LEAVE_REJECTED: (name: string, type: string, dates: string, reason: string) => `📋 Leave rejected: ${name} — ${type}, ${dates}. Reason: ${reason}`,
+  SHIFT_REMINDER: (name: string, time: string)       => `⏰ Reminder: ${name}, your shift starts in 30 minutes — ${time}`,
+  PAYSLIP_READY:  (name: string, month: string)      => `💰 ${name}, your payslip for ${month} is now available in Attenda`,
+  REMOTE_MORNING: (name: string)                     => `Good morning ${name}! 👋 Quick check-in — what are you working on today?`,
+  REMOTE_MIDDAY:  (name: string)                     => `Afternoon check-in ${name}! Any updates or blockers I should know about?`,
+  REMOTE_EOD:     (name: string)                     => `Wrapping up ${name}? What did you accomplish today? Any carry-overs for tomorrow?`,
 };
 
 export type NotificationEvent =
   | 'check_in' | 'check_out' | 'late_arrival' | 'absent'
-  | 'remote' | 'leave_approved' | 'leave_rejected'
+  | 'remote' | 'remote_request' | 'leave_approved' | 'leave_rejected'
   | 'shift_reminder' | 'payslip_ready'
   | 'remote_morning' | 'remote_midday' | 'remote_eod';
 
@@ -141,6 +142,10 @@ export async function notifyRemote(orgId: string, name: string, department?: str
   for (const groupId of org.groupIds) {
     await notify({ orgId, event: 'remote', message: Templates.REMOTE(name), recipientType: 'group', recipientId: groupId });
   }
+}
+
+export async function notifyRemotePending(orgId: string, employeeName: string, duration: string, managerPhone: string): Promise<void> {
+  await notify({ orgId, event: 'remote_request', message: Templates.REMOTE_REQUEST(employeeName, duration), recipientType: 'individual', recipientId: managerPhone });
 }
 
 export async function notifyLeaveApproved(orgId: string, name: string, type: string, dates: string, employeePhone: string): Promise<void> {
