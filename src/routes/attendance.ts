@@ -133,6 +133,92 @@ router.get('/remote/sessions/me', async (req: Request, res: Response, next: Next
   } catch (e) { next(e); }
 });
 
+// ─── POST /attendance/break/start ─────────────────────
+router.post('/break/start', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { break_type = 'rest' } = req.body;
+    const today = new Date(); today.setHours(0,0,0,0);
+    const record = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: req.user!.id, date: today } },
+      include: { break_records: { where: { break_end: null } } },
+    });
+    if (!record || !record.check_in_at) throw new AppError('Not checked in', 400, 'NOT_CHECKED_IN');
+    if (record.check_out_at) throw new AppError('Already checked out', 400, 'CHECKED_OUT');
+    if (record.break_records.length > 0) throw new AppError('Break already in progress', 400, 'BREAK_IN_PROGRESS');
+
+    const breakRecord = await prisma.breakRecord.create({
+      data: {
+        attendance_id: record.id,
+        break_start: new Date(),
+        break_type,
+        is_paid: break_type === 'rest',
+      },
+    });
+    ok(res, breakRecord);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /attendance/break/end ───────────────────────
+router.post('/break/end', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const record = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: req.user!.id, date: today } },
+      include: { break_records: { where: { break_end: null } } },
+    });
+    if (!record) throw new AppError('Not checked in today', 400, 'NOT_CHECKED_IN');
+    const activeBreak = record.break_records[0];
+    if (!activeBreak) throw new AppError('No break in progress', 400, 'NO_BREAK');
+
+    const now = new Date();
+    const durationMins = Math.round((now.getTime() - activeBreak.break_start.getTime()) / 60000);
+
+    const ended = await prisma.breakRecord.update({
+      where: { id: activeBreak.id },
+      data: { break_end: now, duration_mins: durationMins },
+    });
+
+    // Recalculate net_hours_worked
+    const allBreaks = await prisma.breakRecord.findMany({
+      where: { attendance_id: record.id, break_end: { not: null } },
+    });
+    const unpaidBreakMins = allBreaks.filter(b => !b.is_paid).reduce((sum, b) => sum + (b.duration_mins || 0), 0);
+    const paidBreakMins = allBreaks.filter(b => b.is_paid).reduce((sum, b) => sum + (b.duration_mins || 0), 0);
+    const totalMins = record.check_in_at ? Math.round((now.getTime() - record.check_in_at.getTime()) / 60000) : 0;
+    const netMins = totalMins - unpaidBreakMins;
+
+    await prisma.attendanceRecord.update({
+      where: { id: record.id },
+      data: {
+        break_minutes: unpaidBreakMins + paidBreakMins,
+        paid_break_minutes: paidBreakMins,
+        net_hours_worked: parseFloat((netMins / 60).toFixed(2)),
+      },
+    });
+
+    ok(res, ended);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/break/status ─────────────────────
+router.get('/break/status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const record = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: req.user!.id, date: today } },
+      include: { break_records: { orderBy: { break_start: 'asc' } } },
+    });
+    if (!record) return ok(res, { on_break: false, breaks: [] });
+    const activeBreak = record.break_records.find(b => !b.break_end);
+    ok(res, {
+      on_break: !!activeBreak,
+      active_break: activeBreak || null,
+      breaks: record.break_records,
+      total_break_mins: record.break_minutes,
+    });
+  } catch (e) { next(e); }
+});
+
 // ─── GET /attendance/:userId ───────────────────────────
 router.get('/:userId', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {

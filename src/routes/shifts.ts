@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { Router } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
-import { ok, created, NotFoundError, ValidationError } from '../utils/response';
+import { ok, created, noContent, NotFoundError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -17,7 +17,7 @@ router.get('/', requireRole('manager'), async (req, res, next) => {
   try {
     const shifts = await prisma.shift.findMany({
       where: { org_id: req.user!.org_id },
-      include: { _count: { select: { assignments: true } } },
+      include: { _count: { select: { assignments: true } }, breaks: { orderBy: { after_minutes: 'asc' } } },
       orderBy: { name: 'asc' },
     });
     ok(res, shifts);
@@ -27,12 +27,86 @@ router.get('/', requireRole('manager'), async (req, res, next) => {
 // ─── POST /shifts ──────────────────────────────────────
 router.post('/', requireRole('hr_admin'), async (req, res, next) => {
   try {
-    const { name, start_time, end_time, color, active_days } = req.body;
+    const { name, start_time, end_time, color, active_days, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins } = req.body;
     if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
     const shift = await prisma.shift.create({
-      data: { org_id: req.user!.org_id, name, start_time, end_time, color: color || '#f15153', active_days: active_days || [], created_by: req.user!.sub },
+      data: {
+        org_id: req.user!.org_id, name, start_time, end_time, color: color || '#f15153', active_days: active_days || [], created_by: req.user!.sub,
+        ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
+        ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
+        ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
+        ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
+        ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
+        ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
+      },
     });
     created(res, shift);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /shifts/:id ───────────────────────────────────
+router.get('/:id', requireRole('manager'), async (req, res, next) => {
+  try {
+    const shift = await prisma.shift.findUnique({
+      where: { id: req.params.id as string },
+      include: { breaks: { orderBy: { after_minutes: 'asc' } } },
+    });
+    if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
+    ok(res, shift);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /shifts/:id/breaks ────────────────────────────
+router.get('/:id/breaks', authenticate, async (req, res, next) => {
+  try {
+    const shift = await prisma.shift.findUnique({
+      where: { id: req.params.id as string },
+      include: { breaks: { orderBy: { after_minutes: 'asc' } } },
+    });
+    if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
+    ok(res, shift.breaks);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /shifts/:id/breaks ───────────────────────────
+router.post('/:id/breaks', authenticate, requireRole('manager'), async (req, res, next) => {
+  try {
+    const { name, break_minutes, is_paid, after_minutes } = req.body;
+    if (!name || !break_minutes || after_minutes === undefined) throw new ValidationError('name, break_minutes, after_minutes required');
+    const shift = await prisma.shift.findUnique({ where: { id: req.params.id as string } });
+    if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
+    const b = await prisma.shiftBreak.create({
+      data: { shift_id: shift.id, name, break_minutes: +break_minutes, is_paid: !!is_paid, after_minutes: +after_minutes },
+    });
+    created(res, b);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /shifts/:shiftId/breaks/:breakId ─────────────
+router.put('/:shiftId/breaks/:breakId', authenticate, requireRole('manager'), async (req, res, next) => {
+  try {
+    const { name, break_minutes, is_paid, after_minutes } = req.body;
+    const b = await prisma.shiftBreak.findFirst({
+      where: { id: req.params.breakId as string, shift: { org_id: req.user!.org_id } },
+    });
+    if (!b) throw new NotFoundError('ShiftBreak');
+    const updated = await prisma.shiftBreak.update({
+      where: { id: b.id },
+      data: { name, break_minutes: break_minutes ? +break_minutes : undefined, is_paid, after_minutes: after_minutes !== undefined ? +after_minutes : undefined },
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── DELETE /shifts/:shiftId/breaks/:breakId ──────────
+router.delete('/:shiftId/breaks/:breakId', authenticate, requireRole('manager'), async (req, res, next) => {
+  try {
+    const b = await prisma.shiftBreak.findFirst({
+      where: { id: req.params.breakId as string, shift: { org_id: req.user!.org_id } },
+    });
+    if (!b) throw new NotFoundError('ShiftBreak');
+    await prisma.shiftBreak.delete({ where: { id: b.id } });
+    noContent(res);
   } catch (e) { next(e); }
 });
 

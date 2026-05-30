@@ -14,6 +14,7 @@ import payrollRouter    from './routes/payroll';
 import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './routes/misc';
 import webhooksRouter from './routes/webhooks';
 import adminRouter    from './routes/admin';
+import overtimeRouter from './routes/overtime';
 import { errorHandler, notFound } from './middleware/errorHandler';
 
 const app = express();
@@ -88,6 +89,7 @@ app.use(`${API}/org`,         orgRouter);
 app.use(`${API}/reports`,      reportsRouter);
 app.use(`${API}/webhooks`,    webhooksRouter);
 app.use(`${API}/admin`,      adminRouter);
+app.use(`${API}/overtime`,   overtimeRouter);
 
 // ─── 404 & Error handler ──────────────────────────────
 app.use(notFound);
