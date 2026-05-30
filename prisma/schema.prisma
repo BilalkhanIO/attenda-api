@@ -36,6 +36,7 @@ model Organisation {
   whatsapp_logs       WhatsappLog[]
   performance_reviews PerformanceReview[]
   overtime_rules      OvertimeRule[]
+  notifications       InAppNotification[]
 
   @@map("organisations")
 }
@@ -83,6 +84,7 @@ model User {
   submitted_reviews       PerformanceReview[] @relation("ReviewSubmitter")
   performance_goals       PerformanceGoal[]
   remote_sessions         RemoteSession[]
+  notifications           InAppNotification[]
 
   @@map("users")
 }
@@ -405,4 +407,25 @@ model TokenBlacklist {
   created_at DateTime @default(now())
 
   @@map("token_blacklist")
+}
+
+model InAppNotification {
+  id          String    @id @default(uuid())
+  user_id     String
+  org_id      String
+  type        String    @db.VarChar(50)
+  title       String    @db.VarChar(255)
+  body        String    @db.Text
+  action_type String?   @db.VarChar(50)
+  action_id   String?   @db.VarChar(36)
+  metadata    Json?     @default("{}")
+  read_at     DateTime?
+  created_at  DateTime  @default(now())
+
+  user User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  org  Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id, read_at])
+  @@index([user_id, created_at(sort: Desc)])
+  @@map("in_app_notifications")
 }

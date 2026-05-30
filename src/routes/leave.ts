@@ -101,6 +101,20 @@ router.post('/requests', async (req, res, next) => {
       },
       include: LEAVE_INCLUDE,
     });
+
+    // Notify manager (in-app)
+    const submitter = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true, manager_id: true } });
+    if (submitter?.manager_id) {
+      const { createNotification } = await import('../services/notifications');
+      createNotification({
+        userId: submitter.manager_id, orgId: req.user!.org_id,
+        type: 'leave_request',
+        title: 'New leave request',
+        body: `${submitter.name} has requested ${working_days} day(s) of ${leave_type} leave`,
+        actionType: 'leave_request', actionId: request.id,
+      }).catch(console.error);
+    }
+
     ok(res, request, 201);
   } catch (e) { next(e); }
 });
@@ -168,6 +182,16 @@ router.put('/requests/:id/approve', requireRole('manager'), async (req, res, nex
         const { notifyLeaveApproved } = await import('../services/whatsapp');
         await notifyLeaveApproved(req.user!.org_id, updated.user.name, updated.leave_type, dates, employee.phone).catch(console.error);
       }
+
+      // In-app notification to employee
+      const { createNotification } = await import('../services/notifications');
+      createNotification({
+        userId: updated.user.id, orgId: req.user!.org_id,
+        type: 'leave_approved',
+        title: 'Leave approved',
+        body: `Your ${updated.leave_type} leave (${dates}) has been approved`,
+        actionType: 'leave_request', actionId: updated.id,
+      }).catch(console.error);
     }
     ok(res, updated);
   } catch (e) { next(e); }
@@ -201,6 +225,16 @@ router.put('/requests/:id/reject', requireRole('manager'), async (req, res, next
         const { notifyLeaveRejected } = await import('../services/whatsapp');
         notifyLeaveRejected(req.user!.org_id, updated.user.name, updated.leave_type, dates, reason, employee.phone).catch(console.error);
       }
+
+      // In-app notification to employee
+      const { createNotification } = await import('../services/notifications');
+      createNotification({
+        userId: updated.user.id, orgId: req.user!.org_id,
+        type: 'leave_rejected',
+        title: 'Leave rejected',
+        body: `Your ${updated.leave_type} leave (${dates}) was rejected: ${reason}`,
+        actionType: 'leave_request', actionId: updated.id,
+      }).catch(console.error);
     }
 
     ok(res, updated);

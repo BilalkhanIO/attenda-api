@@ -48,6 +48,7 @@ async function run() {
       'prisma/migrations/20260201000000_shift_breaks_overtime/migration.sql',
       'prisma/migrations/20260301000000_ssid_support/migration.sql',
       'prisma/migrations/20260401000000_goal_completion_int/migration.sql',
+      'prisma/migrations/20260501000000_in_app_notifications/migration.sql',
     ];
     for (const relPath of incrementalMigrations) {
       const migPath = path.join(ROOT, relPath);

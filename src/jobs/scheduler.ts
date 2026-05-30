@@ -56,8 +56,20 @@ export function startLateArrivalDetector() {
             }
 
             // Notify manager at 30 min mark only (avoids double-alerting)
-            if (diffMins === 30 && user.manager?.phone) {
-              await notifyLateArrival(user.org_id, user.name, diffMins, user.manager.phone);
+            if (diffMins === 30) {
+              if (user.manager?.phone) {
+                await notifyLateArrival(user.org_id, user.name, diffMins, user.manager.phone);
+              }
+              if (user.manager_id) {
+                const { createNotification } = await import('../services/notifications');
+                createNotification({
+                  userId: user.manager_id, orgId: user.org_id,
+                  type: 'attendance_late',
+                  title: 'Employee late',
+                  body: `${user.name} is ${diffMins} minutes late and has not checked in yet`,
+                  actionType: 'attendance', actionId: user.id,
+                }).catch(console.error);
+              }
             }
           }
         }
@@ -110,6 +122,16 @@ export function startAbsentDetector() {
             // Notify manager only (privacy — not group)
             if (user.manager?.phone) {
               await notifyAbsent(user.org_id, user.name, user.manager.phone);
+            }
+            if (user.manager_id) {
+              const { createNotification } = await import('../services/notifications');
+              createNotification({
+                userId: user.manager_id, orgId: user.org_id,
+                type: 'attendance_absent',
+                title: 'Employee absent',
+                body: `${user.name} has not checked in — marked absent`,
+                actionType: 'attendance', actionId: user.id,
+              }).catch(console.error);
             }
           }
         }
@@ -272,6 +294,18 @@ export function startRemoteNudgeJob() {
               await prisma.remoteCheckinLog.create({
                 data: { remote_session_id: session.id, nudge_type: type, nudge_sent_at: sentAt, no_reply_alerted: true },
               });
+            }
+
+            // In-app notification to manager
+            if (manager) {
+              const { createNotification } = await import('../services/notifications');
+              createNotification({
+                userId: manager.id, orgId: user.org_id,
+                type: 'remote_no_reply',
+                title: 'Remote worker not responding',
+                body: `${user.name} has not replied to their ${type} check-in nudge`,
+                actionType: 'remote_session', actionId: session.id,
+              }).catch(console.error);
             }
           }
         }

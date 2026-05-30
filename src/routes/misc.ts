@@ -118,6 +118,16 @@ performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, r
         reviewer: { select: { id: true, name: true } },
       },
     });
+    // In-app notification to the reviewed employee
+    const { createNotification } = await import('../services/notifications');
+    createNotification({
+      userId: updated.user.id, orgId: req.user!.org_id,
+      type: 'review_submitted',
+      title: 'Performance review submitted',
+      body: `Your performance review for ${m}/${y} has been submitted by ${updated.reviewer?.name || 'your manager'}`,
+      actionType: 'performance_review', actionId: updated.id,
+    }).catch(console.error);
+
     ok(res, { ...updated, score: updated.manager_rating ?? 0, comments: updated.notes ?? '' });
   } catch (e) { next(e); }
 });
@@ -157,6 +167,17 @@ performanceRouter.post('/goals', requireRole('manager'), async (req, res, next) 
       data: { user_id, review_id, title, description, weight, target_date: target_date ? new Date(target_date) : null },
       include: { user: { select: { id: true, name: true, department: true } } },
     });
+
+    // In-app notification to the employee
+    const { createNotification } = await import('../services/notifications');
+    createNotification({
+      userId: user_id, orgId: req.user!.org_id,
+      type: 'goal_assigned',
+      title: 'New goal assigned',
+      body: `A new goal has been assigned to you: ${title}`,
+      actionType: 'performance_goal', actionId: goal.id,
+    }).catch(console.error);
+
     ok(res, goal, 201);
   } catch (e) { next(e); }
 });

@@ -90,6 +90,16 @@ router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, r
     const { notifyRemote } = await import('../services/whatsapp');
     await notifyRemote(session.user.org_id, session.user.name).catch(console.error);
 
+    // In-app notification to employee
+    const { createNotification } = await import('../services/notifications');
+    createNotification({
+      userId: session.user.id, orgId: session.user.org_id,
+      type: 'remote_approved',
+      title: 'Remote work approved',
+      body: `Your remote work request for today has been approved`,
+      actionType: 'remote_session', actionId: session.id,
+    }).catch(console.error);
+
     ok(res, { message: 'Remote session approved' });
   } catch (e) { next(e); }
 });
@@ -111,6 +121,21 @@ router.put('/remote/sessions/:id/reject', requireRole('manager'), async (req: Re
       where: { id: session.attendance_id },
       data: { status: 'absent' },
     });
+
+    // In-app notification to employee
+    const rejectedSession = await prisma.remoteSession.findUnique({
+      where: { id: session.id }, select: { user: { select: { id: true, org_id: true } } },
+    });
+    if (rejectedSession?.user) {
+      const { createNotification } = await import('../services/notifications');
+      createNotification({
+        userId: rejectedSession.user.id, orgId: rejectedSession.user.org_id,
+        type: 'remote_rejected',
+        title: 'Remote work rejected',
+        body: `Your remote work request for today was not approved`,
+        actionType: 'remote_session', actionId: session.id,
+      }).catch(console.error);
+    }
 
     ok(res, { message: 'Remote session rejected' });
   } catch (e) { next(e); }
