@@ -17,6 +17,7 @@ async function run() {
 
   const pool   = new Pool({ connectionString: process.env.DATABASE_URL });
   const client = await pool.connect();
+  let poolClosed = false;
 
   try {
     // ── 1. Migration ──────────────────────────────────────────────────────────
@@ -72,6 +73,7 @@ async function run() {
     } else {
       console.log('[seed] Running initial seed …');
       client.release();
+      poolClosed = true;
       await pool.end();
       execSync('node dist/utils/seed.js', { stdio: 'inherit', cwd: ROOT });
       console.log('[seed] Done');
@@ -82,8 +84,10 @@ async function run() {
     console.error('[migrate] Failed:', err.message);
     process.exit(1);
   } finally {
-    try { client.release(); } catch (_) {}
-    try { await pool.end(); } catch (_) {}
+    if (!poolClosed) {
+      try { client.release(); } catch (_) {}
+      try { await pool.end(); } catch (_) {}
+    }
   }
 }
 

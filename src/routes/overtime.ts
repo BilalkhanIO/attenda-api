@@ -7,7 +7,7 @@ const router = Router();
 router.use(authenticate);
 
 // ─── GET /overtime/rules ───────────────────────────────
-router.get('/rules', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/rules', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rules = await prisma.overtimeRule.findMany({
       where: { org_id: req.user!.org_id },

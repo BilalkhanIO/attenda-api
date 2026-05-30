@@ -78,7 +78,7 @@ router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, r
       where: { id: req.params.id },
       include: { user: true },
     });
-    if (!session) throw new NotFoundError('Remote session');
+    if (!session || session.user.org_id !== req.user!.org_id) throw new NotFoundError('Remote session');
     if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
 
     await prisma.remoteSession.update({
@@ -97,7 +97,7 @@ router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, r
 // ─── PUT /attendance/remote/sessions/:id/reject ───────
 router.put('/remote/sessions/:id/reject', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const session = await prisma.remoteSession.findUnique({ where: { id: req.params.id } });
+    const session = await prisma.remoteSession.findFirst({ where: { id: req.params.id, user: { org_id: req.user!.org_id } } });
     if (!session) throw new NotFoundError('Remote session');
     if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
 
@@ -139,7 +139,7 @@ router.post('/break/start', async (req: Request, res: Response, next: NextFuncti
     const { break_type = 'rest' } = req.body;
     const today = new Date(); today.setHours(0,0,0,0);
     const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.id, date: today } },
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
       include: { break_records: { where: { break_end: null } } },
     });
     if (!record || !record.check_in_at) throw new AppError('Not checked in', 400, 'NOT_CHECKED_IN');
@@ -163,7 +163,7 @@ router.post('/break/end', async (req: Request, res: Response, next: NextFunction
   try {
     const today = new Date(); today.setHours(0,0,0,0);
     const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.id, date: today } },
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
       include: { break_records: { where: { break_end: null } } },
     });
     if (!record) throw new AppError('Not checked in today', 400, 'NOT_CHECKED_IN');
@@ -205,7 +205,7 @@ router.get('/break/status', async (req: Request, res: Response, next: NextFuncti
   try {
     const today = new Date(); today.setHours(0,0,0,0);
     const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.id, date: today } },
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
       include: { break_records: { orderBy: { break_start: 'asc' } } },
     });
     if (!record) return ok(res, { on_break: false, breaks: [] });
@@ -372,7 +372,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
 
     // Check against org's registered office networks (SSID first, then IP/CIDR)
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
-    if (!isOfficeNetwork(ip, ssid, org?.office_ips ?? [], (org as any)?.office_ssids ?? [])) {
+    if (!isOfficeNetwork(ip, ssid, org?.office_ips ?? [], org?.office_ssids ?? [])) {
       return ok(res, { action: 'none', reason: 'Not on a registered office network' });
     }
 
@@ -402,8 +402,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
           const shiftStartMins = sh * 60 + sm;
           const nowMins        = now.getHours() * 60 + now.getMinutes();
-          const ipOrg = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { late_threshold: true } });
-          const lateThreshold = ipOrg?.late_threshold ?? 15;
+          const lateThreshold = org?.late_threshold ?? 15;
           if (nowMins > shiftStartMins + lateThreshold) status = 'late';
         }
 

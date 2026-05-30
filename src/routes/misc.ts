@@ -489,7 +489,7 @@ orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) =>
 orgRouter.get('/office-ips', requireRole('super_admin'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
-    ok(res, { ips: org?.office_ips || [], ssids: (org as any)?.office_ssids || [] });
+    ok(res, { ips: org?.office_ips || [], ssids: org?.office_ssids || [] });
   } catch (e) { next(e); }
 });
 
@@ -500,7 +500,7 @@ orgRouter.put('/office-ips', requireRole('super_admin'), async (req, res, next) 
     if (!Array.isArray(ips)) throw new ValidationError('ips must be an array');
     if (ips.length > 20) throw new ValidationError('Maximum 20 entries allowed');
     const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data: { office_ips: ips } });
-    ok(res, { ips: updated.office_ips, ssids: (updated as any)?.office_ssids || [] });
+    ok(res, { ips: updated.office_ips, ssids: updated.office_ssids || [] });
   } catch (e) { next(e); }
 });
 
@@ -511,8 +511,8 @@ orgRouter.put('/office-ssids', requireRole('super_admin'), async (req, res, next
     if (!Array.isArray(ssids)) throw new ValidationError('ssids must be an array');
     if (ssids.length > 10) throw new ValidationError('Maximum 10 SSIDs allowed');
     const trimmed = ssids.map((s: string) => s.trim()).filter(Boolean);
-    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data: { office_ssids: trimmed } as any });
-    ok(res, { ips: updated.office_ips, ssids: (updated as any)?.office_ssids || [] });
+    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data: { office_ssids: trimmed } });
+    ok(res, { ips: updated.office_ips, ssids: updated.office_ssids || [] });
   } catch (e) { next(e); }
 });
 

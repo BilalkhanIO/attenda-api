@@ -44,32 +44,8 @@ router.post('/', requireRole('hr_admin'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ─── GET /shifts/:id ───────────────────────────────────
-router.get('/:id', requireRole('manager'), async (req, res, next) => {
-  try {
-    const shift = await prisma.shift.findUnique({
-      where: { id: req.params.id as string },
-      include: { breaks: { orderBy: { after_minutes: 'asc' } } },
-    });
-    if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
-    ok(res, shift);
-  } catch (e) { next(e); }
-});
-
-// ─── GET /shifts/:id/breaks ────────────────────────────
-router.get('/:id/breaks', authenticate, async (req, res, next) => {
-  try {
-    const shift = await prisma.shift.findUnique({
-      where: { id: req.params.id as string },
-      include: { breaks: { orderBy: { after_minutes: 'asc' } } },
-    });
-    if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
-    ok(res, shift.breaks);
-  } catch (e) { next(e); }
-});
-
 // ─── POST /shifts/:id/breaks ───────────────────────────
-router.post('/:id/breaks', authenticate, requireRole('manager'), async (req, res, next) => {
+router.post('/:id/breaks', requireRole('manager'), async (req, res, next) => {
   try {
     const { name, break_minutes, is_paid, after_minutes } = req.body;
     if (!name || !break_minutes || after_minutes === undefined) throw new ValidationError('name, break_minutes, after_minutes required');
@@ -83,7 +59,7 @@ router.post('/:id/breaks', authenticate, requireRole('manager'), async (req, res
 });
 
 // ─── PUT /shifts/:shiftId/breaks/:breakId ─────────────
-router.put('/:shiftId/breaks/:breakId', authenticate, requireRole('manager'), async (req, res, next) => {
+router.put('/:shiftId/breaks/:breakId', requireRole('manager'), async (req, res, next) => {
   try {
     const { name, break_minutes, is_paid, after_minutes } = req.body;
     const b = await prisma.shiftBreak.findFirst({
@@ -99,7 +75,7 @@ router.put('/:shiftId/breaks/:breakId', authenticate, requireRole('manager'), as
 });
 
 // ─── DELETE /shifts/:shiftId/breaks/:breakId ──────────
-router.delete('/:shiftId/breaks/:breakId', authenticate, requireRole('manager'), async (req, res, next) => {
+router.delete('/:shiftId/breaks/:breakId', requireRole('manager'), async (req, res, next) => {
   try {
     const b = await prisma.shiftBreak.findFirst({
       where: { id: req.params.breakId as string, shift: { org_id: req.user!.org_id } },
@@ -392,6 +368,32 @@ router.post('/ai-schedule', requireRole('hr_admin'), async (req, res, next) => {
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     const result = jsonMatch ? JSON.parse(jsonMatch[0]) : { plan: [], summary: text, warnings: [] };
     ok(res, result);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /shifts/:id/breaks ────────────────────────────
+// Must be registered after all literal two-segment routes (/assignments/me, /swaps/me)
+router.get('/:id/breaks', async (req, res, next) => {
+  try {
+    const shift = await prisma.shift.findUnique({
+      where: { id: req.params.id as string },
+      include: { breaks: { orderBy: { after_minutes: 'asc' } } },
+    });
+    if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
+    ok(res, shift.breaks);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /shifts/:id ───────────────────────────────────
+// Must be registered after all literal single-segment routes (/schedule, /assignments, /swaps)
+router.get('/:id', requireRole('manager'), async (req, res, next) => {
+  try {
+    const shift = await prisma.shift.findUnique({
+      where: { id: req.params.id as string },
+      include: { breaks: { orderBy: { after_minutes: 'asc' } } },
+    });
+    if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
+    ok(res, shift);
   } catch (e) { next(e); }
 });
 

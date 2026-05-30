@@ -34,11 +34,16 @@ export function startLateArrivalDetector() {
           include: { user: { include: { manager: true } } },
         });
 
+        // Batch-fetch all attendance records for these users to avoid N+1
+        const userIds = assignments.map(a => a.user.id);
+        const records = await prisma.attendanceRecord.findMany({
+          where: { user_id: { in: userIds }, date: today },
+        });
+        const recordByUserId = new Map(records.map(r => [r.user_id, r]));
+
         for (const assignment of assignments) {
           const { user } = assignment;
-          const record = await prisma.attendanceRecord.findUnique({
-            where: { user_id_date: { user_id: user.id, date: today } },
-          });
+          const record = recordByUserId.get(user.id);
 
           if (!record || !record.check_in_at) {
             // Mark as late at 15 min mark
