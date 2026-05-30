@@ -13,8 +13,15 @@ performanceRouter.use(authenticate);
 performanceRouter.get('/reviews', requireRole('manager'), async (req, res, next) => {
   try {
     const { month, year, department } = req.query as Record<string, string>;
-    const m = parseInt(month || String(new Date().getMonth() + 1));
-    const y = parseInt(year  || String(new Date().getFullYear()));
+    let m: number, y: number;
+    if (month && month.includes('-')) {
+      const parts = month.split('-').map(Number);
+      if (parts[0] > 12) { y = parts[0]; m = parts[1]; }  // YYYY-MM
+      else                { m = parts[0]; y = parts[1]; }  // MM-YYYY
+    } else {
+      m = parseInt(month || String(new Date().getMonth() + 1));
+      y = parseInt(year  || String(new Date().getFullYear()));
+    }
 
     const where: Record<string, unknown> = { org_id: req.user!.org_id, period_month: m, period_year: y };
     if (req.user!.role === 'manager') {
@@ -45,7 +52,13 @@ performanceRouter.get('/reviews', requireRole('manager'), async (req, res, next)
       },
       orderBy: { user: { name: 'asc' } },
     });
-    ok(res, reviews);
+    // Map DB field names to the shape the web client expects
+    ok(res, reviews.map(r => ({
+      ...r,
+      score:    r.manager_rating ?? 0,
+      comments: r.notes ?? '',
+      month:    `${r.period_year}-${String(r.period_month).padStart(2, '0')}`,
+    })));
   } catch (e) { next(e); }
 });
 
@@ -69,7 +82,7 @@ performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, r
     }
     if (!m || !y || m < 1 || m > 12) throw new ValidationError('Invalid month/year format. Use MM-YYYY');
     const review = await prisma.performanceReview.findFirst({
-      where: { user_id: req.params.userId, period_month: m, period_year: y },
+      where: { user_id: req.params.userId, period_month: m, period_year: y, org_id: req.user!.org_id },
     });
     if (!review) throw new NotFoundError('Review');
     if (review.submitted_at) throw new AppError('Review already submitted and locked', 400);
@@ -92,7 +105,7 @@ performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, r
         reviewer: { select: { id: true, name: true } },
       },
     });
-    ok(res, updated);
+    ok(res, { ...updated, score: updated.manager_rating ?? 0, comments: updated.notes ?? '' });
   } catch (e) { next(e); }
 });
 
@@ -101,15 +114,21 @@ performanceRouter.get('/goals', async (req, res, next) => {
   try {
     const requestedUserId = req.query.user_id as string | undefined;
     const isManager = ['manager', 'hr_admin', 'super_admin'].includes(req.user!.role);
-    // Non-managers can only read their own goals
-    const userId = (requestedUserId && isManager) ? requestedUserId : req.user!.sub;
-    // Verify the target user belongs to the same org
-    if (userId !== req.user!.sub) {
-      const target = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
-      if (!target) throw new NotFoundError('User');
+    let goalWhere: Record<string, unknown>;
+    if (isManager && !requestedUserId) {
+      // Manager with no filter — return all goals across the org
+      goalWhere = { user: { org_id: req.user!.org_id } };
+    } else {
+      const userId = (requestedUserId && isManager) ? requestedUserId : req.user!.sub;
+      if (userId !== req.user!.sub) {
+        const target = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
+        if (!target) throw new NotFoundError('User');
+      }
+      goalWhere = { user_id: userId };
     }
     const goals = await prisma.performanceGoal.findMany({
-      where: { user_id: userId },
+      where: goalWhere,
+      include: { user: { select: { id: true, name: true, department: true } } },
       orderBy: { created_at: 'desc' },
     });
     ok(res, goals);
@@ -123,6 +142,7 @@ performanceRouter.post('/goals', requireRole('manager'), async (req, res, next) 
     if (!user_id || !review_id || !title || !weight) throw new ValidationError('Missing required fields');
     const goal = await prisma.performanceGoal.create({
       data: { user_id, review_id, title, description, weight, target_date: target_date ? new Date(target_date) : null },
+      include: { user: { select: { id: true, name: true, department: true } } },
     });
     ok(res, goal, 201);
   } catch (e) { next(e); }

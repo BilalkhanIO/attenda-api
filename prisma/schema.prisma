@@ -373,7 +373,7 @@ model PerformanceGoal {
   description String?   @db.Text
   weight      Int
   target_date DateTime? @db.Date
-  completion  String    @default("pending")
+  completion  Int       @default(0)
   created_at  DateTime  @default(now())
 
   review PerformanceReview @relation(fields: [review_id], references: [id])
