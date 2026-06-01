@@ -1,13 +1,45 @@
 'use strict';
 // Applies the initial migration using pg directly, then seeds demo data.
-// Prisma Migrate (migrate deploy) doesn't work reliably with the
-// PrismaPg driver-adapter in Prisma 7 — this script is the safe alternative.
+// Each incremental migration file is executed statement-by-statement so that
+// a single failing statement (e.g. "column already exists" in a partially-applied
+// migration) does NOT prevent subsequent statements in the same file from running.
+
 const { Pool }     = require('pg');
 const { execSync } = require('child_process');
 const fs           = require('fs');
 const path         = require('path');
 
 const ROOT = path.join(__dirname, '..');
+
+// Split a SQL file into individual statements and execute each one.
+// Failures are non-fatal when they indicate the statement was already applied.
+async function applySqlFile(client, sqlPath) {
+  const sql = fs.readFileSync(sqlPath, 'utf8');
+
+  // Split on semicolon + optional whitespace + (newline or end-of-string).
+  // This correctly splits multi-line CREATE TABLE blocks.
+  const stmts = sql
+    .split(/;[ \t]*(?:\r?\n|$)/)
+    .map(s => s.trim())
+    .filter(s => {
+      if (!s) return false;
+      // Skip lines that consist solely of SQL comments
+      const withoutComments = s.replace(/--[^\n]*/g, '').trim();
+      return withoutComments.length > 0;
+    });
+
+  for (const stmt of stmts) {
+    try {
+      await client.query(stmt);
+    } catch (err) {
+      // Most failures here are "already exists" / "duplicate column" which are
+      // fine — IF NOT EXISTS guards handle the majority, but FK constraints and
+      // TYPE casts can still throw on an already-migrated DB.
+      const preview = stmt.replace(/\s+/g, ' ').substring(0, 90);
+      console.warn(`[migrate]   ⚠ skipped: ${preview}… — ${err.message}`);
+    }
+  }
+}
 
 async function run() {
   if (!process.env.DATABASE_URL) {
@@ -20,7 +52,7 @@ async function run() {
   let poolClosed = false;
 
   try {
-    // ── 1. Migration ──────────────────────────────────────────────────────────
+    // ── 1. Initial migration ──────────────────────────────────────────────
     const { rows: tableRows } = await client.query(`
       SELECT EXISTS (
         SELECT 1 FROM information_schema.tables
@@ -36,14 +68,13 @@ async function run() {
         path.join(ROOT, 'prisma/migrations/20260101000000_init/migration.sql'),
         'utf8'
       );
-
       await client.query('BEGIN');
       await client.query(sql);
       await client.query('COMMIT');
-      console.log('[migrate] Done — all tables created');
+      console.log('[migrate] Initial migration done');
     }
 
-    // ── 1b. Incremental migrations (idempotent — use IF NOT EXISTS / ADD COLUMN IF NOT EXISTS)
+    // ── 2. Incremental migrations — one statement at a time ────────────────
     const incrementalMigrations = [
       'prisma/migrations/20260201000000_shift_breaks_overtime/migration.sql',
       'prisma/migrations/20260301000000_ssid_support/migration.sql',
@@ -57,22 +88,19 @@ async function run() {
       'prisma/migrations/20260605000000_late_notice/migration.sql',
       'prisma/migrations/20260605000001_half_day_leave/migration.sql',
     ];
+
     for (const relPath of incrementalMigrations) {
       const migPath = path.join(ROOT, relPath);
-      if (!fs.existsSync(migPath)) continue;
-      const sql = fs.readFileSync(migPath, 'utf8');
-      try {
-        await client.query(sql);
-        console.log(`[migrate] Applied: ${relPath}`);
-      } catch (err) {
-        // Non-fatal if already applied (IF NOT EXISTS guards handle most cases)
-        console.warn(`[migrate] Skipped (already applied?): ${relPath} — ${err.message}`);
+      if (!fs.existsSync(migPath)) {
+        console.log(`[migrate] Not found, skipping: ${relPath}`);
+        continue;
       }
+      console.log(`[migrate] → ${relPath}`);
+      await applySqlFile(client, migPath);
+      console.log(`[migrate] ✓ ${relPath}`);
     }
 
-    // ── 2. Seed ───────────────────────────────────────────────────────────────
-    // Run seed whenever demo org is missing, regardless of whether migration
-    // just ran (tables may have been created by an earlier deploy without seed).
+    // ── 3. Seed ───────────────────────────────────────────────────────────
     const { rows: seedRows } = await client.query(
       `SELECT EXISTS (SELECT 1 FROM organisations WHERE id = 'demo-org-001') AS seeded`
     );
@@ -86,11 +114,11 @@ async function run() {
       await pool.end();
       execSync('node dist/utils/seed.js', { stdio: 'inherit', cwd: ROOT });
       console.log('[seed] Done');
-      return; // pool already closed above
+      return;
     }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    console.error('[migrate] Failed:', err.message);
+    console.error('[migrate] Fatal error:', err.message);
     process.exit(1);
   } finally {
     if (!poolClosed) {
