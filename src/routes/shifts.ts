@@ -215,6 +215,126 @@ router.post('/assignments', requireRole('hr_admin'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ─── PUT /shifts/assignments/:id ──────────────────────
+// Change the shift or date of an existing assignment.
+router.put('/assignments/:id', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const assignment = await prisma.shiftAssignment.findFirst({
+      where: { id: req.params.id, shift: { org_id: req.user!.org_id } },
+    });
+    if (!assignment) throw new NotFoundError('Assignment');
+
+    const { shift_id, date } = req.body;
+    const updateData: Record<string, unknown> = {};
+
+    if (shift_id) {
+      const shift = await prisma.shift.findFirst({ where: { id: shift_id, org_id: req.user!.org_id } });
+      if (!shift) throw new NotFoundError('Shift');
+      updateData.shift_id = shift_id;
+    }
+
+    if (date) {
+      const assignDate = new Date(date);
+      if (isNaN(assignDate.getTime())) throw new ValidationError('Invalid date');
+
+      // Conflict check: ensure no other assignment exists for this user on the new date
+      const conflict = await prisma.shiftAssignment.findFirst({
+        where: { user_id: assignment.user_id, date: assignDate, id: { not: assignment.id } },
+      });
+      if (conflict) throw new ValidationError('Employee already has a shift on that date');
+      updateData.date = assignDate;
+    }
+
+    if (!shift_id && !date) throw new ValidationError('shift_id or date required');
+
+    const updated = await prisma.shiftAssignment.update({
+      where: { id: assignment.id },
+      data:  updateData,
+      include: ASSIGN_INCLUDE,
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /shifts/assignments/bulk ────────────────────
+// Assign a shift to multiple employees across multiple dates in one call.
+// Returns created assignments, skipped conflicts, and leave/off-day warnings.
+router.post('/assignments/bulk', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const { user_ids, shift_id, dates } = req.body;
+    if (!Array.isArray(user_ids) || user_ids.length === 0) throw new ValidationError('user_ids array required');
+    if (!shift_id)                                          throw new ValidationError('shift_id required');
+    if (!Array.isArray(dates)    || dates.length === 0)    throw new ValidationError('dates array required');
+
+    const shift = await prisma.shift.findFirst({ where: { id: shift_id, org_id: req.user!.org_id } });
+    if (!shift) throw new NotFoundError('Shift');
+
+    // Validate all employees belong to org
+    const users = await prisma.user.findMany({
+      where: { id: { in: user_ids }, org_id: req.user!.org_id, is_active: true },
+      select: { id: true, name: true },
+    });
+    if (users.length !== user_ids.length) throw new ValidationError('One or more employees not found in your organisation');
+
+    const parsedDates = dates.map((d: string) => {
+      const dt = new Date(d);
+      if (isNaN(dt.getTime())) throw new ValidationError(`Invalid date: ${d}`);
+      return dt;
+    });
+
+    // Pre-fetch existing assignments and approved leave to avoid N+1 checks
+    const existingAssignments = await prisma.shiftAssignment.findMany({
+      where: { user_id: { in: user_ids }, date: { in: parsedDates } },
+      select: { user_id: true, date: true },
+    });
+    const conflictSet = new Set(existingAssignments.map(a => `${a.user_id}:${a.date.toISOString().split('T')[0]}`));
+
+    const approvedLeave = await prisma.leaveRequest.findMany({
+      where: {
+        user_id: { in: user_ids }, status: 'approved',
+        start_date: { lte: parsedDates[parsedDates.length - 1] },
+        end_date:   { gte: parsedDates[0] },
+      },
+      select: { user_id: true, start_date: true, end_date: true },
+    });
+
+    const created: { user_id: string; user_name: string; date: string }[] = [];
+    const skipped: { user_id: string; user_name: string; date: string; reason: string }[] = [];
+    const warnings: { user_id: string; user_name: string; date: string; type: string }[] = [];
+
+    const userMap = new Map(users.map(u => [u.id, u.name]));
+
+    for (const userId of user_ids) {
+      for (const assignDate of parsedDates) {
+        const dateStr  = assignDate.toISOString().split('T')[0];
+        const userName = userMap.get(userId) ?? userId;
+
+        if (conflictSet.has(`${userId}:${dateStr}`)) {
+          skipped.push({ user_id: userId, user_name: userName, date: dateStr, reason: 'already_assigned' });
+          continue;
+        }
+
+        // Leave warning (don't block — HR may be overriding)
+        const onLeave = approvedLeave.some(l =>
+          l.user_id === userId &&
+          new Date(l.start_date) <= assignDate &&
+          new Date(l.end_date)   >= assignDate
+        );
+        const weekday = assignDate.getDay();
+        const offDay  = Array.isArray(shift.active_days) && shift.active_days.length > 0 && !shift.active_days.includes(weekday);
+
+        await prisma.shiftAssignment.create({ data: { shift_id, user_id: userId, date: assignDate } });
+        created.push({ user_id: userId, user_name: userName, date: dateStr });
+
+        if (onLeave) warnings.push({ user_id: userId, user_name: userName, date: dateStr, type: 'leave_overlap' });
+        if (offDay)  warnings.push({ user_id: userId, user_name: userName, date: dateStr, type: 'off_day' });
+      }
+    }
+
+    ok(res, { created: created.length, skipped: skipped.length, warnings: warnings.length, details: { created, skipped, warnings } }, 201);
+  } catch (e) { next(e); }
+});
+
 // ─── DELETE /shifts/assignments/:id ───────────────────
 router.delete('/assignments/:id', requireRole('hr_admin'), async (req, res, next) => {
   try {

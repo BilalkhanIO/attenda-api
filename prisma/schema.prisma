@@ -37,6 +37,7 @@ model Organisation {
   performance_reviews PerformanceReview[]
   overtime_rules      OvertimeRule[]
   notifications       InAppNotification[]
+  late_arrival_notices LateArrivalNotice[]
 
   @@map("organisations")
 }
@@ -85,6 +86,7 @@ model User {
   performance_goals       PerformanceGoal[]
   remote_sessions         RemoteSession[]
   notifications           InAppNotification[]
+  late_arrival_notices    LateArrivalNotice[]
 
   @@map("users")
 }
@@ -118,10 +120,14 @@ model AttendanceRecord {
   adherence_score    Int?
   auto_checked_out   Boolean   @default(false)
   late_alerted       Boolean   @default(false)
+  hour_alerted       Boolean   @default(false)
+  late_notice_id     String?
+  is_on_approved_leave Boolean @default(false)
 
-  user           User          @relation(fields: [user_id], references: [id])
-  org            Organisation  @relation(fields: [org_id], references: [id])
-  shift          Shift?        @relation(fields: [shift_id], references: [id])
+  user           User               @relation(fields: [user_id], references: [id])
+  org            Organisation       @relation(fields: [org_id], references: [id])
+  shift          Shift?             @relation(fields: [shift_id], references: [id])
+  late_notice    LateArrivalNotice? @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
   remote_session RemoteSession?
   break_records  BreakRecord[]
 
@@ -130,16 +136,19 @@ model AttendanceRecord {
 }
 
 model BreakRecord {
-  id            String    @id @default(uuid())
-  attendance_id String
-  break_start   DateTime
-  break_end     DateTime?
-  is_paid       Boolean   @default(false)
-  break_type    String    @db.VarChar(50)
-  duration_mins Int?
-  auto_ended    Boolean   @default(false)
+  id              String    @id @default(uuid())
+  attendance_id   String
+  break_start     DateTime
+  break_end       DateTime?
+  is_paid         Boolean   @default(false)
+  break_type      String    @db.VarChar(50)
+  duration_mins   Int?
+  auto_ended      Boolean   @default(false)
+  auto_started    Boolean   @default(false)
+  shift_break_id  String?
 
-  attendance AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
+  attendance  AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
+  shift_break ShiftBreak?      @relation(fields: [shift_break_id], references: [id], onDelete: SetNull)
 
   @@map("break_records")
 }
@@ -188,7 +197,9 @@ model LeaveRequest {
   leave_type       String    @db.VarChar(50)
   start_date       DateTime  @db.Date
   end_date         DateTime  @db.Date
-  working_days     Int
+  working_days     Float     // supports 0.5 for half-day
+  is_half_day      Boolean   @default(false)
+  half_day_period  String?   @db.VarChar(20) // 'morning' | 'afternoon'
   reason           String?
   status           String    @default("pending")
   reviewed_by      String?
@@ -257,7 +268,8 @@ model ShiftBreak {
   break_start_time String? @db.VarChar(10)
   break_end_time   String? @db.VarChar(10)
 
-  shift Shift @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+  shift         Shift         @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+  break_records BreakRecord[]
 
   @@map("shift_breaks")
 }
@@ -431,4 +443,26 @@ model InAppNotification {
   @@index([user_id, read_at])
   @@index([user_id, created_at(sort: Desc)])
   @@map("in_app_notifications")
+}
+
+// Employee submits an advance notice of late arrival before their shift.
+// The scheduler checks this before alerting the manager about lateness.
+model LateArrivalNotice {
+  id              String    @id @default(uuid())
+  user_id         String
+  org_id          String
+  date            DateTime  @db.Date
+  expected_time   String    @db.VarChar(10)   // HH:MM wall-clock — expected arrival
+  reason          String    @db.Text
+  status          String    @default("pending") @db.VarChar(20) // pending | acknowledged | cancelled
+  acknowledged_by String?
+  acknowledged_at DateTime?
+  created_at      DateTime  @default(now())
+
+  user              User               @relation(fields: [user_id], references: [id])
+  org               Organisation       @relation(fields: [org_id], references: [id])
+  attendance_records AttendanceRecord[]
+
+  @@unique([user_id, date])
+  @@map("late_arrival_notices")
 }
