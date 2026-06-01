@@ -53,6 +53,7 @@ async function run() {
       'prisma/migrations/20260602000000_wa_groups_json/migration.sql',
       'prisma/migrations/20260603000000_wa_phone_text/migration.sql',
       'prisma/migrations/20260604000000_late_alerted/migration.sql',
+      'prisma/migrations/20260604000001_break_auto/migration.sql',
     ];
     for (const relPath of incrementalMigrations) {
       const migPath = path.join(ROOT, relPath);

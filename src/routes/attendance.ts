@@ -11,7 +11,8 @@ const router = Router();
 router.use(authenticate);
 
 const RECORD_INCLUDE = {
-  user: { select: { id: true, name: true, avatar_url: true, department: true, job_title: true } },
+  user:  { select: { id: true, name: true, avatar_url: true, department: true, job_title: true } },
+  shift: { select: { id: true, name: true, start_time: true, end_time: true, color: true } },
 };
 
 // ─── GET /attendance/today ─────────────────────────────

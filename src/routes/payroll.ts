@@ -71,7 +71,8 @@ router.post('/generate', requireRole('hr_admin'), async (req, res, next) => {
         where: { user_id: user.id, date: { gte: start, lte: end } },
       });
 
-      const regularHours  = attendance.reduce((s, r) => s + (r.hours_worked ? Number(r.hours_worked) : 0), 0);
+      // Prefer net_hours_worked (gross minus unpaid breaks) — fall back to hours_worked for old records
+      const regularHours  = attendance.reduce((s, r) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
       const overtimeHours = attendance.reduce((s, r) => s + Number(r.overtime_hours), 0);
 
       // Get unpaid leave days

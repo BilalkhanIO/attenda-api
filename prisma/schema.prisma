@@ -130,16 +130,19 @@ model AttendanceRecord {
 }
 
 model BreakRecord {
-  id            String    @id @default(uuid())
-  attendance_id String
-  break_start   DateTime
-  break_end     DateTime?
-  is_paid       Boolean   @default(false)
-  break_type    String    @db.VarChar(50)
-  duration_mins Int?
-  auto_ended    Boolean   @default(false)
+  id              String    @id @default(uuid())
+  attendance_id   String
+  break_start     DateTime
+  break_end       DateTime?
+  is_paid         Boolean   @default(false)
+  break_type      String    @db.VarChar(50)
+  duration_mins   Int?
+  auto_ended      Boolean   @default(false)
+  auto_started    Boolean   @default(false)
+  shift_break_id  String?
 
-  attendance AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
+  attendance  AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
+  shift_break ShiftBreak?      @relation(fields: [shift_break_id], references: [id], onDelete: SetNull)
 
   @@map("break_records")
 }
@@ -257,7 +260,8 @@ model ShiftBreak {
   break_start_time String? @db.VarChar(10)
   break_end_time   String? @db.VarChar(10)
 
-  shift Shift @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+  shift         Shift         @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+  break_records BreakRecord[]
 
   @@map("shift_breaks")
 }

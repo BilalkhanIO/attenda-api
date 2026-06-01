@@ -266,32 +266,48 @@ export function startShiftAutoCheckout() {
 }
 
 // ─── Job: Shift Reminders ─────────────────────────────
-// Runs every minute — sends reminder 30 min before shift start
+// Runs every minute — sends reminder 30 min before shift start (timezone-aware).
+// Uses in-memory cache for idempotency (prevents duplicate sends in the fire window).
+const _shiftReminderSent = new Set<string>(); // `${assignment.id}:${YYYY-MM-DD}`
+
 export function startShiftReminderJob() {
   cron.schedule('* * * * *', async () => {
     const now   = new Date();
     const today = new Date(now); today.setHours(0, 0, 0, 0);
 
     try {
-      const nowMins = now.getHours() * 60 + now.getMinutes();
-      const shifts  = await prisma.shift.findMany({ where: { is_published: true } });
+      const shifts = await prisma.shift.findMany({
+        where: { is_published: true },
+        include: { org: { select: { timezone: true } } },
+      });
 
       for (const shift of shifts) {
-        const [sh, sm] = shift.start_time.split(':').map(Number);
-        const shiftMins = sh * 60 + sm;
+        const tz      = shift.org?.timezone;
+        const nowMins = minutesOfDayInTz(now, tz);
+        const startMins = hhmmToMins(shift.start_time);
 
-        // Send reminder exactly 30 min before start
-        if (nowMins !== shiftMins - 30) continue;
+        // Fire within a 4-minute window centred on 30 min before shift start,
+        // i.e. when [28, 32) minutes remain. This handles minor cron-tick drift.
+        const minsUntilStart = startMins - nowMins;
+        if (minsUntilStart < 28 || minsUntilStart >= 32) continue;
 
         const assignments = await prisma.shiftAssignment.findMany({
           where: { shift_id: shift.id, date: today },
           include: { user: true },
         });
 
-        for (const { user } of assignments) {
+        for (const assignment of assignments) {
+          const { user } = assignment;
           if (!user.phone) continue;
+
+          const dateKey = today.toISOString().split('T')[0];
+          const cacheKey = `${assignment.id}:${dateKey}`;
+          if (_shiftReminderSent.has(cacheKey)) continue; // already sent today
+
+          const [sh] = shift.start_time.split(':').map(Number);
           const shiftStartTime = `${shift.start_time} ${sh < 12 ? 'AM' : 'PM'}`;
-          await notifyShiftReminder(user.org_id, user.name, shiftStartTime, user.phone);
+          await notifyShiftReminder(user.org_id, user.name, shiftStartTime, user.phone).catch(console.error);
+          _shiftReminderSent.add(cacheKey);
         }
       }
     } catch (err) {
@@ -302,19 +318,20 @@ export function startShiftReminderJob() {
 }
 
 // ─── Job: Remote AI Nudges ────────────────────────────
-// Runs every minute — sends WhatsApp nudges to remote employees
+// Runs every minute — sends WhatsApp nudges to remote employees (timezone-aware).
+// Each nudge type has a ±1-minute fire window; idempotency is enforced by the
+// morning_nudge_at / midday_nudge_at / end_nudge_at timestamps on the session.
 export function startRemoteNudgeJob() {
   cron.schedule('* * * * *', async () => {
     const now   = new Date();
     const today = new Date(now); today.setHours(0, 0, 0, 0);
-    const nowMins = now.getHours() * 60 + now.getMinutes();
 
     try {
       // Get all approved remote sessions for today
       const sessions = await prisma.remoteSession.findMany({
         where: { status: 'approved', created_at: { gte: today } },
         include: {
-          user: true,
+          user: { include: { org: { select: { timezone: true } } } },
           attendance: { include: { shift: { select: { start_time: true, end_time: true } } } },
         },
       });
@@ -323,26 +340,31 @@ export function startRemoteNudgeJob() {
         const user  = session.user;
         if (!user.phone) continue;
 
+        // Use org timezone for wall-clock comparison
+        const tz      = user.org?.timezone;
+        const nowMins = minutesOfDayInTz(now, tz);
+
         const shiftStart = session.attendance?.shift?.start_time || '09:00';
         const shiftEnd   = session.attendance?.shift?.end_time   || '18:00';
-        const [startH, startM] = shiftStart.split(':').map(Number);
-        const [endH,   endM]   = shiftEnd.split(':').map(Number);
-        const startMins  = startH * 60 + startM;
-        const endMins    = endH   * 60 + endM;
+        const startMins  = hhmmToMins(shiftStart);
+        const endMins    = hhmmToMins(shiftEnd);
         const middayMins = Math.floor((startMins + endMins) / 2);
 
+        // ±1-minute window; idempotency enforced by the *_nudge_at timestamps
+        const near = (target: number) => Math.abs(nowMins - target) <= 1;
+
         // Morning nudge — at shift start
-        if (nowMins === startMins && !session.morning_nudge_at) {
+        if (near(startMins) && !session.morning_nudge_at) {
           await sendRemoteNudge(user.org_id, user.name, 'morning', user.phone);
           await prisma.remoteSession.update({ where: { id: session.id }, data: { morning_nudge_at: new Date() } });
         }
         // Midday nudge
-        else if (nowMins === middayMins && !session.midday_nudge_at) {
+        else if (near(middayMins) && !session.midday_nudge_at) {
           await sendRemoteNudge(user.org_id, user.name, 'midday', user.phone);
           await prisma.remoteSession.update({ where: { id: session.id }, data: { midday_nudge_at: new Date() } });
         }
         // End-of-day nudge
-        else if (nowMins === endMins && !session.end_nudge_at) {
+        else if (near(endMins) && !session.end_nudge_at) {
           await sendRemoteNudge(user.org_id, user.name, 'eod', user.phone);
           await prisma.remoteSession.update({ where: { id: session.id }, data: { end_nudge_at: new Date() } });
         }
@@ -482,7 +504,7 @@ export function startPayrollAutoGenerate() {
           const attendance = await prisma.attendanceRecord.findMany({
             where: { user_id: user.id, date: { gte: start, lte: end } },
           });
-          const regularHours  = attendance.reduce((s, r) => s + Number(r.hours_worked || 0), 0);
+          const regularHours  = attendance.reduce((s, r) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
           const overtimeHours = attendance.reduce((s, r) => s + Number(r.overtime_hours || 0), 0);
           const unpaidLeave   = await prisma.leaveRequest.findMany({
             where: { user_id: user.id, status: 'approved', leave_type: 'unpaid', start_date: { lte: end }, end_date: { gte: start } },
@@ -528,6 +550,80 @@ export function startPayrollAutoGenerate() {
   console.log('💰 Payroll auto-generate job started');
 }
 
+// ─── Job: Shift Break Auto-Manager (every minute) ────
+// Automatically starts and ends BreakRecords for employees whose shift has
+// ShiftBreak templates with break_start_time / break_end_time set.
+// This connects shift break schedules to live attendance records so break
+// time is properly deducted from net_hours_worked without manual action.
+export function startShiftBreakAutoManager() {
+  cron.schedule('* * * * *', async () => {
+    const now   = new Date();
+    const today = new Date(now); today.setHours(0, 0, 0, 0);
+
+    try {
+      const openRecords = await prisma.attendanceRecord.findMany({
+        where: {
+          date:         today,
+          check_in_at:  { not: null },
+          check_out_at: null,
+          status:       { in: ['in', 'late', 'remote'] },
+          shift_id:     { not: null },
+        },
+        include: {
+          user:         { include: { org: { select: { timezone: true } } } },
+          shift:        { include: { breaks: { orderBy: { after_minutes: 'asc' } } } },
+          break_records: { orderBy: { break_start: 'asc' } },
+        },
+      });
+
+      for (const record of openRecords) {
+        const tz      = record.user.org?.timezone;
+        const nowMins = minutesOfDayInTz(now, tz);
+        const shiftBreaks = record.shift?.breaks ?? [];
+
+        for (const tmpl of shiftBreaks) {
+          if (!tmpl.break_start_time || !tmpl.break_end_time) continue;
+
+          const bStartMins = hhmmToMins(tmpl.break_start_time);
+          const bEndMins   = hhmmToMins(tmpl.break_end_time);
+
+          // Find if a BreakRecord for this shift-break template exists today
+          const existing = record.break_records.find(br => br.shift_break_id === tmpl.id);
+
+          // Auto-start: current time is at/after break start and before break end
+          if (!existing && nowMins >= bStartMins && nowMins < bEndMins) {
+            const openBreak = record.break_records.find(br => !br.break_end);
+            if (!openBreak) {
+              await prisma.breakRecord.create({
+                data: {
+                  attendance_id:  record.id,
+                  shift_break_id: tmpl.id,
+                  break_start:    now,
+                  break_type:     'shift_break',
+                  is_paid:        tmpl.is_paid,
+                  auto_started:   true,
+                },
+              });
+            }
+          }
+
+          // Auto-end: break template has ended but BreakRecord is still open
+          if (existing && !existing.break_end && nowMins >= bEndMins) {
+            const durMins = Math.max(0, Math.round((now.getTime() - existing.break_start.getTime()) / 60000));
+            await prisma.breakRecord.update({
+              where: { id: existing.id },
+              data:  { break_end: now, duration_mins: durMins, auto_ended: true },
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error('[JOB] Shift break auto-manager error:', err);
+    }
+  });
+  console.log('☕ Shift break auto-manager started');
+}
+
 // ─── Start all jobs ───────────────────────────────────
 export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
@@ -540,6 +636,7 @@ export function startAllJobs() {
   startTokenCleanup();
   startPayrollAutoGenerate();
   startIpCheckoutMonitor();
+  startShiftBreakAutoManager();
   console.log('✅ All background jobs running\n');
 }
 
