@@ -20,6 +20,9 @@ import { errorHandler, notFound } from './middleware/errorHandler';
 
 const app = express();
 
+// Trust Railway/cloud-proxy X-Forwarded-For header so rate-limit uses real IPs
+app.set('trust proxy', 1);
+
 // ─── Security & Parsing ───────────────────────────────
 app.use(helmet());
 const allowedOrigins = new Set(
