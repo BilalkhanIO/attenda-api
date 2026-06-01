@@ -11,22 +11,94 @@ const path         = require('path');
 
 const ROOT = path.join(__dirname, '..');
 
+// Token-aware SQL statement splitter. Correctly handles dollar-quoted blocks
+// (DO $$ ... $$), single-quoted strings, double-quoted identifiers, and both
+// comment styles so that semicolons inside those constructs are never treated
+// as statement boundaries.
+function splitSqlStatements(sql) {
+  const stmts = [];
+  let current = '';
+  let i = 0;
+  const n = sql.length;
+
+  while (i < n) {
+    // Single-line comment
+    if (sql[i] === '-' && sql[i + 1] === '-') {
+      const end = sql.indexOf('\n', i);
+      if (end === -1) { current += sql.slice(i); i = n; }
+      else            { current += sql.slice(i, end + 1); i = end + 1; }
+      continue;
+    }
+    // Block comment
+    if (sql[i] === '/' && sql[i + 1] === '*') {
+      const end = sql.indexOf('*/', i + 2);
+      if (end === -1) { current += sql.slice(i); i = n; }
+      else            { current += sql.slice(i, end + 2); i = end + 2; }
+      continue;
+    }
+    // Single-quoted string ('' escape)
+    if (sql[i] === "'") {
+      let j = i + 1;
+      while (j < n) {
+        if (sql[j] === "'" && sql[j + 1] === "'") { j += 2; }
+        else if (sql[j] === "'")                   { j++; break; }
+        else                                        { j++; }
+      }
+      current += sql.slice(i, j); i = j; continue;
+    }
+    // Double-quoted identifier
+    if (sql[i] === '"') {
+      let j = i + 1;
+      while (j < n) {
+        if (sql[j] === '"' && sql[j + 1] === '"') { j += 2; }
+        else if (sql[j] === '"')                   { j++; break; }
+        else                                        { j++; }
+      }
+      current += sql.slice(i, j); i = j; continue;
+    }
+    // Dollar-quoted string: $tag$...$tag$ (handles both $$ and $label$)
+    if (sql[i] === '$') {
+      let j = i + 1;
+      while (j < n && sql[j] !== '$' && /[A-Za-z0-9_]/.test(sql[j])) j++;
+      if (j < n && sql[j] === '$') {
+        const tag = sql.slice(i, j + 1);
+        const closeIdx = sql.indexOf(tag, j + 1);
+        if (closeIdx !== -1) {
+          current += sql.slice(i, closeIdx + tag.length);
+          i = closeIdx + tag.length;
+          continue;
+        }
+      }
+      current += sql[i]; i++; continue;
+    }
+    // Statement terminator
+    if (sql[i] === ';') {
+      current += ';';
+      const trimmed = current.trim();
+      if (trimmed) stmts.push(trimmed);
+      current = ''; i++; continue;
+    }
+    current += sql[i]; i++;
+  }
+
+  // Trailing statement without trailing semicolon
+  const trailing = current.trim();
+  if (trailing) {
+    const clean = trailing.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+    if (clean) stmts.push(trailing);
+  }
+
+  return stmts.filter(s => {
+    const clean = s.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+    return clean.length > 0;
+  });
+}
+
 // Split a SQL file into individual statements and execute each one.
 // Failures are non-fatal when they indicate the statement was already applied.
 async function applySqlFile(client, sqlPath) {
   const sql = fs.readFileSync(sqlPath, 'utf8');
-
-  // Split on semicolon + optional whitespace + (newline or end-of-string).
-  // This correctly splits multi-line CREATE TABLE blocks.
-  const stmts = sql
-    .split(/;[ \t]*(?:\r?\n|$)/)
-    .map(s => s.trim())
-    .filter(s => {
-      if (!s) return false;
-      // Skip lines that consist solely of SQL comments
-      const withoutComments = s.replace(/--[^\n]*/g, '').trim();
-      return withoutComments.length > 0;
-    });
+  const stmts = splitSqlStatements(sql);
 
   for (const stmt of stmts) {
     try {
