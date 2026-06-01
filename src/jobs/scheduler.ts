@@ -7,7 +7,7 @@ import {
 } from '../services/whatsapp';
 import {
   minutesOfDayInTz, hhmmToMins, lateThresholdFor, lateMinutes,
-  earlyOutMinutes, adherenceScore, shiftAutoCheckoutDue, scheduledWindow,
+  earlyOutMinutes, adherenceScore, scheduledWindow,
 } from '../utils/shift';
 import { settleBreaks, netHoursWorked } from '../utils/attendance';
 

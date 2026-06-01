@@ -331,29 +331,6 @@ router.get('/break/status', async (req: Request, res: Response, next: NextFuncti
   } catch (e) { next(e); }
 });
 
-// ─── GET /attendance/:userId ───────────────────────────
-router.get('/:userId', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { userId } = req.params;
-    const { start, end } = req.query as { start?: string; end?: string };
-
-    const user = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
-    if (!user) throw new NotFoundError('User');
-
-    const where: Record<string, unknown> = { user_id: userId };
-    if (start || end) {
-      where.date = {};
-      if (start) (where.date as Record<string, unknown>).gte = new Date(start);
-      if (end)   (where.date as Record<string, unknown>).lte = new Date(end);
-    }
-
-    const records = await prisma.attendanceRecord.findMany({
-      where, include: RECORD_INCLUDE, orderBy: { date: 'desc' }, take: 90,
-    });
-    ok(res, records);
-  } catch (e) { next(e); }
-});
-
 // ─── GET /attendance/late-notice/me ───────────────────
 router.get('/late-notice/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -893,6 +870,32 @@ router.get('/report/export', requireRole('hr_admin'), async (req: Request, res: 
 
     const records = await prisma.attendanceRecord.findMany({
       where, include: RECORD_INCLUDE, orderBy: [{ date: 'asc' }, { user_id: 'asc' }],
+    });
+    ok(res, records);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/:userId ───────────────────────────
+// NOTE: This parameterised route MUST stay last among GET routes so that
+// fixed-path routes like /leave-check, /late-notices, /me, etc. are matched
+// before Express falls through to the wildcard segment.
+router.get('/:userId', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId } = req.params;
+    const { start, end } = req.query as { start?: string; end?: string };
+
+    const user = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
+    if (!user) throw new NotFoundError('User');
+
+    const where: Record<string, unknown> = { user_id: userId };
+    if (start || end) {
+      where.date = {};
+      if (start) (where.date as Record<string, unknown>).gte = new Date(start);
+      if (end)   (where.date as Record<string, unknown>).lte = new Date(end);
+    }
+
+    const records = await prisma.attendanceRecord.findMany({
+      where, include: RECORD_INCLUDE, orderBy: { date: 'desc' }, take: 90,
     });
     ok(res, records);
   } catch (e) { next(e); }
