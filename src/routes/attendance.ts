@@ -3,6 +3,8 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
+import { lateThresholdFor, lateMinutes, earlyOutMinutes, adherenceScore, scheduledWindow } from '../utils/shift';
+import { settleBreaks, netHoursWorked } from '../utils/attendance';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -373,37 +375,54 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     // Detect status: check if this is a remote check-in
     let status: string = type === 'remote' ? 'remote' : 'in';
 
-    // Detect late arrival by comparing with assigned shift
+    // Shift-based compliance: late detection + scheduled window (timezone-aware)
+    let lateMins  = 0;
+    let scheduledStart: Date | null = null;
+    let scheduledEnd:   Date | null = null;
+    let shiftId: string | null = null;
+
     if (type !== 'remote') {
       const [assignment, org] = await Promise.all([
         prisma.shiftAssignment.findFirst({
           where: { user_id: req.user!.sub, date: today },
           include: { shift: true },
         }),
-        prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { late_threshold: true } }),
+        prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { late_threshold: true, timezone: true } }),
       ]);
 
       if (assignment?.shift) {
-        const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
-        const shiftStartMins = sh * 60 + sm;
-        const nowMins        = now.getHours() * 60 + now.getMinutes();
-        const lateThreshold  = org?.late_threshold ?? 15;
-        if (nowMins > shiftStartMins + lateThreshold) {
-          status = 'late';
-        }
+        const shift = assignment.shift;
+        shiftId = shift.id;
+        lateMins = lateMinutes(now, shift, org?.timezone);
+        if (lateMins > lateThresholdFor(shift, org)) status = 'late';
+
+        // Persist the scheduled window as correct UTC instants in the org's tz
+        const win = scheduledWindow(shift, org?.timezone, now);
+        scheduledStart = win.start;
+        scheduledEnd   = win.end;
       }
     }
 
     const record = existing
       ? await prisma.attendanceRecord.update({
           where: { id: existing.id },
-          data: { check_in_at: now, check_in_type: type, status },
+          data: {
+            check_in_at: now, check_in_type: type, status,
+            late_minutes: lateMins,
+            ...(shiftId        && { shift_id: shiftId }),
+            ...(scheduledStart && { scheduled_start: scheduledStart }),
+            ...(scheduledEnd   && { scheduled_end: scheduledEnd }),
+          },
           include: RECORD_INCLUDE,
         })
       : await prisma.attendanceRecord.create({
           data: {
             user_id: req.user!.sub, org_id: req.user!.org_id,
             date: today, check_in_at: now, check_in_type: type, status,
+            late_minutes: lateMins,
+            shift_id:        shiftId        ?? undefined,
+            scheduled_start: scheduledStart ?? undefined,
+            scheduled_end:   scheduledEnd   ?? undefined,
           },
           include: RECORD_INCLUDE,
         });
@@ -453,6 +472,7 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
     const today = startOfDay(new Date());
     const record = await prisma.attendanceRecord.findUnique({
       where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      include: { shift: true },
     });
     if (!record?.check_in_at) throw new ValidationError('No check-in found for today');
     if (record.check_out_at)  throw new ValidationError('Already checked out today');
@@ -460,9 +480,24 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
     const now          = new Date();
     const hoursWorked  = calcHoursWorked(record.check_in_at, now);
 
+    // Settle breaks (close any open break) and compute net hours
+    const breaks   = await settleBreaks(record.id, now);
+    const netHours = netHoursWorked(hoursWorked, breaks.unpaidMins);
+
+    // Shift-based compliance on checkout (timezone-aware)
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { timezone: true } });
+    const earlyMins = earlyOutMinutes(now, record.shift, org?.timezone);
+    const score     = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
+
     const updated = await prisma.attendanceRecord.update({
       where: { id: record.id },
-      data: { check_out_at: now, hours_worked: hoursWorked, status: 'out' },
+      data: {
+        check_out_at: now, hours_worked: hoursWorked, status: 'out',
+        net_hours_worked: netHours,
+        break_minutes: breaks.totalMins, paid_break_minutes: breaks.paidMins,
+        early_out_minutes: earlyMins,
+        ...(score != null && { adherence_score: score }),
+      },
       include: RECORD_INCLUDE,
     });
 
@@ -517,23 +552,36 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
 
       if (!existing?.check_in_at) {
         const now = new Date();
-        // Detect late arrival for IP-based check-in
-        let status = 'in';
+        // Detect late arrival for IP-based check-in (timezone-aware, shift-first threshold)
+        let status   = 'in';
+        let lateMins = 0;
+        let scheduledStart: Date | null = null;
+        let scheduledEnd:   Date | null = null;
+        let shiftId: string | null = null;
         const assignment = await prisma.shiftAssignment.findFirst({
           where: { user_id: req.user!.sub, date: today },
           include: { shift: true },
         });
         if (assignment?.shift) {
-          const [sh, sm] = assignment.shift.start_time.split(':').map(Number);
-          const shiftStartMins = sh * 60 + sm;
-          const nowMins        = now.getHours() * 60 + now.getMinutes();
-          const lateThreshold = org?.late_threshold ?? 15;
-          if (nowMins > shiftStartMins + lateThreshold) status = 'late';
+          const shift = assignment.shift;
+          shiftId  = shift.id;
+          lateMins = lateMinutes(now, shift, org?.timezone);
+          if (lateMins > lateThresholdFor(shift, org)) status = 'late';
+          const win = scheduledWindow(shift, org?.timezone, now);
+          scheduledStart = win.start;
+          scheduledEnd   = win.end;
         }
 
+        const checkInData = {
+          check_in_at: now, check_in_type: 'auto_ip', status, ip_detected: ip,
+          late_minutes: lateMins,
+          shift_id:        shiftId        ?? undefined,
+          scheduled_start: scheduledStart ?? undefined,
+          scheduled_end:   scheduledEnd   ?? undefined,
+        };
         const record = existing
-          ? await prisma.attendanceRecord.update({ where: { id: existing.id }, data: { check_in_at: now, check_in_type: 'auto_ip', status, ip_detected: ip } })
-          : await prisma.attendanceRecord.create({ data: { user_id: req.user!.sub, org_id: req.user!.org_id, date: today, check_in_at: now, check_in_type: 'auto_ip', status, ip_detected: ip } });
+          ? await prisma.attendanceRecord.update({ where: { id: existing.id }, data: checkInData })
+          : await prisma.attendanceRecord.create({ data: { user_id: req.user!.sub, org_id: req.user!.org_id, date: today, ...checkInData } });
 
         // Notify WhatsApp
         const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
