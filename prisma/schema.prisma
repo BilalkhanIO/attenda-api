@@ -17,7 +17,7 @@ model Organisation {
   wa_enabled         Boolean  @default(false)
   wa_phone_number_id String?  @db.VarChar(255)
   wa_access_token    String?
-  wa_group_ids       String[] @default([])
+  wa_groups          Json     @default("[]")
   wa_events          Json     @default("{}")
   wa_dept_groups     Json     @default("{}")
   payroll_day        Int      @default(28)
