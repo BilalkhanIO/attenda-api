@@ -1,16 +1,28 @@
--- Convert wa_group_ids (String[]) to wa_groups (JSONB array of {id,name,phone} objects)
-ALTER TABLE organisations ADD COLUMN IF NOT EXISTS wa_groups JSONB NOT NULL DEFAULT '[]';
+-- Convert wa_group_ids (String[]) → wa_groups (JSONB) — fully idempotent
+DO $$
+BEGIN
+  -- 1. Add wa_groups column if it doesn't exist yet
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'organisations' AND column_name = 'wa_groups'
+  ) THEN
+    ALTER TABLE organisations ADD COLUMN wa_groups JSONB NOT NULL DEFAULT '[]';
+  END IF;
 
--- Migrate existing phone-string rows to object format
-UPDATE organisations
-SET wa_groups = COALESCE(
-  (SELECT jsonb_agg(
-     jsonb_build_object('id', val, 'name', val, 'phone', val)
-   )
-   FROM unnest(wa_group_ids) AS val),
-  '[]'::jsonb
-)
-WHERE array_length(wa_group_ids, 1) IS NOT NULL;
+  -- 2. Migrate data from wa_group_ids (if that column still exists)
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'organisations' AND column_name = 'wa_group_ids'
+  ) THEN
+    -- Convert each phone string to a {id, name, phone} object; rows with empty arrays keep '[]'
+    UPDATE organisations
+    SET wa_groups = COALESCE(
+      (SELECT jsonb_agg(jsonb_build_object('id', val, 'name', val, 'phone', val))
+       FROM unnest(wa_group_ids) AS val),
+      '[]'::jsonb
+    )
+    WHERE wa_groups = '[]'::jsonb;
 
--- Drop old column (idempotent: no-op if already removed)
-ALTER TABLE organisations DROP COLUMN IF EXISTS wa_group_ids;
+    ALTER TABLE organisations DROP COLUMN wa_group_ids;
+  END IF;
+END $$;
