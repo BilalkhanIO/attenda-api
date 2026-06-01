@@ -547,6 +547,15 @@ orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) =>
   } catch (e) { next(e); }
 });
 
+// GET /org/my-ip — returns the client IP as seen by the server (useful for network auto-detection)
+orgRouter.get('/my-ip', authenticate, async (req, res, _next) => {
+  const fwd = req.headers['x-forwarded-for'];
+  const raw = fwd
+    ? (Array.isArray(fwd) ? fwd[0] : fwd).split(',')[0].trim()
+    : req.socket?.remoteAddress || req.ip || '';
+  ok(res, { ip: raw.replace(/^::ffff:/, '') });
+});
+
 // GET /org/office-ips
 orgRouter.get('/office-ips', requireRole('super_admin'), async (req, res, next) => {
   try {
