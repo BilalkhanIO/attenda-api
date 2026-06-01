@@ -117,6 +117,7 @@ model AttendanceRecord {
   early_out_minutes  Int       @default(0)
   adherence_score    Int?
   auto_checked_out   Boolean   @default(false)
+  late_alerted       Boolean   @default(false)
 
   user           User          @relation(fields: [user_id], references: [id])
   org            Organisation  @relation(fields: [org_id], references: [id])

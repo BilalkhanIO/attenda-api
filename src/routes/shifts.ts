@@ -179,26 +179,39 @@ router.post('/assignments', requireRole('hr_admin'), async (req, res, next) => {
     const { user_id, shift_id, date } = req.body;
     if (!user_id || !shift_id || !date) throw new ValidationError('user_id, shift_id and date required');
 
-    // Conflict check
+    const assignDate = new Date(date);
+    if (isNaN(assignDate.getTime())) throw new ValidationError('Invalid date');
+
+    // Both the employee and the shift must belong to the caller's org
+    const [user, shift] = await Promise.all([
+      prisma.user.findFirst({ where: { id: user_id, org_id: req.user!.org_id, is_active: true } }),
+      prisma.shift.findFirst({ where: { id: shift_id, org_id: req.user!.org_id } }),
+    ]);
+    if (!user)  throw new NotFoundError('Employee');
+    if (!shift) throw new NotFoundError('Shift');
+
+    // Conflict check (scoped to org via the shift relation above)
     const conflict = await prisma.shiftAssignment.findFirst({
-      where: { user_id, date: new Date(date) },
+      where: { user_id, date: assignDate },
     });
     if (conflict) throw new ValidationError('Employee is already assigned to a shift on this date');
 
     // Leave conflict check
     const onLeave = await prisma.leaveRequest.findFirst({
-      where: { user_id, status: 'approved', start_date: { lte: new Date(date) }, end_date: { gte: new Date(date) } },
+      where: { user_id, status: 'approved', start_date: { lte: assignDate }, end_date: { gte: assignDate } },
     });
-    if (onLeave) {
-      // Warn but don't block (as per spec)
-      console.warn(`[SHIFTS] Warning: ${user_id} has approved leave on ${date}`);
-    }
+    if (onLeave) console.warn(`[SHIFTS] Warning: ${user_id} has approved leave on ${date}`);
+
+    // Active-day check: warn (don't block) if the date's weekday isn't in the
+    // shift's active_days. JS getDay() is 0=Sun..6=Sat — match that convention.
+    const weekday = assignDate.getDay();
+    const offDay  = Array.isArray(shift.active_days) && shift.active_days.length > 0 && !shift.active_days.includes(weekday);
 
     const assignment = await prisma.shiftAssignment.create({
-      data: { shift_id, user_id, date: new Date(date) },
+      data: { shift_id, user_id, date: assignDate },
       include: ASSIGN_INCLUDE,
     });
-    created(res, { assignment, leave_warning: !!onLeave });
+    created(res, { assignment, leave_warning: !!onLeave, off_day_warning: offDay });
   } catch (e) { next(e); }
 });
 
