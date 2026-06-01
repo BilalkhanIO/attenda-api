@@ -214,21 +214,30 @@ export function startAbsentDetector() {
   console.log('❌ Absent detector started');
 }
 
-// ─── Job: Midnight Checkout (safety net) ──────────────
-// Runs at 23:55 — final safety net for anyone still checked in who wasn't
-// already auto-checked-out by their shift (e.g. shifts with auto_checkout off).
-export function startMidnightCheckout() {
-  cron.schedule('55 23 * * *', async () => {
-    const today = new Date(); today.setHours(0, 0, 0, 0);
+// ─── Job: Heartbeat Expiry Monitor (every 5 min) ──────
+// WiFi check-ins send a heartbeat every ~4 min. If the last heartbeat
+// is more than 10 min old, the employee has left — check them out at
+// the time of their last heartbeat (not now).
+export function startHeartbeatExpiryMonitor() {
+  cron.schedule('*/5 * * * *', async () => {
+    const now   = new Date();
+    const today = new Date(now); today.setHours(0, 0, 0, 0);
 
     try {
-      const openRecords = await prisma.attendanceRecord.findMany({
-        where: { date: today, check_in_at: { not: null }, check_out_at: null, status: { in: ['in', 'late'] } },
+      const expired = await prisma.attendanceRecord.findMany({
+        where: {
+          date:          today,
+          check_in_type: 'auto_ip',
+          check_in_at:   { not: null },
+          check_out_at:  null,
+          status:        { in: ['in', 'late'] },
+          last_heartbeat_at: { not: null, lte: new Date(now.getTime() - 10 * 60 * 1000) },
+        },
         include: { user: { include: { org: { select: { timezone: true } } } }, shift: true },
       });
 
-      for (const record of openRecords) {
-        const checkOut    = new Date(); checkOut.setHours(23, 59, 0, 0);
+      for (const record of expired) {
+        const checkOut    = record.last_heartbeat_at!;
         const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
         const tz          = record.user.org?.timezone;
         const breaks      = await settleBreaks(record.id, checkOut);
@@ -238,85 +247,75 @@ export function startMidnightCheckout() {
         await prisma.attendanceRecord.update({
           where: { id: record.id },
           data: {
-            check_out_at: checkOut, hours_worked: parseFloat(hoursWorked.toFixed(2)), status: 'out',
+            check_out_at:     checkOut,
+            hours_worked:     parseFloat(hoursWorked.toFixed(2)),
+            status:           'out',
             net_hours_worked: netHoursWorked(hoursWorked, breaks.unpaidMins),
-            break_minutes: breaks.totalMins, paid_break_minutes: breaks.paidMins,
-            auto_checked_out: true, early_out_minutes: earlyMins,
+            break_minutes:    breaks.totalMins,
+            paid_break_minutes: breaks.paidMins,
+            auto_checked_out: true,
+            early_out_minutes: earlyMins,
             ...(score != null && { adherence_score: score }),
+            last_heartbeat_at: null,
           },
         });
 
-        await notifyCheckOut(record.user.org_id, record.user.name, '11:59 PM').catch(() => {});
+        await notifyCheckOut(record.user.org_id, record.user.name, formatTime12h(checkOut)).catch(() => {});
       }
-      console.log(`[JOB] Midnight checkout: processed ${openRecords.length} open records`);
+
+      if (expired.length > 0) console.log(`[JOB] Heartbeat expiry: checked out ${expired.length} records`);
     } catch (err) {
-      console.error('[JOB] Midnight checkout error:', err);
+      console.error('[JOB] Heartbeat expiry monitor error:', err);
     }
   });
-  console.log('🌙 Midnight auto-checkout started');
+  console.log('💓 Heartbeat expiry monitor started');
 }
 
-// ─── Job: Shift-based Auto Checkout (every 5 min) ─────
-// Checks out employees whose shift has auto_checkout enabled once org-local
-// time passes shift end + buffer. Checkout time is anchored to the scheduled
-// shift end (employees aren't credited for idle time after their shift).
-export function startShiftAutoCheckout() {
-  cron.schedule('*/5 * * * *', async () => {
-    const now   = new Date();
-    const today = new Date(now); today.setHours(0, 0, 0, 0);
+// ─── Job: Stale Record Sweep (06:00 daily) ────────────
+// Safety net: close any record from yesterday still open at 6 AM.
+// Covers manual check-ins where employee forgot to checkout, dead phones,
+// and any edge case missed by the heartbeat monitor.
+export function startStaleRecordSweep() {
+  cron.schedule('0 6 * * *', async () => {
+    const yesterday = new Date();
+    yesterday.setDate(yesterday.getDate() - 1);
+    yesterday.setHours(0, 0, 0, 0);
 
     try {
-      const openRecords = await prisma.attendanceRecord.findMany({
-        where: {
-          date: today,
-          check_in_at:  { not: null },
-          check_out_at: null,
-          status:       { in: ['in', 'late'] },
-          shift_id:     { not: null },
-        },
-        include: { user: { include: { org: { select: { timezone: true } } } }, shift: true },
+      const stale = await prisma.attendanceRecord.findMany({
+        where: { date: yesterday, check_in_at: { not: null }, check_out_at: null },
+        include: { shift: true },
       });
 
-      let processed = 0;
-      for (const record of openRecords) {
-        const tz = record.user.org?.timezone;
-        if (!shiftAutoCheckoutDue(record.shift, tz, now)) continue;
-
-        // Anchor checkout to scheduled shift end in the org's timezone.
+      for (const record of stale) {
         const checkOut = record.scheduled_end
           ? new Date(record.scheduled_end)
-          : scheduledWindow(record.shift!, tz, now).end;
-
-        // Guard against negative/zero duration (clock skew) — fall back to now.
-        const effectiveOut = checkOut.getTime() > record.check_in_at!.getTime() ? checkOut : now;
+          : new Date(yesterday.getTime() + 23 * 3_600_000 + 59 * 60_000);
+        const effectiveOut = checkOut > record.check_in_at! ? checkOut : record.check_in_at!;
         const hoursWorked  = (effectiveOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
         const breaks       = await settleBreaks(record.id, effectiveOut);
-        const earlyMins    = earlyOutMinutes(effectiveOut, record.shift, tz);
-        const score        = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
 
         await prisma.attendanceRecord.update({
           where: { id: record.id },
           data: {
-            check_out_at: effectiveOut, hours_worked: parseFloat(hoursWorked.toFixed(2)), status: 'out',
+            check_out_at:     effectiveOut,
+            hours_worked:     parseFloat(hoursWorked.toFixed(2)),
+            status:           'out',
             net_hours_worked: netHoursWorked(hoursWorked, breaks.unpaidMins),
-            break_minutes: breaks.totalMins, paid_break_minutes: breaks.paidMins,
-            auto_checked_out: true, early_out_minutes: earlyMins,
-            ...(score != null && { adherence_score: score }),
-            ip_checkout_pending_at: null,
+            break_minutes:    breaks.totalMins,
+            paid_break_minutes: breaks.paidMins,
+            auto_checked_out: true,
+            last_heartbeat_at: null,
           },
         });
-
-        const { formatTime12h } = await import('../services/whatsapp');
-        await notifyCheckOut(record.user.org_id, record.user.name, formatTime12h(effectiveOut)).catch(() => {});
-        processed++;
       }
 
-      if (processed > 0) console.log(`[JOB] Shift auto-checkout: processed ${processed} records`);
+      if (stale.length > 0) console.log(`[JOB] Stale sweep: closed ${stale.length} open records from yesterday`);
     } catch (err) {
-      console.error('[JOB] Shift auto-checkout error:', err);
+      console.error('[JOB] Stale record sweep error:', err);
     }
   });
-  console.log('🏁 Shift-based auto-checkout started');
+  console.log('🧹 Stale record sweep started (06:00)');
 }
 
 // ─── Job: Shift Reminders ─────────────────────────────
@@ -683,72 +682,12 @@ export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
   startLateArrivalDetector();
   startAbsentDetector();
-  startShiftAutoCheckout();
-  startMidnightCheckout();
+  startHeartbeatExpiryMonitor();
+  startStaleRecordSweep();
   startShiftReminderJob();
   startRemoteNudgeJob();
   startTokenCleanup();
   startPayrollAutoGenerate();
-  startIpCheckoutMonitor();
   startShiftBreakAutoManager();
   console.log('✅ All background jobs running\n');
-}
-
-// ─── Job: IP Checkout Monitor (every 5 min) ───────────
-// Tracks employees whose device left the office WiFi.
-// Fires actual checkout after the 5-minute grace period.
-export function startIpCheckoutMonitor() {
-  cron.schedule('*/5 * * * *', async () => {
-    const now   = new Date();
-    const today = new Date(now); today.setHours(0, 0, 0, 0);
-
-    try {
-      // Find grace-period records: ip_checkout_at set but no check_out_at yet
-      const graceRecords = await prisma.attendanceRecord.findMany({
-        where: {
-          date:          today,
-          check_in_at:   { not: null },
-          check_out_at:  null,
-          status:        { in: ['in', 'late', 'remote'] },
-          ip_checkout_pending_at: { not: null, lte: new Date(now.getTime() - 5 * 60 * 1000) }, // grace expired
-        },
-        include: { user: { include: { org: { select: { timezone: true } } } }, shift: true },
-      });
-
-      for (const record of graceRecords) {
-        const checkOut    = record.ip_checkout_pending_at!;
-        const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
-        const tz          = record.user.org?.timezone;
-        const breaks      = await settleBreaks(record.id, checkOut);
-        const earlyMins   = earlyOutMinutes(checkOut, record.shift, tz);
-        const score       = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
-
-        await prisma.attendanceRecord.update({
-          where: { id: record.id },
-          data: {
-            check_out_at: checkOut,
-            hours_worked: parseFloat(hoursWorked.toFixed(2)),
-            status:       'out',
-            net_hours_worked: netHoursWorked(hoursWorked, breaks.unpaidMins),
-            break_minutes: breaks.totalMins, paid_break_minutes: breaks.paidMins,
-            auto_checked_out: true,
-            early_out_minutes: earlyMins,
-            ...(score != null && { adherence_score: score }),
-            ip_checkout_pending_at: null,
-          },
-        });
-
-        // WhatsApp notification
-        const { notifyCheckOut, formatTime12h } = await import('../services/whatsapp');
-        await notifyCheckOut(record.user.org_id, record.user.name, formatTime12h(checkOut)).catch(console.error);
-      }
-
-      if (graceRecords.length > 0) {
-        console.log(`[JOB] IP checkout: processed ${graceRecords.length} grace-expired check-outs`);
-      }
-    } catch (err) {
-      console.error('[JOB] IP checkout monitor error:', err);
-    }
-  });
-  console.log('📶 IP checkout monitor started');
 }
