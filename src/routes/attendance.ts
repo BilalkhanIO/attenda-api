@@ -3,7 +3,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
-import { lateThresholdFor, lateMinutes, earlyOutMinutes, adherenceScore, hhmmToMins } from '../utils/shift';
+import { lateThresholdFor, lateMinutes, earlyOutMinutes, adherenceScore, scheduledWindow } from '../utils/shift';
 import { settleBreaks, netHoursWorked } from '../utils/attendance';
 import prisma from '../utils/prisma';
 
@@ -396,9 +396,10 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         lateMins = lateMinutes(now, shift, org?.timezone);
         if (lateMins > lateThresholdFor(shift, org)) status = 'late';
 
-        // Persist the scheduled window for reporting (stored as UTC anchored on today)
-        scheduledStart = new Date(today); scheduledStart.setMinutes(hhmmToMins(shift.start_time));
-        scheduledEnd   = new Date(today); scheduledEnd.setMinutes(hhmmToMins(shift.end_time));
+        // Persist the scheduled window as correct UTC instants in the org's tz
+        const win = scheduledWindow(shift, org?.timezone, now);
+        scheduledStart = win.start;
+        scheduledEnd   = win.end;
       }
     }
 
@@ -566,8 +567,9 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           shiftId  = shift.id;
           lateMins = lateMinutes(now, shift, org?.timezone);
           if (lateMins > lateThresholdFor(shift, org)) status = 'late';
-          scheduledStart = new Date(today); scheduledStart.setMinutes(hhmmToMins(shift.start_time));
-          scheduledEnd   = new Date(today); scheduledEnd.setMinutes(hhmmToMins(shift.end_time));
+          const win = scheduledWindow(shift, org?.timezone, now);
+          scheduledStart = win.start;
+          scheduledEnd   = win.end;
         }
 
         const checkInData = {

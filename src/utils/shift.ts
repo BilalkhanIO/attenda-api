@@ -5,7 +5,7 @@
 // Date objects. To compare them correctly we must convert the UTC instant to
 // the org's local wall clock before doing any minute math — otherwise late /
 // early / auto-checkout detection is wrong by the server↔org UTC offset.
-import { toZonedTime } from 'date-fns-tz';
+import { toZonedTime, fromZonedTime } from 'date-fns-tz';
 
 export interface ShiftLike {
   start_time: string;
@@ -31,6 +31,42 @@ export function minutesOfDayInTz(at: Date, timezone?: string | null): number {
 /** A `Date` whose local getters reflect wall-clock time in `timezone`. */
 export function nowInTz(timezone?: string | null, at: Date = new Date()): Date {
   return toZonedTime(at, timezone || 'UTC');
+}
+
+/** YYYY-MM-DD of the instant `at` as seen in `timezone`. */
+export function localDateStr(at: Date, timezone?: string | null): string {
+  const z = toZonedTime(at, timezone || 'UTC');
+  const m = String(z.getMonth() + 1).padStart(2, '0');
+  const d = String(z.getDate()).padStart(2, '0');
+  return `${z.getFullYear()}-${m}-${d}`;
+}
+
+/**
+ * The exact UTC instant of wall-clock `hhmm` on `dateStr` (YYYY-MM-DD) in
+ * `timezone`. Used to anchor scheduled_start / scheduled_end correctly
+ * regardless of where the server runs.
+ */
+export function scheduledInstant(dateStr: string, hhmm: string, timezone?: string | null): Date {
+  const padded = hhmm.length === 4 ? `0${hhmm}` : hhmm; // "9:00" → "09:00"
+  return fromZonedTime(`${dateStr}T${padded}:00`, timezone || 'UTC');
+}
+
+/**
+ * Compute scheduled start & end instants for a shift on the org-local day of
+ * `at`. Handles overnight shifts (end <= start) by rolling end to the next day.
+ */
+export function scheduledWindow(
+  shift: ShiftLike,
+  timezone: string | null | undefined,
+  at: Date = new Date(),
+): { start: Date; end: Date } {
+  const dateStr = localDateStr(at, timezone);
+  const start   = scheduledInstant(dateStr, shift.start_time, timezone);
+  let   end     = scheduledInstant(dateStr, shift.end_time, timezone);
+  if (hhmmToMins(shift.end_time) <= hhmmToMins(shift.start_time)) {
+    end = new Date(end.getTime() + 24 * 60 * 60 * 1000); // overnight shift
+  }
+  return { start, end };
 }
 
 /**

@@ -7,7 +7,7 @@ import {
 } from '../services/whatsapp';
 import {
   minutesOfDayInTz, hhmmToMins, lateThresholdFor, lateMinutes,
-  earlyOutMinutes, adherenceScore, shiftAutoCheckoutDue,
+  earlyOutMinutes, adherenceScore, shiftAutoCheckoutDue, scheduledWindow,
 } from '../utils/shift';
 import { settleBreaks, netHoursWorked } from '../utils/attendance';
 
@@ -231,7 +231,7 @@ export function startShiftAutoCheckout() {
         // Anchor checkout to scheduled shift end in the org's timezone.
         const checkOut = record.scheduled_end
           ? new Date(record.scheduled_end)
-          : (() => { const d = new Date(today); d.setMinutes(hhmmToMins(record.shift!.end_time)); return d; })();
+          : scheduledWindow(record.shift!, tz, now).end;
 
         // Guard against negative/zero duration (clock skew) — fall back to now.
         const effectiveOut = checkOut.getTime() > record.check_in_at!.getTime() ? checkOut : now;
