@@ -351,6 +351,161 @@ router.get('/:userId', requireRole('manager'), async (req: Request, res: Respons
   } catch (e) { next(e); }
 });
 
+// ─── GET /attendance/late-notice/me ───────────────────
+router.get('/late-notice/me', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { days = '7' } = req.query as { days?: string };
+    const since = new Date(); since.setDate(since.getDate() - parseInt(days));
+    const notices = await prisma.lateArrivalNotice.findMany({
+      where: { user_id: req.user!.sub, date: { gte: since } },
+      orderBy: { date: 'desc' },
+    });
+    ok(res, notices);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /attendance/late-notice ─────────────────────
+// Employee submits an advance notice that they will arrive late.
+// The scheduler respects this: no manager alert until expected_time passes.
+router.post('/late-notice', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { date, expected_time, reason } = req.body;
+    if (!date || !expected_time || !reason) throw new ValidationError('date, expected_time and reason required');
+    if (!reason.trim() || reason.trim().length < 5) throw new ValidationError('reason must be at least 5 characters');
+
+    const noticeDate = new Date(date);
+    if (isNaN(noticeDate.getTime())) throw new ValidationError('Invalid date');
+
+    // Validate expected_time format HH:MM
+    if (!/^\d{1,2}:\d{2}$/.test(expected_time)) throw new ValidationError('expected_time must be HH:MM');
+
+    // Can't submit a notice for a past date (allow today and future)
+    const today = startOfDay(new Date());
+    if (noticeDate < today) throw new ValidationError('Cannot submit a late notice for a past date');
+
+    const notice = await prisma.lateArrivalNotice.upsert({
+      where: { user_id_date: { user_id: req.user!.sub, date: noticeDate } },
+      update: { expected_time, reason: reason.trim(), status: 'pending', acknowledged_by: null, acknowledged_at: null },
+      create: { user_id: req.user!.sub, org_id: req.user!.org_id, date: noticeDate, expected_time, reason: reason.trim() },
+    });
+
+    // Notify manager immediately (non-blocking)
+    prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true, manager: { select: { phone: true, id: true } } } })
+      .then(async u => {
+        if (!u) return;
+        if (u.manager?.phone) {
+          const { notify } = await import('../services/whatsapp');
+          await notify({
+            orgId: req.user!.org_id, event: 'shift_reminder' as any,
+            message: `🕐 *Late Arrival Notice*\n${u.name} has notified they will arrive late on ${date}.\nExpected arrival: *${expected_time}*\nReason: ${reason.trim()}`,
+            recipientType: 'individual', recipientId: u.manager.phone,
+          }).catch(console.error);
+        }
+        if (u.manager?.id) {
+          const { createNotification } = await import('../services/notifications');
+          createNotification({
+            userId: u.manager.id, orgId: req.user!.org_id,
+            type: 'late_notice',
+            title: 'Late arrival notice',
+            body: `${u.name} will be late — expected at ${expected_time}. Reason: ${reason.trim()}`,
+            actionType: 'attendance', actionId: req.user!.sub,
+          }).catch(console.error);
+        }
+      }).catch(console.error);
+
+    ok(res, notice, 201);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/late-notices ─────────────────────
+// Manager/HR: view pending late notices for the org (today + future)
+router.get('/late-notices', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = startOfDay(new Date());
+    const { status } = req.query as { status?: string };
+
+    const isManager = req.user!.role === 'manager';
+    const teamIds = isManager
+      ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
+      : null;
+
+    const where: Record<string, unknown> = { org_id: req.user!.org_id, date: { gte: today } };
+    if (status) where.status = status;
+    if (teamIds) where.user_id = { in: teamIds };
+
+    const notices = await prisma.lateArrivalNotice.findMany({
+      where,
+      include: { user: { select: { id: true, name: true, avatar_url: true, department: true } } },
+      orderBy: [{ date: 'asc' }, { created_at: 'asc' }],
+    });
+    ok(res, notices);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /attendance/late-notice/:id/acknowledge ──────
+router.put('/late-notice/:id/acknowledge', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const notice = await prisma.lateArrivalNotice.findFirst({
+      where: { id: req.params.id, org_id: req.user!.org_id },
+      include: { user: true },
+    });
+    if (!notice) throw new NotFoundError('Late arrival notice');
+    if (notice.status === 'cancelled') throw new ValidationError('Notice has been cancelled by the employee');
+
+    const updated = await prisma.lateArrivalNotice.update({
+      where: { id: notice.id },
+      data: { status: 'acknowledged', acknowledged_by: req.user!.sub, acknowledged_at: new Date() },
+    });
+
+    // Notify employee
+    const { createNotification } = await import('../services/notifications');
+    createNotification({
+      userId: notice.user_id, orgId: notice.org_id,
+      type: 'late_notice_ack',
+      title: 'Late notice acknowledged',
+      body: `Your late arrival notice for ${notice.date.toISOString().split('T')[0]} has been acknowledged`,
+      actionType: 'attendance', actionId: notice.id,
+    }).catch(console.error);
+
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── DELETE /attendance/late-notice/:id ───────────────
+router.delete('/late-notice/:id', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const notice = await prisma.lateArrivalNotice.findFirst({
+      where: { id: req.params.id, user_id: req.user!.sub },
+    });
+    if (!notice) throw new NotFoundError('Late arrival notice');
+    if (notice.status === 'acknowledged') throw new ValidationError('Cannot cancel an already-acknowledged notice');
+
+    await prisma.lateArrivalNotice.update({
+      where: { id: notice.id },
+      data: { status: 'cancelled' },
+    });
+    ok(res, { message: 'Notice cancelled' });
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/leave-check ──────────────────────
+// Quick check: is the calling employee on approved leave today?
+// Used by mobile/web to show a banner before presenting check-in UI.
+router.get('/leave-check', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const today = startOfDay(new Date());
+    const leave = await prisma.leaveRequest.findFirst({
+      where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
+      select: { id: true, leave_type: true, start_date: true, end_date: true, reason: true },
+    });
+    const notice = await prisma.lateArrivalNotice.findUnique({
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      select: { id: true, expected_time: true, reason: true, status: true },
+    });
+    ok(res, { on_leave: !!leave, leave, late_notice: notice });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /attendance/checkin ──────────────────────────
 router.post('/checkin', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -372,6 +527,19 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     }
 
     const now = new Date();
+
+    // ── Check for approved leave ──────────────────────────────────────────────
+    const approvedLeave = await prisma.leaveRequest.findFirst({
+      where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
+      select: { id: true, leave_type: true },
+    });
+
+    // ── Check for an active late notice ──────────────────────────────────────
+    const lateNotice = await prisma.lateArrivalNotice.findUnique({
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      select: { id: true, status: true },
+    });
+    const activeNoticeId = lateNotice && lateNotice.status !== 'cancelled' ? lateNotice.id : null;
 
     // Detect status: check if this is a remote check-in
     let status: string = type === 'remote' ? 'remote' : 'in';
@@ -413,6 +581,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
             ...(shiftId        && { shift_id: shiftId }),
             ...(scheduledStart && { scheduled_start: scheduledStart }),
             ...(scheduledEnd   && { scheduled_end: scheduledEnd }),
+            ...(activeNoticeId && { late_notice_id: activeNoticeId }),
+            ...(approvedLeave  && { is_on_approved_leave: true }),
           },
           include: RECORD_INCLUDE,
         })
@@ -424,9 +594,29 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
             shift_id:        shiftId        ?? undefined,
             scheduled_start: scheduledStart ?? undefined,
             scheduled_end:   scheduledEnd   ?? undefined,
+            late_notice_id:  activeNoticeId ?? undefined,
+            is_on_approved_leave: !!approvedLeave,
           },
           include: RECORD_INCLUDE,
         });
+
+    // If on approved leave: alert manager that employee checked in anyway
+    if (approvedLeave) {
+      const u = await prisma.user.findUnique({
+        where: { id: req.user!.sub },
+        select: { name: true, manager: { select: { id: true, phone: true } } },
+      });
+      if (u?.manager?.id) {
+        const { createNotification } = await import('../services/notifications');
+        createNotification({
+          userId: u.manager.id, orgId: req.user!.org_id,
+          type: 'leave_checkin_override',
+          title: 'Employee checked in while on leave',
+          body: `${u.name} has checked in today despite having approved ${approvedLeave.leave_type} leave. Please verify.`,
+          actionType: 'attendance', actionId: req.user!.sub,
+        }).catch(console.error);
+      }
+    }
 
     // Handle remote check-in: create RemoteSession pending manager approval
     if (type === 'remote') {

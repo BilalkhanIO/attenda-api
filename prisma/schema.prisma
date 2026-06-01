@@ -37,6 +37,7 @@ model Organisation {
   performance_reviews PerformanceReview[]
   overtime_rules      OvertimeRule[]
   notifications       InAppNotification[]
+  late_arrival_notices LateArrivalNotice[]
 
   @@map("organisations")
 }
@@ -85,6 +86,7 @@ model User {
   performance_goals       PerformanceGoal[]
   remote_sessions         RemoteSession[]
   notifications           InAppNotification[]
+  late_arrival_notices    LateArrivalNotice[]
 
   @@map("users")
 }
@@ -118,10 +120,14 @@ model AttendanceRecord {
   adherence_score    Int?
   auto_checked_out   Boolean   @default(false)
   late_alerted       Boolean   @default(false)
+  hour_alerted       Boolean   @default(false)
+  late_notice_id     String?
+  is_on_approved_leave Boolean @default(false)
 
-  user           User          @relation(fields: [user_id], references: [id])
-  org            Organisation  @relation(fields: [org_id], references: [id])
-  shift          Shift?        @relation(fields: [shift_id], references: [id])
+  user           User               @relation(fields: [user_id], references: [id])
+  org            Organisation       @relation(fields: [org_id], references: [id])
+  shift          Shift?             @relation(fields: [shift_id], references: [id])
+  late_notice    LateArrivalNotice? @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
   remote_session RemoteSession?
   break_records  BreakRecord[]
 
@@ -435,4 +441,26 @@ model InAppNotification {
   @@index([user_id, read_at])
   @@index([user_id, created_at(sort: Desc)])
   @@map("in_app_notifications")
+}
+
+// Employee submits an advance notice of late arrival before their shift.
+// The scheduler checks this before alerting the manager about lateness.
+model LateArrivalNotice {
+  id              String    @id @default(uuid())
+  user_id         String
+  org_id          String
+  date            DateTime  @db.Date
+  expected_time   String    @db.VarChar(10)   // HH:MM wall-clock — expected arrival
+  reason          String    @db.Text
+  status          String    @default("pending") @db.VarChar(20) // pending | acknowledged | cancelled
+  acknowledged_by String?
+  acknowledged_at DateTime?
+  created_at      DateTime  @default(now())
+
+  user              User               @relation(fields: [user_id], references: [id])
+  org               Organisation       @relation(fields: [org_id], references: [id])
+  attendance_records AttendanceRecord[]
+
+  @@unique([user_id, date])
+  @@map("late_arrival_notices")
 }

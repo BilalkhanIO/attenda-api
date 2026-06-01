@@ -16,6 +16,11 @@ import { settleBreaks, netHoursWorked } from '../utils/attendance';
 // late tolerance with no check-in. Timezone-aware (uses each org's timezone)
 // and threshold-crossing (not exact-minute) so a missed cron tick can't let
 // someone slip through. Idempotent: only writes 'late' once, alerts once.
+//
+// Late-notice awareness: if an employee pre-announced late arrival with an
+// expected_time, the manager alert is suppressed until that time passes.
+// 1-hour escalation: if still absent at 60 min past shift start, escalate
+// to manager + HR admin (tracked via hour_alerted to fire exactly once).
 export function startLateArrivalDetector() {
   cron.schedule('* * * * *', async () => {
     const now   = new Date();
@@ -34,10 +39,10 @@ export function startLateArrivalDetector() {
         const diffMins       = nowMins - shiftStartMins;
 
         const tolerance = lateThresholdFor(shift, shift.org);
-        // Past tolerance → eligible to flag late. Manager alert at +30 from
-        // scheduled start. Cap the window so overnight wrap doesn't re-fire.
         if (diffMins <= tolerance || diffMins >= 720) continue;
-        const shouldAlert = diffMins >= 30;
+
+        const shouldAlert    = diffMins >= 30;
+        const shouldEscalate = diffMins >= 60;
 
         const assignments = await prisma.shiftAssignment.findMany({
           where: { shift_id: shift.id, date: today },
@@ -45,8 +50,14 @@ export function startLateArrivalDetector() {
         });
 
         const userIds = assignments.map(a => a.user.id);
-        const records = await prisma.attendanceRecord.findMany({ where: { user_id: { in: userIds }, date: today } });
+        const [records, lateNotices] = await Promise.all([
+          prisma.attendanceRecord.findMany({ where: { user_id: { in: userIds }, date: today } }),
+          prisma.lateArrivalNotice.findMany({
+            where: { user_id: { in: userIds }, date: today, status: { not: 'cancelled' } },
+          }),
+        ]);
         const recordByUserId = new Map(records.map(r => [r.user_id, r]));
+        const noticeByUserId = new Map(lateNotices.map(n => [n.user_id, n]));
 
         for (const assignment of assignments) {
           const { user } = assignment;
@@ -55,6 +66,15 @@ export function startLateArrivalDetector() {
           // Already checked in, or already resolved (leave/absent) → skip
           if (record?.check_in_at) continue;
           if (record && ['leave', 'absent'].includes(record.status)) continue;
+
+          // Check if employee submitted a late notice
+          const notice = noticeByUserId.get(user.id);
+          if (notice) {
+            const expectedMins = hhmmToMins(notice.expected_time);
+            // Still within their promised window — don't flag or alert
+            if (nowMins <= expectedMins) continue;
+            // Past promised time — fall through to normal late handling
+          }
 
           // Flag late once (idempotent: skip if already 'late')
           if (!record || record.status !== 'late') {
@@ -65,7 +85,10 @@ export function startLateArrivalDetector() {
             });
           }
 
-          // Manager alert at the +30 mark — fires exactly once via late_alerted flag.
+          const wasPreAnnounced = !!notice;
+          const preAnnouncedSuffix = wasPreAnnounced ? ` (had a late notice — expected by ${notice!.expected_time})` : '';
+
+          // Manager alert at +30 min — fires once via late_alerted
           if (shouldAlert && !record?.late_alerted) {
             if (user.manager?.phone) {
               await notifyLateArrival(user.org_id, user.name, diffMins, user.manager.phone).catch(() => {});
@@ -75,14 +98,45 @@ export function startLateArrivalDetector() {
               createNotification({
                 userId: user.manager_id, orgId: user.org_id,
                 type: 'attendance_late',
-                title: 'Employee late',
-                body: `${user.name} is ${diffMins} minutes late and has not checked in yet`,
+                title: wasPreAnnounced ? 'Employee late (past expected time)' : 'Employee late',
+                body: `${user.name} is ${diffMins} minutes late and has not checked in${preAnnouncedSuffix}`,
                 actionType: 'attendance', actionId: user.id,
               }).catch(console.error);
             }
             await prisma.attendanceRecord.update({
               where: { user_id_date: { user_id: user.id, date: today } },
               data:  { late_alerted: true },
+            }).catch(() => {});
+          }
+
+          // Escalation at +60 min — send to manager AND HR admins, fires once via hour_alerted
+          if (shouldEscalate && !record?.hour_alerted) {
+            const hrAdmins = await prisma.user.findMany({
+              where: { org_id: user.org_id, role: { in: ['hr_admin', 'super_admin'] }, is_active: true },
+              select: { id: true, phone: true },
+            });
+            const { notify } = await import('../services/whatsapp');
+            const escalMsg = `🚨 *1-Hour Late Alert*\n${user.name} has not checked in 60+ minutes past shift start${preAnnouncedSuffix}.\nPlease check on them.`;
+
+            for (const admin of hrAdmins) {
+              if (admin.phone) {
+                await notify({ orgId: user.org_id, event: 'shift_reminder' as any, message: escalMsg, recipientType: 'individual', recipientId: admin.phone }).catch(() => {});
+              }
+              const { createNotification } = await import('../services/notifications');
+              createNotification({
+                userId: admin.id, orgId: user.org_id,
+                type: 'attendance_late_escalation',
+                title: '1-hour late escalation',
+                body: `${user.name} still has not checked in — 60+ min past shift start${preAnnouncedSuffix}`,
+                actionType: 'attendance', actionId: user.id,
+              }).catch(console.error);
+            }
+            if (user.manager?.phone) {
+              await notify({ orgId: user.org_id, event: 'shift_reminder' as any, message: escalMsg, recipientType: 'individual', recipientId: user.manager.phone }).catch(() => {});
+            }
+            await prisma.attendanceRecord.update({
+              where: { user_id_date: { user_id: user.id, date: today } },
+              data:  { hour_alerted: true },
             }).catch(() => {});
           }
         }
