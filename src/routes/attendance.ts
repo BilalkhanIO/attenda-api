@@ -490,19 +490,28 @@ router.delete('/late-notice/:id', async (req: Request, res: Response, next: Next
 
 // ─── GET /attendance/leave-check ──────────────────────
 // Quick check: is the calling employee on approved leave today?
-// Used by mobile/web to show a banner before presenting check-in UI.
+// Returns full-day, half-day, or no leave. Also returns any active late notice.
 router.get('/leave-check', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const today = startOfDay(new Date());
-    const leave = await prisma.leaveRequest.findFirst({
-      where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
-      select: { id: true, leave_type: true, start_date: true, end_date: true, reason: true },
+    const [leave, notice] = await Promise.all([
+      prisma.leaveRequest.findFirst({
+        where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
+        select: { id: true, leave_type: true, start_date: true, end_date: true, reason: true, is_half_day: true, half_day_period: true },
+      }),
+      prisma.lateArrivalNotice.findUnique({
+        where: { user_id_date: { user_id: req.user!.sub, date: today } },
+        select: { id: true, expected_time: true, reason: true, status: true },
+      }),
+    ]);
+    const isFullLeave = leave && !leave.is_half_day;
+    ok(res, {
+      on_leave: !!isFullLeave,
+      on_half_leave: !!(leave?.is_half_day),
+      half_day_period: leave?.half_day_period ?? null,
+      leave,
+      late_notice: notice?.status !== 'cancelled' ? notice : null,
     });
-    const notice = await prisma.lateArrivalNotice.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      select: { id: true, expected_time: true, reason: true, status: true },
-    });
-    ok(res, { on_leave: !!leave, leave, late_notice: notice });
   } catch (e) { next(e); }
 });
 
@@ -529,10 +538,14 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     const now = new Date();
 
     // ── Check for approved leave ──────────────────────────────────────────────
+    // Half-day leave employees are expected to check in for the other half.
+    // Full-day leave: allow check-in but flag is_on_approved_leave=true + notify manager.
     const approvedLeave = await prisma.leaveRequest.findFirst({
       where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
-      select: { id: true, leave_type: true },
+      select: { id: true, leave_type: true, is_half_day: true, half_day_period: true },
     });
+    // Half-day leave: not an override — employee IS expected to show up for the other half
+    const isFullDayLeaveOverride = !!approvedLeave && !approvedLeave.is_half_day;
 
     // ── Check for an active late notice ──────────────────────────────────────
     const lateNotice = await prisma.lateArrivalNotice.findUnique({
@@ -581,8 +594,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
             ...(shiftId        && { shift_id: shiftId }),
             ...(scheduledStart && { scheduled_start: scheduledStart }),
             ...(scheduledEnd   && { scheduled_end: scheduledEnd }),
-            ...(activeNoticeId && { late_notice_id: activeNoticeId }),
-            ...(approvedLeave  && { is_on_approved_leave: true }),
+            ...(activeNoticeId         && { late_notice_id: activeNoticeId }),
+            ...(isFullDayLeaveOverride && { is_on_approved_leave: true }),
           },
           include: RECORD_INCLUDE,
         })
@@ -595,13 +608,13 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
             scheduled_start: scheduledStart ?? undefined,
             scheduled_end:   scheduledEnd   ?? undefined,
             late_notice_id:  activeNoticeId ?? undefined,
-            is_on_approved_leave: !!approvedLeave,
+            is_on_approved_leave: isFullDayLeaveOverride,
           },
           include: RECORD_INCLUDE,
         });
 
-    // If on approved leave: alert manager that employee checked in anyway
-    if (approvedLeave) {
+    // If on full-day approved leave: alert manager that employee checked in anyway
+    if (isFullDayLeaveOverride) {
       const u = await prisma.user.findUnique({
         where: { id: req.user!.sub },
         select: { name: true, manager: { select: { id: true, phone: true } } },

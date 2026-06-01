@@ -63,9 +63,9 @@ export function startLateArrivalDetector() {
           const { user } = assignment;
           const record = recordByUserId.get(user.id);
 
-          // Already checked in, or already resolved (leave/absent) → skip
+          // Already checked in, or already resolved (leave/half_leave/absent) → skip
           if (record?.check_in_at) continue;
-          if (record && ['leave', 'absent'].includes(record.status)) continue;
+          if (record && ['leave', 'half_leave', 'absent'].includes(record.status)) continue;
 
           // Check if employee submitted a late notice
           const notice = noticeByUserId.get(user.id);
@@ -181,8 +181,8 @@ export function startAbsentDetector() {
           });
 
           if (!record || !record.check_in_at) {
-            // Don't overwrite 'leave' status
-            if (record?.status === 'leave') continue;
+            // Don't overwrite 'leave' or 'half_leave' status
+            if (record?.status === 'leave' || record?.status === 'half_leave') continue;
 
             await prisma.attendanceRecord.upsert({
               where: { user_id_date: { user_id: user.id, date: today } },

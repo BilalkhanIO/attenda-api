@@ -57,9 +57,12 @@ router.get('/requests', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // ─── POST /leave/requests ──────────────────────────────
+// Supports both full-day and half-day leave:
+//   is_half_day: true + half_day_period: 'morning'|'afternoon'
+//   → start_date = end_date (single day), working_days = 0.5
 router.post('/requests', async (req, res, next) => {
   try {
-    const { leave_type, start_date, end_date, reason } = req.body;
+    const { leave_type, start_date, end_date, reason, is_half_day, half_day_period } = req.body;
     if (!leave_type || !start_date || !end_date) throw new ValidationError('leave_type, start_date and end_date required');
 
     const start = new Date(start_date);
@@ -67,7 +70,15 @@ router.post('/requests', async (req, res, next) => {
     if (start > end) throw new ValidationError('start_date must be before end_date');
     if (start < new Date(new Date().setHours(0, 0, 0, 0))) throw new ValidationError('Cannot request leave in the past');
 
-    const working_days = calculateWorkingDays(start, end);
+    // Half-day validation
+    if (is_half_day) {
+      if (start_date !== end_date) throw new ValidationError('Half-day leave must be on a single day (start_date = end_date)');
+      if (!half_day_period || !['morning', 'afternoon'].includes(half_day_period)) {
+        throw new ValidationError('half_day_period must be "morning" or "afternoon" for half-day leave');
+      }
+    }
+
+    const working_days = is_half_day ? 0.5 : calculateWorkingDays(start, end);
 
     // Check leave balance (skip for unpaid leave)
     if (leave_type !== 'unpaid') {
@@ -83,21 +94,27 @@ router.post('/requests', async (req, res, next) => {
       }
     }
 
-    // Check no overlapping approved leave
-    const overlap = await prisma.leaveRequest.findFirst({
-      where: {
-        user_id: req.user!.sub,
-        status: { in: ['pending', 'approved'] },
-        start_date: { lte: end },
-        end_date:   { gte: start },
-      },
-    });
+    // Check no overlapping approved leave (full-day overlaps; half-days on same day with different periods can coexist)
+    const overlapWhere: Record<string, unknown> = {
+      user_id: req.user!.sub, status: { in: ['pending', 'approved'] },
+      start_date: { lte: end }, end_date: { gte: start },
+    };
+    if (is_half_day) {
+      // Allow a half-day on the same date as another half-day with a different period
+      overlapWhere.OR = [
+        { is_half_day: false },
+        { is_half_day: true, half_day_period: half_day_period },
+      ];
+    }
+    const overlap = await prisma.leaveRequest.findFirst({ where: overlapWhere });
     if (overlap) throw new ValidationError('You already have a leave request that overlaps with these dates');
 
     const request = await prisma.leaveRequest.create({
       data: {
         user_id: req.user!.sub, org_id: req.user!.org_id,
         leave_type, start_date: start, end_date: end, working_days, reason,
+        is_half_day: !!is_half_day,
+        ...(is_half_day && { half_day_period }),
       },
       include: LEAVE_INCLUDE,
     });
@@ -105,12 +122,13 @@ router.post('/requests', async (req, res, next) => {
     // Notify manager (in-app)
     const submitter = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true, manager_id: true } });
     if (submitter?.manager_id) {
+      const label = is_half_day ? `a half-day (${half_day_period}) of ${leave_type}` : `${working_days} day(s) of ${leave_type}`;
       const { createNotification } = await import('../services/notifications');
       createNotification({
         userId: submitter.manager_id, orgId: req.user!.org_id,
         type: 'leave_request',
         title: 'New leave request',
-        body: `${submitter.name} has requested ${working_days} day(s) of ${leave_type} leave`,
+        body: `${submitter.name} has requested ${label} leave`,
         actionType: 'leave_request', actionId: request.id,
       }).catch(console.error);
     }
@@ -150,18 +168,34 @@ router.put('/requests/:id/approve', requireRole('manager'), async (req, res, nex
         where: { user_id: request.user_id, leave_type: request.leave_type, year: request.start_date.getFullYear() },
         data: { used_days: { increment: request.working_days } },
       });
-      // Update attendance records to 'leave'
+      // Update attendance records to 'leave'.
+      // For half-day leave: only set status='half_leave' — the employee is
+      // expected to check in for the other half, so we don't block check-in.
+      const leaveStatus = request.is_half_day ? 'half_leave' : 'leave';
       const cur = new Date(request.start_date);
       while (cur <= request.end_date) {
         if (cur.getDay() !== 0 && cur.getDay() !== 6) {
-          await tx.attendanceRecord.upsert({
+          // For half-day: if the record already has a check-in (employee worked
+          // one half), preserve the check-in data but update status only
+          const existingRecord = await tx.attendanceRecord.findUnique({
             where: { user_id_date: { user_id: request.user_id, date: new Date(cur) } },
-            update: { status: 'leave' },
-            create: {
-              user_id: request.user_id, org_id: req.user!.org_id,
-              date: new Date(cur), check_in_type: 'manual', status: 'leave',
-            },
           });
+          if (request.is_half_day && existingRecord?.check_in_at) {
+            // Employee already checked in — just note the half-leave on the record
+            await tx.attendanceRecord.update({
+              where: { id: existingRecord.id },
+              data: { status: leaveStatus },
+            });
+          } else {
+            await tx.attendanceRecord.upsert({
+              where: { user_id_date: { user_id: request.user_id, date: new Date(cur) } },
+              update: { status: leaveStatus },
+              create: {
+                user_id: request.user_id, org_id: req.user!.org_id,
+                date: new Date(cur), check_in_type: 'manual', status: leaveStatus,
+              },
+            });
+          }
         }
         cur.setDate(cur.getDate() + 1);
       }
