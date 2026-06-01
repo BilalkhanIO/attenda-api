@@ -489,7 +489,15 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
 
     // Check against org's registered office networks (SSID first, then IP/CIDR)
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
-    if (!isOfficeNetwork(ip, ssid, org?.office_ips ?? [], org?.office_ssids ?? [])) {
+    const officeIps   = org?.office_ips   ?? [];
+    const officeSsids = org?.office_ssids ?? [];
+
+    // Distinguish "admin never configured networks" from "device is on wrong network"
+    if (officeIps.length === 0 && officeSsids.length === 0) {
+      return ok(res, { action: 'no_networks_configured', reason: 'No office networks configured. Ask your admin to add office IPs or WiFi names in Settings → Office Networks.' });
+    }
+
+    if (!isOfficeNetwork(ip, ssid, officeIps, officeSsids)) {
       return ok(res, { action: 'none', reason: 'Not on a registered office network' });
     }
 
