@@ -247,12 +247,14 @@ model Shift {
 }
 
 model ShiftBreak {
-  id            String @id @default(uuid())
-  shift_id      String
-  name          String @db.VarChar(100)
-  break_minutes Int
-  is_paid       Boolean @default(false)
-  after_minutes Int     // minutes into shift before break is due
+  id               String  @id @default(uuid())
+  shift_id         String
+  name             String  @db.VarChar(100)
+  break_minutes    Int
+  is_paid          Boolean @default(false)
+  after_minutes    Int
+  break_start_time String? @db.VarChar(10)
+  break_end_time   String? @db.VarChar(10)
 
   shift Shift @relation(fields: [shift_id], references: [id], onDelete: Cascade)
 
