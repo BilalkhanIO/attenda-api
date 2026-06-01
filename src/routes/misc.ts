@@ -592,11 +592,11 @@ orgRouter.get('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     ok(res, {
-      enabled:         org?.wa_enabled,
-      phone_number_id: org?.wa_phone_number_id,
+      enabled:         org?.wa_enabled ?? false,
+      phone_number_id: org?.wa_phone_number_id || '',
       access_token:    org?.wa_access_token ? '***redacted***' : null,
-      group_ids:       org?.wa_group_ids,
-      events:          org?.wa_events,
+      groups:          (org?.wa_groups as unknown[]) || [],
+      events:          org?.wa_events || {},
       dept_groups:     org?.wa_dept_groups ?? {},
     });
   } catch (e) { next(e); }
@@ -605,13 +605,13 @@ orgRouter.get('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
 // PUT /org/whatsapp
 orgRouter.put('/whatsapp', requireRole('super_admin'), async (req, res, next) => {
   try {
-    const { enabled, phone_number_id, access_token, group_ids, events, dept_groups } = req.body;
+    const { enabled, phone_number_id, access_token, groups, events, dept_groups } = req.body;
     const data: Record<string, unknown> = {};
-    if (enabled          !== undefined) data.wa_enabled          = enabled;
-    if (phone_number_id  !== undefined) data.wa_phone_number_id  = phone_number_id;
-    if (group_ids        !== undefined) data.wa_group_ids        = group_ids;
-    if (events           !== undefined) data.wa_events           = events;
-    if (dept_groups      !== undefined) data.wa_dept_groups      = dept_groups; // { "Engineering": "group-id", ... }
+    if (enabled         !== undefined) data.wa_enabled         = enabled;
+    if (phone_number_id !== undefined) data.wa_phone_number_id = phone_number_id;
+    if (groups          !== undefined) data.wa_groups          = groups;
+    if (events          !== undefined) data.wa_events          = events;
+    if (dept_groups     !== undefined) data.wa_dept_groups     = dept_groups;
     if (access_token && access_token !== '***redacted***') data.wa_access_token = access_token;
     await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, { message: 'WhatsApp settings saved' });
