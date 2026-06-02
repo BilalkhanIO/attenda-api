@@ -123,6 +123,8 @@ model AttendanceRecord {
   hour_alerted       Boolean   @default(false)
   late_notice_id     String?
   is_on_approved_leave Boolean @default(false)
+  last_heartbeat_at    DateTime?
+  last_heartbeat_ssid  String?   @db.VarChar(100)
 
   user           User               @relation(fields: [user_id], references: [id])
   org            Organisation       @relation(fields: [org_id], references: [id])

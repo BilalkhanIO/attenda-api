@@ -42,6 +42,9 @@ router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
     const records = await prisma.attendanceRecord.findMany({
       where: { user_id: req.user!.sub, date: { gte: since } },
       orderBy: { date: 'desc' },
+      include: {
+        break_records: { orderBy: { break_start: 'asc' } },
+      },
     });
     ok(res, records);
   } catch (e) { next(e); }
@@ -328,29 +331,6 @@ router.get('/break/status', async (req: Request, res: Response, next: NextFuncti
   } catch (e) { next(e); }
 });
 
-// ─── GET /attendance/:userId ───────────────────────────
-router.get('/:userId', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { userId } = req.params;
-    const { start, end } = req.query as { start?: string; end?: string };
-
-    const user = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
-    if (!user) throw new NotFoundError('User');
-
-    const where: Record<string, unknown> = { user_id: userId };
-    if (start || end) {
-      where.date = {};
-      if (start) (where.date as Record<string, unknown>).gte = new Date(start);
-      if (end)   (where.date as Record<string, unknown>).lte = new Date(end);
-    }
-
-    const records = await prisma.attendanceRecord.findMany({
-      where, include: RECORD_INCLUDE, orderBy: { date: 'desc' }, take: 90,
-    });
-    ok(res, records);
-  } catch (e) { next(e); }
-});
-
 // ─── GET /attendance/late-notice/me ───────────────────
 router.get('/late-notice/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -525,7 +505,13 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     const existing = await prisma.attendanceRecord.findUnique({
       where: { user_id_date: { user_id: req.user!.sub, date: today } },
     });
-    if (existing?.check_in_at) throw new ValidationError('Already checked in today');
+    if (existing?.check_in_at) {
+      if (type === 'qr') {
+        // Already checked in + QR scan = offer checkout
+        return ok(res, { action: 'checkout_prompt', record: existing });
+      }
+      throw new ValidationError('Already checked in today');
+    }
 
     // Validate QR code if provided
     if (type === 'qr') {
@@ -715,9 +701,44 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
   } catch (e) { next(e); }
 });
 
+// ─── POST /attendance/heartbeat ────────────────────────
+// Called by Flutter app every ~4 min while on office WiFi.
+// Server-side expiry job checks out employees when heartbeat goes stale.
+router.post('/heartbeat', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { ip, ssid } = req.body;
+    if (!ip && !ssid) throw new ValidationError('ip or ssid is required');
+    const today = startOfDay(new Date());
+
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
+    const officeIps   = org?.office_ips   ?? [];
+    const officeSsids = org?.office_ssids ?? [];
+
+    if (officeIps.length === 0 && officeSsids.length === 0) {
+      return ok(res, { action: 'no_networks_configured' });
+    }
+    if (!isOfficeNetwork(ip, ssid, officeIps, officeSsids)) {
+      return ok(res, { action: 'not_on_office_network' });
+    }
+
+    const record = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+    });
+    if (!record?.check_in_at || record.check_out_at) {
+      return ok(res, { action: 'not_checked_in' });
+    }
+
+    await prisma.attendanceRecord.update({
+      where: { id: record.id },
+      data: { last_heartbeat_at: new Date(), last_heartbeat_ssid: ssid ?? null },
+    });
+    return ok(res, { action: 'heartbeat_accepted' });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /attendance/ip-event ─────────────────────────
-// Called by Flutter app when WiFi connect/disconnect detected.
-// Accepts: event ('match'|'unmatch'), ip (device LAN IP or CIDR), ssid (WiFi network name)
+// Called by Flutter app when WiFi connect detected.
+// Accepts: event ('match'), ip (device LAN IP or CIDR), ssid (WiFi network name)
 // SSID matching is preferred — more reliable than IP for orgs without static IPs.
 router.post('/ip-event', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -744,15 +765,6 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
       const existing = await prisma.attendanceRecord.findUnique({
         where: { user_id_date: { user_id: req.user!.sub, date: today } },
       });
-
-      // Reconnected during grace period — cancel pending checkout
-      if (existing?.ip_checkout_pending_at && !existing.check_out_at) {
-        await prisma.attendanceRecord.update({
-          where: { id: existing.id },
-          data:  { ip_checkout_pending_at: null },
-        });
-        return ok(res, { action: 'grace_period_cancelled' });
-      }
 
       if (!existing?.check_in_at) {
         const now = new Date();
@@ -797,21 +809,6 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
         return ok(res, { action: 'checked_in', record });
       }
       return ok(res, { action: 'already_in' });
-    }
-
-    if (event === 'unmatch') {
-      // Start 5-minute grace period: set pending checkout timestamp
-      const existing = await prisma.attendanceRecord.findUnique({
-        where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      });
-      if (existing?.check_in_at && !existing.check_out_at && !existing.ip_checkout_pending_at) {
-        await prisma.attendanceRecord.update({
-          where: { id: existing.id },
-          data:  { ip_checkout_pending_at: new Date() },
-        });
-        return ok(res, { action: 'grace_period_started', expires_at: new Date(Date.now() + 5 * 60 * 1000) });
-      }
-      return ok(res, { action: 'none' });
     }
 
     ok(res, { action: 'none' });
@@ -873,6 +870,32 @@ router.get('/report/export', requireRole('hr_admin'), async (req: Request, res: 
 
     const records = await prisma.attendanceRecord.findMany({
       where, include: RECORD_INCLUDE, orderBy: [{ date: 'asc' }, { user_id: 'asc' }],
+    });
+    ok(res, records);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /attendance/:userId ───────────────────────────
+// NOTE: This parameterised route MUST stay last among GET routes so that
+// fixed-path routes like /leave-check, /late-notices, /me, etc. are matched
+// before Express falls through to the wildcard segment.
+router.get('/:userId', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { userId } = req.params;
+    const { start, end } = req.query as { start?: string; end?: string };
+
+    const user = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
+    if (!user) throw new NotFoundError('User');
+
+    const where: Record<string, unknown> = { user_id: userId };
+    if (start || end) {
+      where.date = {};
+      if (start) (where.date as Record<string, unknown>).gte = new Date(start);
+      if (end)   (where.date as Record<string, unknown>).lte = new Date(end);
+    }
+
+    const records = await prisma.attendanceRecord.findMany({
+      where, include: RECORD_INCLUDE, orderBy: { date: 'desc' }, take: 90,
     });
     ok(res, records);
   } catch (e) { next(e); }
