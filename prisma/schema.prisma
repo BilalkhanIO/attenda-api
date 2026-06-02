@@ -26,6 +26,13 @@ model Organisation {
   late_threshold     Int      @default(15)
   plan               String   @db.VarChar(50) @default("trial")
   status             String   @db.VarChar(20) @default("active")
+  subscription_status String  @db.VarChar(30) @default("active")
+  trial_started_at   DateTime?
+  trial_ends_at      DateTime?
+  seats_limit        Int?
+  features_override  Json?
+  admin_notes        String?  @db.Text
+  billing_email      String?  @db.VarChar(255)
   contact_name       String?  @db.VarChar(255)
   contact_email      String?  @db.VarChar(255)
   company_size       String?  @db.VarChar(50)
@@ -473,4 +480,44 @@ model LateArrivalNotice {
 
   @@unique([user_id, date])
   @@map("late_arrival_notices")
+}
+
+model PlanDefinition {
+  id            String  @id @db.VarChar(50)
+  display_name  String  @db.VarChar(100)
+  price_monthly Decimal @default(0) @db.Decimal(10, 2)
+  price_annual  Decimal @default(0) @db.Decimal(10, 2)
+  max_employees Int     @default(0)
+  trial_days    Int     @default(14)
+  features      Json    @default("{}")
+  description   String? @db.Text
+  highlight     Boolean @default(false)
+  is_active     Boolean @default(true)
+  sort_order    Int     @default(0)
+  updated_at    DateTime @default(now()) @updatedAt
+
+  @@map("plan_definitions")
+}
+
+model BlogPost {
+  id               String    @id @default(uuid())
+  slug             String    @unique @db.VarChar(255)
+  title            String    @db.VarChar(500)
+  excerpt          String?   @db.Text
+  content          String    @default("") @db.Text
+  author_name      String    @default("Attenda Team") @db.VarChar(255)
+  author_avatar    String?   @db.VarChar(500)
+  cover_image      String?   @db.VarChar(500)
+  tags             String[]  @default([])
+  meta_title       String?   @db.VarChar(500)
+  meta_description String?   @db.Text
+  og_image         String?   @db.VarChar(500)
+  is_published     Boolean   @default(false)
+  published_at     DateTime?
+  read_time_mins   Int?
+  views            Int       @default(0)
+  created_at       DateTime  @default(now())
+  updated_at       DateTime  @default(now()) @updatedAt
+
+  @@map("blog_posts")
 }

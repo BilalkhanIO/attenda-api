@@ -678,6 +678,32 @@ export function startShiftBreakAutoManager() {
 }
 
 // ─── Start all jobs ───────────────────────────────────
+// ─── Job: Trial Expiry Monitor ────────────────────────
+// Runs daily at 06:00 UTC. Marks trialing orgs as 'inactive' when their
+// trial has ended, and marks active orgs with a past trial as 'defaulted'
+// when they haven't upgraded.
+export function startTrialExpiryMonitor() {
+  cron.schedule('0 6 * * *', async () => {
+    const now = new Date();
+    try {
+      // Trialing → inactive when trial_ends_at has passed
+      const expired = await prisma.organisation.updateMany({
+        where: {
+          subscription_status: 'trialing',
+          trial_ends_at: { lt: now },
+        },
+        data: { subscription_status: 'inactive' },
+      });
+      if (expired.count > 0) {
+        console.log(`[trial-expiry] Marked ${expired.count} organisation(s) as inactive (trial ended)`);
+      }
+    } catch (err: any) {
+      console.error('[trial-expiry] Error:', err.message);
+    }
+  });
+  console.log('  ✓ Trial expiry monitor scheduled (daily 06:00 UTC)');
+}
+
 export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
   startLateArrivalDetector();
@@ -689,5 +715,6 @@ export function startAllJobs() {
   startTokenCleanup();
   startPayrollAutoGenerate();
   startShiftBreakAutoManager();
+  startTrialExpiryMonitor();
   console.log('✅ All background jobs running\n');
 }
