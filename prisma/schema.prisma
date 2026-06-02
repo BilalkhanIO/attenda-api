@@ -63,9 +63,10 @@ model User {
   reset_expires  DateTime?
   login_attempts Int       @default(0)
   locked_until   DateTime?
-  totp_secret    String?
-  totp_enabled   Boolean   @default(false)
-  google_id      String?   @unique
+  totp_secret          String?
+  totp_enabled         Boolean   @default(false)
+  notification_prefs   Json      @default("{\"check_in\":true,\"leave_updates\":true,\"shift_reminders\":true,\"payroll\":true,\"announcements\":true,\"late_alerts\":true}")
+  google_id            String?   @unique
   created_at     DateTime  @default(now())
   deleted_at     DateTime?
 

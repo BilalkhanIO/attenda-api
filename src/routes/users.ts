@@ -12,7 +12,7 @@ const USER_SELECT = {
   id: true, org_id: true, name: true, email: true, role: true,
   department: true, job_title: true, phone: true, manager_id: true,
   hourly_rate: true, avatar_url: true, is_active: true, setup_complete: true,
-  created_at: true,
+  created_at: true, totp_enabled: true, notification_prefs: true,
   manager: { select: { id: true, name: true } },
 };
 
@@ -40,6 +40,37 @@ router.put('/me', async (req: Request, res: Response, next: NextFunction) => {
       select: USER_SELECT,
     });
     ok(res, user);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /users/me/notification-prefs ──────────────────
+router.get('/me/notification-prefs', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user!.sub },
+      select: { notification_prefs: true },
+    });
+    if (!user) throw new NotFoundError('User');
+    ok(res, user.notification_prefs);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /users/me/notification-prefs ──────────────────
+router.put('/me/notification-prefs', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const defaults = { check_in: true, leave_updates: true, shift_reminders: true, payroll: true, announcements: true, late_alerts: true };
+    const incoming = req.body as Record<string, boolean>;
+    // Merge: only accept known keys
+    const prefs: Record<string, boolean> = {};
+    for (const key of Object.keys(defaults)) {
+      prefs[key] = key in incoming ? Boolean(incoming[key]) : (defaults as Record<string, boolean>)[key];
+    }
+    const user = await prisma.user.update({
+      where: { id: req.user!.sub },
+      data: { notification_prefs: prefs },
+      select: { notification_prefs: true },
+    });
+    ok(res, user.notification_prefs);
   } catch (e) { next(e); }
 });
 

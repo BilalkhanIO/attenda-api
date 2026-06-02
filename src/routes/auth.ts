@@ -286,6 +286,20 @@ router.post('/2fa/verify', authenticate, async (req: Request, res: Response, nex
   } catch (e) { next(e); }
 });
 
+// ─── DELETE /auth/2fa (disable 2FA) ────────────────────
+router.delete('/2fa', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { code } = req.body as { code: string };
+    if (!code) throw new AppError('Verification code required', 400, 'VALIDATION_ERROR');
+    const user = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { totp_secret: true, totp_enabled: true } });
+    if (!user || !user.totp_enabled) throw new AppError('2FA is not enabled', 400, 'NOT_ENABLED');
+    const result = verifySync({ secret: user.totp_secret!, token: String(code) });
+    if (!result.valid) throw new AppError('Invalid verification code', 400, 'INVALID_CODE');
+    await prisma.user.update({ where: { id: req.user!.sub }, data: { totp_enabled: false, totp_secret: null } });
+    ok(res, { message: '2FA disabled' });
+  } catch (e) { next(e); }
+});
+
 // ─── DELETE /auth/2fa/disable ─────────────────────────
 // Disable 2FA (requires password confirmation)
 router.delete('/2fa/disable', authenticate, async (req: Request, res: Response, next: NextFunction) => {
