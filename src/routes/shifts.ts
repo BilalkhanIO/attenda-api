@@ -398,7 +398,7 @@ router.get('/assignments/me', async (req, res, next) => {
     const until  = new Date(); until.setDate(until.getDate() + 28);
     const assignments = await prisma.shiftAssignment.findMany({
       where: { user_id: req.user!.sub, date: { gte: future, lte: until } },
-      include: { shift: { include: { shift_breaks: { orderBy: { after_minutes: 'asc' } } } } },
+      include: { shift: { include: { breaks: { orderBy: { after_minutes: 'asc' } } } } },
       orderBy: { date: 'asc' },
     });
     ok(res, assignments);
