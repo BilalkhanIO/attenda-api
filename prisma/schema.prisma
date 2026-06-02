@@ -25,6 +25,10 @@ model Organisation {
   pension_rate       Float    @default(0)
   late_threshold     Int      @default(15)
   plan               String   @db.VarChar(50) @default("trial")
+  status             String   @db.VarChar(20) @default("active")
+  contact_name       String?  @db.VarChar(255)
+  contact_email      String?  @db.VarChar(255)
+  company_size       String?  @db.VarChar(50)
   created_at         DateTime @default(now())
 
   users               User[]

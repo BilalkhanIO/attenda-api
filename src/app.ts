@@ -16,6 +16,7 @@ import webhooksRouter from './routes/webhooks';
 import adminRouter         from './routes/admin';
 import overtimeRouter      from './routes/overtime';
 import notificationsRouter from './routes/notifications';
+import publicRouter        from './routes/public';
 import { errorHandler, notFound } from './middleware/errorHandler';
 
 const app = express();
@@ -95,6 +96,7 @@ app.use(`${API}/webhooks`,    webhooksRouter);
 app.use(`${API}/admin`,      adminRouter);
 app.use(`${API}/overtime`,       overtimeRouter);
 app.use(`${API}/notifications`, notificationsRouter);
+app.use(`${API}/public`,       publicRouter);
 
 // ─── 404 & Error handler ──────────────────────────────
 app.use(notFound);
