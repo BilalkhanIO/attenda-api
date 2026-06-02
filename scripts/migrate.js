@@ -159,6 +159,7 @@ async function run() {
       'prisma/migrations/20260604000001_break_auto/migration.sql',
       'prisma/migrations/20260605000000_late_notice/migration.sql',
       'prisma/migrations/20260605000001_half_day_leave/migration.sql',
+      'prisma/migrations/20260606000000_heartbeat/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {
