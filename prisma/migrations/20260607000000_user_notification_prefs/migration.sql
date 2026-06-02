@@ -1,0 +1,1 @@
+ALTER TABLE users ADD COLUMN IF NOT EXISTS notification_prefs JSONB NOT NULL DEFAULT '{"check_in":true,"leave_updates":true,"shift_reminders":true,"payroll":true,"announcements":true,"late_alerts":true}';
