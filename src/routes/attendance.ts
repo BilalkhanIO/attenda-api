@@ -500,11 +500,52 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
   try {
     const { type = 'manual', qr_code, duration_type = 'full_day' } = req.body;
     const today = startOfDay(new Date());
+    // Capture client IP — prefer X-Forwarded-For (behind proxy/load balancer)
+    const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || null;
 
     // Check no existing check-in today
     const existing = await prisma.attendanceRecord.findUnique({
       where: { user_id_date: { user_id: req.user!.sub, date: today } },
     });
+
+    // Re-entry: employee was auto-checked out (WiFi dropout / heartbeat expiry)
+    // and has now returned without having logged a break. Log the gap as an
+    // unpaid 'away' break and reopen the record so the rest of the day continues.
+    if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
+      const reentryTime = new Date();
+      const gapMins = Math.max(1, Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000));
+      await prisma.breakRecord.create({
+        data: {
+          attendance_id: existing.id,
+          break_start:   existing.check_out_at,
+          break_end:     reentryTime,
+          break_type:    'away',
+          duration_mins: gapMins,
+          is_paid:       false,
+        },
+      });
+      const reopened = await prisma.attendanceRecord.update({
+        where: { id: existing.id },
+        data: {
+          check_out_at:      null,
+          hours_worked:      null,
+          net_hours_worked:  null,
+          early_out_minutes: null,
+          adherence_score:   null,
+          auto_checked_out:  false,
+          status:            'in',
+          break_minutes:     (existing.break_minutes || 0) + gapMins,
+          last_heartbeat_at: null,
+        },
+        include: RECORD_INCLUDE,
+      });
+      if (reopened.user) {
+        const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
+        notifyCheckIn(req.user!.org_id, reopened.user.name, formatTime12h(reentryTime), reopened.user.department ?? undefined).catch(console.error);
+      }
+      return ok(res, reopened);
+    }
+
     if (existing?.check_in_at) {
       if (type === 'qr') {
         // Already checked in + QR scan = offer checkout
@@ -544,7 +585,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     let status: string = type === 'remote' ? 'remote' : 'in';
 
     // Shift-based compliance: late detection + scheduled window (timezone-aware)
-    let lateMins  = 0;
+    let lateMins         = 0;
+    let earlyCheckinMins = 0;
     let scheduledStart: Date | null = null;
     let scheduledEnd:   Date | null = null;
     let shiftId: string | null = null;
@@ -568,6 +610,11 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         const win = scheduledWindow(shift, org?.timezone, now);
         scheduledStart = win.start;
         scheduledEnd   = win.end;
+
+        // Early check-in: employee arrived before their shift started
+        if (scheduledStart && now < scheduledStart) {
+          earlyCheckinMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
+        }
       }
     }
 
@@ -577,6 +624,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
           data: {
             check_in_at: now, check_in_type: type, status,
             late_minutes: lateMins,
+            early_checkin_minutes: earlyCheckinMins,
+            ...(rawIp          && { ip_detected: rawIp }),
             ...(shiftId        && { shift_id: shiftId }),
             ...(scheduledStart && { scheduled_start: scheduledStart }),
             ...(scheduledEnd   && { scheduled_end: scheduledEnd }),
@@ -590,6 +639,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
             user_id: req.user!.sub, org_id: req.user!.org_id,
             date: today, check_in_at: now, check_in_type: type, status,
             late_minutes: lateMins,
+            early_checkin_minutes: earlyCheckinMins,
+            ip_detected:     rawIp          ?? undefined,
             shift_id:        shiftId        ?? undefined,
             scheduled_start: scheduledStart ?? undefined,
             scheduled_end:   scheduledEnd   ?? undefined,
@@ -679,6 +730,36 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
       }).catch(console.error);
     }
 
+    // Notify manager when employee checks in significantly early (>30 min before shift)
+    if (earlyCheckinMins > 30 && type !== 'remote') {
+      const orgId  = req.user!.org_id;
+      const userId = req.user!.sub;
+      prisma.user.findUnique({
+        where:  { id: userId },
+        select: { name: true, manager: { select: { id: true, phone: true } } },
+      }).then(async u => {
+        if (!u) return;
+        const { formatTime12h, notify } = await import('../services/whatsapp');
+        const { createNotification }    = await import('../services/notifications');
+        if (u.manager?.id) {
+          createNotification({
+            userId: u.manager.id, orgId,
+            type:       'attendance_early_in',
+            title:      'Early check-in',
+            body:       `${u.name} checked in ${earlyCheckinMins} min early at ${formatTime12h(now)}`,
+            actionType: 'attendance', actionId: userId,
+          }).catch(console.error);
+        }
+        if (u.manager?.phone) {
+          notify({
+            orgId, event: 'shift_reminder' as any,
+            message:       `⏰ *Early Check-in*\n${u.name} arrived ${earlyCheckinMins} min before their shift start.`,
+            recipientType: 'individual', recipientId: u.manager.phone,
+          }).catch(console.error);
+        }
+      }).catch(console.error);
+    }
+
     ok(res, record);
   } catch (e) { next(e); }
 });
@@ -724,6 +805,38 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
       const timeStr = formatTime12h(updated.check_out_at || now);
       notifyCheckOut(req.user!.org_id, updated.user.name, timeStr, updated.user.department ?? undefined).catch(console.error);
     }
+
+    // Notify manager when employee leaves before their shift ends
+    const earlyTolerance = record.shift?.early_checkout_tolerance_mins ?? 15;
+    if (earlyMins > earlyTolerance) {
+      const orgId  = req.user!.org_id;
+      const userId = req.user!.sub;
+      prisma.user.findUnique({
+        where:  { id: userId },
+        select: { name: true, manager: { select: { id: true, phone: true } } },
+      }).then(async u => {
+        if (!u) return;
+        const { formatTime12h, notify } = await import('../services/whatsapp');
+        const { createNotification }    = await import('../services/notifications');
+        if (u.manager?.id) {
+          createNotification({
+            userId: u.manager.id, orgId,
+            type:       'attendance_early_out',
+            title:      'Early check-out',
+            body:       `${u.name} left ${earlyMins} min early at ${formatTime12h(now)}`,
+            actionType: 'attendance', actionId: userId,
+          }).catch(console.error);
+        }
+        if (u.manager?.phone) {
+          notify({
+            orgId, event: 'shift_reminder' as any,
+            message:       `⚡ *Early Check-out*\n${u.name} left ${earlyMins} min before shift end.`,
+            recipientType: 'individual', recipientId: u.manager.phone,
+          }).catch(console.error);
+        }
+      }).catch(console.error);
+    }
+
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -815,9 +928,15 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           scheduledEnd   = win.end;
         }
 
+        let earlyIpMins = 0;
+        if (scheduledStart && now < scheduledStart) {
+          earlyIpMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
+        }
+
         const checkInData = {
           check_in_at: now, check_in_type: 'auto_ip', status, ip_detected: ip,
           late_minutes: lateMins,
+          early_checkin_minutes: earlyIpMins,
           shift_id:        shiftId        ?? undefined,
           scheduled_start: scheduledStart ?? undefined,
           scheduled_end:   scheduledEnd   ?? undefined,
@@ -859,8 +978,76 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           }).catch(console.error);
         }
 
+        // Alert manager on significantly early WiFi auto check-in
+        if (earlyIpMins > 30) {
+          const orgId  = req.user!.org_id;
+          const userId = req.user!.sub;
+          prisma.user.findUnique({
+            where:  { id: userId },
+            select: { name: true, manager: { select: { id: true, phone: true } } },
+          }).then(async u => {
+            if (!u) return;
+            const { formatTime12h, notify } = await import('../services/whatsapp');
+            const { createNotification }    = await import('../services/notifications');
+            if (u.manager?.id) {
+              createNotification({
+                userId: u.manager.id, orgId,
+                type:       'attendance_early_in',
+                title:      'Early check-in',
+                body:       `${u.name} checked in ${earlyIpMins} min early at ${formatTime12h(now)}`,
+                actionType: 'attendance', actionId: userId,
+              }).catch(console.error);
+            }
+            if (u.manager?.phone) {
+              notify({
+                orgId, event: 'shift_reminder' as any,
+                message:       `⏰ *Early Check-in*\n${u.name} arrived ${earlyIpMins} min before their shift start.`,
+                recipientType: 'individual', recipientId: u.manager.phone,
+              }).catch(console.error);
+            }
+          }).catch(console.error);
+        }
+
         return ok(res, { action: 'checked_in', record });
       }
+
+      // Re-entry after WiFi dropout: employee was auto-checked out and has reconnected.
+      if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
+        const reentryTime = new Date();
+        const gapMins = Math.max(1, Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000));
+        await prisma.breakRecord.create({
+          data: {
+            attendance_id: existing.id,
+            break_start:   existing.check_out_at,
+            break_end:     reentryTime,
+            break_type:    'away',
+            duration_mins: gapMins,
+            is_paid:       false,
+          },
+        });
+        await prisma.attendanceRecord.update({
+          where: { id: existing.id },
+          data: {
+            check_out_at:      null,
+            hours_worked:      null,
+            net_hours_worked:  null,
+            early_out_minutes: null,
+            adherence_score:   null,
+            auto_checked_out:  false,
+            status:            'in',
+            break_minutes:     (existing.break_minutes || 0) + gapMins,
+            last_heartbeat_at: reentryTime,
+            last_heartbeat_ssid: ssid ?? null,
+          },
+        });
+        const reu = await prisma.user.findUnique({ where: { id: req.user!.sub } });
+        if (reu) {
+          const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
+          notifyCheckIn(req.user!.org_id, reu.name, formatTime12h(reentryTime)).catch(console.error);
+        }
+        return ok(res, { action: 'checked_in' });
+      }
+
       return ok(res, { action: 'already_in' });
     }
 

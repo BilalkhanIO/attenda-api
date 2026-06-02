@@ -161,6 +161,7 @@ async function run() {
       'prisma/migrations/20260605000001_half_day_leave/migration.sql',
       'prisma/migrations/20260606000000_heartbeat/migration.sql',
       'prisma/migrations/20260607000000_user_notification_prefs/migration.sql',
+      'prisma/migrations/20260608000000_early_checkin/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {
@@ -189,6 +190,46 @@ async function run() {
       execSync('node dist/utils/seed.js', { stdio: 'inherit', cwd: ROOT });
       console.log('[seed] Done');
       return;
+    }
+
+    // ── 4. Platform admin ─────────────────────────────────────────────────
+    const { rows: platformRows } = await client.query(
+      `SELECT EXISTS (SELECT 1 FROM organisations WHERE id = 'platform-org-001') AS exists`
+    );
+
+    if (!platformRows[0].exists) {
+      console.log('[seed] Creating platform org and admin user …');
+      const bcrypt = require('bcryptjs');
+      const hash   = await bcrypt.hash('Platform1234!', 12);
+
+      await client.query(`
+        INSERT INTO organisations (id, name, timezone, currency, plan, created_at)
+        VALUES ('platform-org-001', 'Attenda Platform', 'UTC', 'USD', 'enterprise', NOW())
+        ON CONFLICT (id) DO NOTHING
+      `);
+
+      await client.query(`
+        INSERT INTO users (
+          id, org_id, name, email, password_hash, role,
+          department, job_title, is_active, setup_complete, created_at
+        ) VALUES (
+          'platform-admin-001',
+          'platform-org-001',
+          'Platform Admin',
+          'platform@attenda.app',
+          $1,
+          'platform_admin',
+          'Platform',
+          'System Administrator',
+          true,
+          true,
+          NOW()
+        ) ON CONFLICT (email) DO NOTHING
+      `, [hash]);
+
+      console.log('[seed] Platform admin created — email: platform@attenda.app / password: Platform1234!');
+    } else {
+      console.log('[seed] Platform admin already exists — skipping');
     }
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});

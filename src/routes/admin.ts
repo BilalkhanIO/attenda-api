@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../utils/prisma';
 import { authenticate } from '../middleware/auth';
-import { ok } from '../utils/response';
+import { ok, ValidationError, NotFoundError } from '../utils/response';
 import { ForbiddenError } from '../utils/response';
 
 const router = Router();
@@ -88,7 +88,7 @@ router.get('/orgs/:id', async (req: Request, res: Response, next: NextFunction) 
 router.patch('/orgs/:id/plan', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { plan } = req.body;
-    if (!['trial', 'starter', 'growth', 'enterprise'].includes(plan)) {
+    if (!['trial', 'starter', 'growth', 'enterprise', 'suspended'].includes(plan)) {
       return res.status(422).json({ success: false, error: 'Invalid plan' });
     }
     const org = await prisma.organisation.update({
@@ -96,6 +96,53 @@ router.patch('/orgs/:id/plan', async (req: Request, res: Response, next: NextFun
       data: { plan },
     });
     ok(res, org);
+  } catch (e) { next(e); }
+});
+
+// PATCH /admin/orgs/:id/suspend — toggle org suspension
+router.patch('/orgs/:id/suspend', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
+    if (!org) throw new NotFoundError('Organisation');
+    const newPlan = org.plan === 'suspended' ? 'trial' : 'suspended';
+    const updated = await prisma.organisation.update({
+      where: { id: req.params.id as string },
+      data: { plan: newPlan },
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// POST /admin/orgs — create a new organisation
+router.post('/orgs', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { name, timezone = 'UTC', currency = 'USD', plan = 'trial' } = req.body;
+    if (!name?.trim()) throw new ValidationError('name is required');
+    if (!['trial', 'starter', 'growth', 'enterprise'].includes(plan)) {
+      throw new ValidationError('Invalid plan');
+    }
+    const org = await prisma.organisation.create({
+      data: { name: name.trim(), timezone, currency, plan },
+    });
+    ok(res, org, 201);
+  } catch (e) { next(e); }
+});
+
+// GET /admin/orgs/:id/users — list users for an org
+router.get('/orgs/:id/users', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
+    if (!org) throw new NotFoundError('Organisation');
+    const users = await prisma.user.findMany({
+      where: { org_id: req.params.id as string, deleted_at: null },
+      select: {
+        id: true, name: true, email: true, role: true,
+        department: true, job_title: true, is_active: true,
+        created_at: true, avatar_url: true,
+      },
+      orderBy: { name: 'asc' },
+    });
+    ok(res, users);
   } catch (e) { next(e); }
 });
 
