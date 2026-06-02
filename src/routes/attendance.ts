@@ -652,6 +652,33 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
       }
     }
 
+    // When an employee actually checks in late, alert their manager with the real arrival time.
+    // The scheduler fires "no-show" alerts at +30/+60 min, but never knows when they arrive.
+    if (status === 'late' && type !== 'remote') {
+      const orgId = req.user!.org_id;
+      const userId = req.user!.sub;
+      prisma.user.findUnique({
+        where: { id: userId },
+        select: { name: true, manager: { select: { id: true, phone: true } } },
+      }).then(async u => {
+        if (!u) return;
+        const { formatTime12h, notifyLateArrival } = await import('../services/whatsapp');
+        const { createNotification } = await import('../services/notifications');
+        if (u.manager?.id) {
+          createNotification({
+            userId: u.manager.id, orgId,
+            type: 'attendance_late',
+            title: 'Late check-in',
+            body: `${u.name} checked in ${lateMins} min late at ${formatTime12h(now)}`,
+            actionType: 'attendance', actionId: userId,
+          }).catch(console.error);
+        }
+        if (u.manager?.phone) {
+          notifyLateArrival(orgId, u.name, lateMins, u.manager.phone).catch(console.error);
+        }
+      }).catch(console.error);
+    }
+
     ok(res, record);
   } catch (e) { next(e); }
 });
@@ -804,6 +831,32 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
         if (user) {
           const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
           notifyCheckIn(req.user!.org_id, user.name, formatTime12h(now)).catch(console.error);
+        }
+
+        // Alert manager on late WiFi auto check-in
+        if (status === 'late') {
+          const orgId = req.user!.org_id;
+          const userId = req.user!.sub;
+          prisma.user.findUnique({
+            where: { id: userId },
+            select: { name: true, manager: { select: { id: true, phone: true } } },
+          }).then(async u => {
+            if (!u) return;
+            const { formatTime12h, notifyLateArrival } = await import('../services/whatsapp');
+            const { createNotification } = await import('../services/notifications');
+            if (u.manager?.id) {
+              createNotification({
+                userId: u.manager.id, orgId,
+                type: 'attendance_late',
+                title: 'Late check-in',
+                body: `${u.name} checked in ${lateMins} min late at ${formatTime12h(now)}`,
+                actionType: 'attendance', actionId: userId,
+              }).catch(console.error);
+            }
+            if (u.manager?.phone) {
+              notifyLateArrival(orgId, u.name, lateMins, u.manager.phone).catch(console.error);
+            }
+          }).catch(console.error);
         }
 
         return ok(res, { action: 'checked_in', record });
