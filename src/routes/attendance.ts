@@ -500,6 +500,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
   try {
     const { type = 'manual', qr_code, duration_type = 'full_day' } = req.body;
     const today = startOfDay(new Date());
+    // Capture client IP — prefer X-Forwarded-For (behind proxy/load balancer)
+    const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || null;
 
     // Check no existing check-in today
     const existing = await prisma.attendanceRecord.findUnique({
@@ -583,7 +585,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     let status: string = type === 'remote' ? 'remote' : 'in';
 
     // Shift-based compliance: late detection + scheduled window (timezone-aware)
-    let lateMins  = 0;
+    let lateMins         = 0;
+    let earlyCheckinMins = 0;
     let scheduledStart: Date | null = null;
     let scheduledEnd:   Date | null = null;
     let shiftId: string | null = null;
@@ -607,6 +610,11 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         const win = scheduledWindow(shift, org?.timezone, now);
         scheduledStart = win.start;
         scheduledEnd   = win.end;
+
+        // Early check-in: employee arrived before their shift started
+        if (scheduledStart && now < scheduledStart) {
+          earlyCheckinMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
+        }
       }
     }
 
@@ -616,6 +624,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
           data: {
             check_in_at: now, check_in_type: type, status,
             late_minutes: lateMins,
+            early_checkin_minutes: earlyCheckinMins,
+            ...(rawIp          && { ip_detected: rawIp }),
             ...(shiftId        && { shift_id: shiftId }),
             ...(scheduledStart && { scheduled_start: scheduledStart }),
             ...(scheduledEnd   && { scheduled_end: scheduledEnd }),
@@ -629,6 +639,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
             user_id: req.user!.sub, org_id: req.user!.org_id,
             date: today, check_in_at: now, check_in_type: type, status,
             late_minutes: lateMins,
+            early_checkin_minutes: earlyCheckinMins,
+            ip_detected:     rawIp          ?? undefined,
             shift_id:        shiftId        ?? undefined,
             scheduled_start: scheduledStart ?? undefined,
             scheduled_end:   scheduledEnd   ?? undefined,
@@ -714,6 +726,36 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         }
         if (u.manager?.phone) {
           notifyLateArrival(orgId, u.name, lateMins, u.manager.phone).catch(console.error);
+        }
+      }).catch(console.error);
+    }
+
+    // Notify manager when employee checks in significantly early (>30 min before shift)
+    if (earlyCheckinMins > 30 && type !== 'remote') {
+      const orgId  = req.user!.org_id;
+      const userId = req.user!.sub;
+      prisma.user.findUnique({
+        where:  { id: userId },
+        select: { name: true, manager: { select: { id: true, phone: true } } },
+      }).then(async u => {
+        if (!u) return;
+        const { formatTime12h, notify } = await import('../services/whatsapp');
+        const { createNotification }    = await import('../services/notifications');
+        if (u.manager?.id) {
+          createNotification({
+            userId: u.manager.id, orgId,
+            type:       'attendance_early_in',
+            title:      'Early check-in',
+            body:       `${u.name} checked in ${earlyCheckinMins} min early at ${formatTime12h(now)}`,
+            actionType: 'attendance', actionId: userId,
+          }).catch(console.error);
+        }
+        if (u.manager?.phone) {
+          notify({
+            orgId, event: 'shift_reminder' as any,
+            message:       `⏰ *Early Check-in*\n${u.name} arrived ${earlyCheckinMins} min before their shift start.`,
+            recipientType: 'individual', recipientId: u.manager.phone,
+          }).catch(console.error);
         }
       }).catch(console.error);
     }
@@ -886,9 +928,15 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           scheduledEnd   = win.end;
         }
 
+        let earlyIpMins = 0;
+        if (scheduledStart && now < scheduledStart) {
+          earlyIpMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
+        }
+
         const checkInData = {
           check_in_at: now, check_in_type: 'auto_ip', status, ip_detected: ip,
           late_minutes: lateMins,
+          early_checkin_minutes: earlyIpMins,
           shift_id:        shiftId        ?? undefined,
           scheduled_start: scheduledStart ?? undefined,
           scheduled_end:   scheduledEnd   ?? undefined,
@@ -926,6 +974,36 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
             }
             if (u.manager?.phone) {
               notifyLateArrival(orgId, u.name, lateMins, u.manager.phone).catch(console.error);
+            }
+          }).catch(console.error);
+        }
+
+        // Alert manager on significantly early WiFi auto check-in
+        if (earlyIpMins > 30) {
+          const orgId  = req.user!.org_id;
+          const userId = req.user!.sub;
+          prisma.user.findUnique({
+            where:  { id: userId },
+            select: { name: true, manager: { select: { id: true, phone: true } } },
+          }).then(async u => {
+            if (!u) return;
+            const { formatTime12h, notify } = await import('../services/whatsapp');
+            const { createNotification }    = await import('../services/notifications');
+            if (u.manager?.id) {
+              createNotification({
+                userId: u.manager.id, orgId,
+                type:       'attendance_early_in',
+                title:      'Early check-in',
+                body:       `${u.name} checked in ${earlyIpMins} min early at ${formatTime12h(now)}`,
+                actionType: 'attendance', actionId: userId,
+              }).catch(console.error);
+            }
+            if (u.manager?.phone) {
+              notify({
+                orgId, event: 'shift_reminder' as any,
+                message:       `⏰ *Early Check-in*\n${u.name} arrived ${earlyIpMins} min before their shift start.`,
+                recipientType: 'individual', recipientId: u.manager.phone,
+              }).catch(console.error);
             }
           }).catch(console.error);
         }

@@ -116,8 +116,9 @@ model AttendanceRecord {
   break_minutes      Int       @default(0)
   paid_break_minutes Int       @default(0)
   net_hours_worked   Decimal?  @db.Decimal(5, 2)
-  late_minutes       Int       @default(0)
-  early_out_minutes  Int       @default(0)
+  late_minutes          Int       @default(0)
+  early_out_minutes     Int       @default(0)
+  early_checkin_minutes Int       @default(0)
   adherence_score    Int?
   auto_checked_out   Boolean   @default(false)
   late_alerted       Boolean   @default(false)
