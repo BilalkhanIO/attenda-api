@@ -1045,7 +1045,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
           notifyCheckIn(req.user!.org_id, reu.name, formatTime12h(reentryTime)).catch(console.error);
         }
-        return ok(res, { action: 'checked_in' });
+        return ok(res, { action: 're_entered', gap_mins: gapMins });
       }
 
       return ok(res, { action: 'already_in' });
