@@ -165,6 +165,7 @@ async function run() {
       'prisma/migrations/20260609000000_org_onboarding/migration.sql',
       'prisma/migrations/20260610000000_saas_management/migration.sql',
       'prisma/migrations/20260611000000_fix_org_timezone/migration.sql',
+      'prisma/migrations/20260612000000_absent_alerted/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {

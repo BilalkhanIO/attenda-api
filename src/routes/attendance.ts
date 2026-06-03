@@ -122,11 +122,19 @@ router.put('/remote/sessions/:id/reject', requireRole('manager'), async (req: Re
       data: { status: 'rejected', approved_by: req.user!.sub },
     });
 
-    // Revert attendance record status to 'absent' since remote was denied
-    await prisma.attendanceRecord.update({
+    // Only mark absent if the employee never physically checked in; if they
+    // already have a check_in_at (e.g. QR'd in before the manager reviewed),
+    // leave the record as-is so we don't erase a real attendance day.
+    const linkedRecord = await prisma.attendanceRecord.findUnique({
       where: { id: session.attendance_id },
-      data: { status: 'absent' },
+      select: { check_in_at: true },
     });
+    if (linkedRecord && !linkedRecord.check_in_at) {
+      await prisma.attendanceRecord.update({
+        where: { id: session.attendance_id },
+        data: { status: 'absent' },
+      });
+    }
 
     // In-app notification to employee
     const rejectedSession = await prisma.remoteSession.findUnique({

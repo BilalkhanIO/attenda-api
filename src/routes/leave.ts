@@ -290,6 +290,10 @@ router.get('/balance/me', async (req, res, next) => {
 router.get('/balance/:userId', requireRole('manager'), async (req, res, next) => {
   try {
     const year = parseInt((req.query.year as string) || String(new Date().getFullYear()));
+    const targetUser = await prisma.user.findFirst({
+      where: { id: req.params.userId, org_id: req.user!.org_id },
+    });
+    if (!targetUser) throw new NotFoundError('User');
     const balances = await prisma.leaveBalance.findMany({
       where: { user_id: req.params.userId, year },
     });

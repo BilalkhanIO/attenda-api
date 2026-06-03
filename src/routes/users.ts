@@ -125,9 +125,19 @@ router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, ne
   try {
     const { name, email, role, department, job_title, phone, hourly_rate, manager_id } = req.body;
     if (!name || !email || !role) throw new ValidationError('name, email and role are required');
+    const VALID_ROLES = ['employee', 'manager', 'hr_admin', 'super_admin'];
+    if (!VALID_ROLES.includes(role)) throw new ValidationError('Invalid role');
+    if (req.user!.role === 'hr_admin' && !['employee', 'manager'].includes(role)) {
+      throw new ForbiddenError();
+    }
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) throw new ValidationError('Email already in use');
+
+    if (manager_id) {
+      const mgr = await prisma.user.findFirst({ where: { id: manager_id, org_id: req.user!.org_id } });
+      if (!mgr) throw new ValidationError('Manager not found in your organisation');
+    }
 
     const inviteToken   = generateToken();
     const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
@@ -192,8 +202,21 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
     const { id } = req.params;
     const { name, role, department, job_title, phone, hourly_rate, manager_id } = req.body;
 
+    if (role !== undefined) {
+      const VALID_ROLES = ['employee', 'manager', 'hr_admin', 'super_admin'];
+      if (!VALID_ROLES.includes(role)) throw new ValidationError('Invalid role');
+      if (req.user!.role === 'hr_admin' && !['employee', 'manager'].includes(role)) {
+        throw new ForbiddenError();
+      }
+    }
+
     const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
     if (!user) throw new NotFoundError('User');
+
+    if (manager_id) {
+      const mgr = await prisma.user.findFirst({ where: { id: manager_id, org_id: req.user!.org_id } });
+      if (!mgr) throw new ValidationError('Manager not found in your organisation');
+    }
 
     const updated = await prisma.user.update({
       where: { id },
