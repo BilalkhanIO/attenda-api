@@ -246,6 +246,8 @@ router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next
     ok(res, session);
   } catch (e) { next(e); }
 });
+const PAID_BREAK_TYPES = new Set(['rest', 'short', 'prayer']);
+
 router.post('/break/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { break_type = 'rest' } = req.body;
@@ -263,7 +265,7 @@ router.post('/break/start', async (req: Request, res: Response, next: NextFuncti
         attendance_id: record.id,
         break_start: new Date(),
         break_type,
-        is_paid: break_type === 'rest',
+        is_paid: PAID_BREAK_TYPES.has(break_type),
       },
     });
     ok(res, breakRecord);

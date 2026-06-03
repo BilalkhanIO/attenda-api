@@ -227,7 +227,6 @@ export function startHeartbeatExpiryMonitor() {
       const expired = await prisma.attendanceRecord.findMany({
         where: {
           date:          today,
-          check_in_type: 'auto_ip',
           check_in_at:   { not: null },
           check_out_at:  null,
           status:        { in: ['in', 'late'] },
@@ -666,6 +665,24 @@ export function startShiftBreakAutoManager() {
             await prisma.breakRecord.update({
               where: { id: existing.id },
               data:  { break_end: now, duration_mins: durMins, auto_ended: true },
+            });
+
+            // Recompute attendance totals so mid-shift figures are accurate
+            const allBreaks = await prisma.breakRecord.findMany({
+              where: { attendance_id: record.id, break_end: { not: null } },
+            });
+            const paidMins   = allBreaks.filter(b => b.is_paid).reduce((s, b) => s + (b.duration_mins ?? 0), 0);
+            const unpaidMins = allBreaks.filter(b => !b.is_paid).reduce((s, b) => s + (b.duration_mins ?? 0), 0);
+            const grossHours = record.check_in_at
+              ? (now.getTime() - record.check_in_at.getTime()) / 3_600_000
+              : 0;
+            await prisma.attendanceRecord.update({
+              where: { id: record.id },
+              data: {
+                break_minutes:      unpaidMins + paidMins,
+                paid_break_minutes: paidMins,
+                net_hours_worked:   netHoursWorked(grossHours, unpaidMins),
+              },
             });
           }
         }

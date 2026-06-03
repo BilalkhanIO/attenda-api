@@ -7,6 +7,11 @@ const router = Router();
 
 const VALID_SIZES = ['1-10', '11-50', '51-200', '201-500', '500+'];
 
+function isValidIanaTz(tz: string): boolean {
+  try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; }
+  catch { return false; }
+}
+
 // ─── POST /public/onboard ─────────────────────────────────────────────────────
 router.post('/onboard', async (req: Request, res: Response, next: NextFunction) => {
   try {
@@ -17,6 +22,7 @@ router.post('/onboard', async (req: Request, res: Response, next: NextFunction) 
     if (!contact_email?.trim()) throw new ValidationError('Work email is required');
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contact_email)) throw new ValidationError('Invalid email address');
     if (company_size && !VALID_SIZES.includes(company_size)) throw new ValidationError('Invalid company size');
+    if (timezone && !isValidIanaTz(timezone.trim())) throw new ValidationError('Invalid timezone — must be a valid IANA timezone (e.g. Asia/Karachi)');
 
     const existing = await prisma.organisation.findFirst({
       where: { contact_email: contact_email.toLowerCase().trim(), status: { in: ['pending', 'active'] } },
