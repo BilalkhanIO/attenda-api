@@ -184,25 +184,33 @@ export function startAbsentDetector() {
             // Don't overwrite 'leave' or 'half_leave' status
             if (record?.status === 'leave' || record?.status === 'half_leave') continue;
 
+            const alreadyAlerted = record?.absent_alerted ?? false;
             await prisma.attendanceRecord.upsert({
               where: { user_id_date: { user_id: user.id, date: today } },
               update: { status: 'absent' },
               create: { user_id: user.id, org_id: user.org_id, date: today, check_in_type: 'manual', status: 'absent' },
             });
 
-            // Notify manager only (privacy — not group)
-            if (user.manager?.phone) {
-              await notifyAbsent(user.org_id, user.name, user.manager.phone);
-            }
-            if (user.manager_id) {
-              const { createNotification } = await import('../services/notifications');
-              createNotification({
-                userId: user.manager_id, orgId: user.org_id,
-                type: 'attendance_absent',
-                title: 'Employee absent',
-                body: `${user.name} has not checked in — marked absent`,
-                actionType: 'attendance', actionId: user.id,
-              }).catch(console.error);
+            if (!alreadyAlerted) {
+              await prisma.attendanceRecord.update({
+                where: { user_id_date: { user_id: user.id, date: today } },
+                data: { absent_alerted: true },
+              });
+
+              // Notify manager only (privacy — not group)
+              if (user.manager?.phone) {
+                await notifyAbsent(user.org_id, user.name, user.manager.phone);
+              }
+              if (user.manager_id) {
+                const { createNotification } = await import('../services/notifications');
+                createNotification({
+                  userId: user.manager_id, orgId: user.org_id,
+                  type: 'attendance_absent',
+                  title: 'Employee absent',
+                  body: `${user.name} has not checked in — marked absent`,
+                  actionType: 'attendance', actionId: user.id,
+                }).catch(console.error);
+              }
             }
           }
         }
@@ -532,8 +540,9 @@ export function startPayrollAutoGenerate() {
       const orgs = await prisma.organisation.findMany({ where: { payroll_day: day } });
 
       for (const org of orgs) {
-        const month = today.getMonth() + 1;
-        const year  = today.getFullYear();
+        // Bill the previous month so the full month is always complete before payroll runs
+        const month = today.getMonth() === 0 ? 12 : today.getMonth();
+        const year  = today.getMonth() === 0 ? today.getFullYear() - 1 : today.getFullYear();
 
         // Check not already generated
         const existing = await prisma.payrollRecord.findFirst({

@@ -134,6 +134,7 @@ model AttendanceRecord {
   auto_checked_out   Boolean   @default(false)
   late_alerted       Boolean   @default(false)
   hour_alerted       Boolean   @default(false)
+  absent_alerted     Boolean   @default(false)
   late_notice_id     String?
   is_on_approved_leave Boolean @default(false)
   last_heartbeat_at    DateTime?

@@ -48,9 +48,13 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
 export function requireRole(...roles: string[]) {
   return (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user) return next(new UnauthorizedError());
+    // platform_admin is a cross-tenant role; it must not pass org-scoped route
+    // guards automatically. Admin routes enforce their own explicit check.
+    if (req.user.role === 'platform_admin' && !roles.includes('platform_admin')) {
+      return next(new ForbiddenError());
+    }
     const userLevel = ROLE_HIERARCHY[req.user.role] || 0;
     const hasAccess = roles.some(r => {
-      // Allow exact match OR higher role
       return req.user!.role === r || userLevel >= ROLE_HIERARCHY[r];
     });
     if (!hasAccess) return next(new ForbiddenError());

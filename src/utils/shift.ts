@@ -103,8 +103,10 @@ export function earlyOutMinutes(checkOutAt: Date, shift: ShiftLike | null | unde
   if (!shift) return 0;
   const end    = hhmmToMins(shift.end_time);
   const actual = minutesOfDayInTz(checkOutAt, timezone);
-  const diff   = end - actual;
-  if (diff < -720) return 0; // checked out well after end (overnight) — not early
+  let diff = end - actual;
+  // For overnight shifts whose end wraps past midnight (end < 120 but actual > 1320),
+  // diff goes to ~ -1400. Add a day's worth of minutes to normalise.
+  if (diff < -720) diff += 1440;
   return Math.max(0, diff);
 }
 

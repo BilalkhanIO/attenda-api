@@ -355,12 +355,6 @@ router.post('/schedule/publish', requireRole('hr_admin'), async (req, res, next)
     const ws = week_start ? new Date(week_start) : (() => { const d = new Date(); d.setDate(d.getDate() - d.getDay() + 1); return d; })();
     const we = new Date(ws); we.setDate(we.getDate() + 6);
 
-    // Mark shift templates as published
-    await prisma.shift.updateMany({
-      where: { org_id: req.user!.org_id },
-      data: { is_published: true },
-    });
-
     // Get all assignments for the week and notify employees
     const assignments = await prisma.shiftAssignment.findMany({
       where: {
@@ -372,6 +366,15 @@ router.post('/schedule/publish', requireRole('hr_admin'), async (req, res, next)
         shift: { select: { name: true, start_time: true } },
       },
     });
+
+    // Mark only the shift templates that appear in this week as published
+    const shiftIds = [...new Set(assignments.map(a => a.shift_id))];
+    if (shiftIds.length > 0) {
+      await prisma.shift.updateMany({
+        where: { id: { in: shiftIds }, org_id: req.user!.org_id },
+        data: { is_published: true },
+      });
+    }
 
     let notified = 0;
     const { notifyShiftReminder } = await import('../services/whatsapp');
@@ -455,6 +458,16 @@ router.post('/swaps', async (req, res, next) => {
   try {
     const { target_id, requester_assign_id, target_assign_id, reason } = req.body;
     if (!target_id || !requester_assign_id || !target_assign_id) throw new ValidationError('Missing required fields');
+
+    const requesterAssign = await prisma.shiftAssignment.findFirst({
+      where: { id: requester_assign_id, user_id: req.user!.sub, shift: { org_id: req.user!.org_id } },
+    });
+    if (!requesterAssign) throw new NotFoundError('Your shift assignment');
+
+    const targetAssign = await prisma.shiftAssignment.findFirst({
+      where: { id: target_assign_id, shift: { org_id: req.user!.org_id } },
+    });
+    if (!targetAssign) throw new NotFoundError('Target shift assignment');
 
     const swap = await prisma.shiftSwap.create({
       data: { requester_id: req.user!.sub, target_id, requester_assign_id, target_assign_id, reason },
