@@ -164,6 +164,7 @@ async function run() {
       'prisma/migrations/20260608000000_early_checkin/migration.sql',
       'prisma/migrations/20260609000000_org_onboarding/migration.sql',
       'prisma/migrations/20260610000000_saas_management/migration.sql',
+      'prisma/migrations/20260611000000_fix_org_timezone/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {
@@ -206,7 +207,7 @@ async function run() {
 
       await client.query(`
         INSERT INTO organisations (id, name, timezone, currency, plan, created_at)
-        VALUES ('platform-org-001', 'Attenda Platform', 'UTC', 'USD', 'enterprise', NOW())
+        VALUES ('platform-org-001', 'Attenda Platform', 'Asia/Karachi', 'USD', 'enterprise', NOW())
         ON CONFLICT (id) DO NOTHING
       `);
 

@@ -12,7 +12,7 @@ async function seed() {
     create: {
       id: 'demo-org-001',
       name: 'Attenda Demo Company',
-      timezone: 'UTC',
+      timezone: 'Asia/Karachi',
       currency: 'USD',
       office_ips: ['192.168.1.1', '10.0.0.1'],
       wa_enabled: false,
