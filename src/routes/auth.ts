@@ -11,6 +11,11 @@ import jwt from 'jsonwebtoken';
 
 const router = Router();
 
+function isValidIanaTz(tz: string): boolean {
+  try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; }
+  catch { return false; }
+}
+
 function validatePasswordStrength(password: string): void {
   if (password.length < 8) throw new ValidationError('Password must be at least 8 characters');
   if (!/[A-Z]/.test(password)) throw new ValidationError('Password must contain at least one uppercase letter');
@@ -25,6 +30,7 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
     const { org_name, timezone, currency, name, email, password } = req.body;
     if (!org_name || !name || !email || !password) throw new ValidationError('Missing required fields');
     validatePasswordStrength(password);
+    if (timezone && !isValidIanaTz(timezone)) throw new ValidationError('Invalid timezone — must be a valid IANA timezone (e.g. Asia/Karachi)');
 
     const existing = await prisma.user.findUnique({ where: { email } });
     if (existing) throw new AppError('Email already registered', 409, 'CONFLICT');

@@ -78,7 +78,8 @@ router.put('/:shiftId/breaks/:breakId', requireRole('manager'), async (req, res,
     });
     if (!b) throw new NotFoundError('ShiftBreak');
     const timeData: Record<string, unknown> = {};
-    if (start_time && end_time) {
+    if (start_time || end_time) {
+      if (!start_time || !end_time) throw new ValidationError('start_time and end_time must both be provided together');
       const bm = timeToMins(end_time) - timeToMins(start_time);
       if (bm <= 0) throw new ValidationError('end_time must be after start_time');
       timeData.break_minutes    = bm;
