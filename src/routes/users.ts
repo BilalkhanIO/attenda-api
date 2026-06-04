@@ -1,6 +1,6 @@
-// @ts-nocheck
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requirePermission } from '../middleware/auth';
+import { getUserCapabilities, resolveUserPermissions, can } from '../services/authorization';
 import { hashPassword, generateToken } from '../utils/auth';
 import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
@@ -15,6 +15,14 @@ const USER_SELECT = {
   created_at: true, totp_enabled: true, notification_prefs: true,
   manager: { select: { id: true, name: true } },
 };
+
+// ─── GET /users/me/capabilities ────────────────────────
+router.get('/me/capabilities', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const caps = await getUserCapabilities(req.user!.sub, req.user!.org_id, req.user!.role);
+    ok(res, caps);
+  } catch (e) { next(e); }
+});
 
 // ─── GET /users/me ─────────────────────────────────────
 router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
@@ -71,6 +79,62 @@ router.put('/me/notification-prefs', async (req: Request, res: Response, next: N
       select: { notification_prefs: true },
     });
     ok(res, user.notification_prefs);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /users/:id/permissions ────────────────────────
+router.get('/:id/permissions', requirePermission('org.permissions.grant'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const user = await prisma.user.findFirst({
+      where: { id: req.params.id, org_id: req.user!.org_id, deleted_at: null },
+    });
+    if (!user) throw new NotFoundError('User');
+
+    const grants = await prisma.userPermissionGrant.findMany({
+      where: { user_id: user.id, org_id: req.user!.org_id },
+      select: { permission_key: true, effect: true },
+    });
+    ok(res, grants);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /users/:id/permissions ────────────────────────
+router.put('/:id/permissions', requirePermission('org.permissions.grant'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { grants } = req.body as { grants?: Array<{ permission_key: string; effect: 'allow' | 'deny' }> };
+    if (!Array.isArray(grants)) throw new ValidationError('grants must be an array');
+
+    const user = await prisma.user.findFirst({
+      where: { id: req.params.id, org_id: req.user!.org_id, deleted_at: null },
+    });
+    if (!user) throw new NotFoundError('User');
+
+    for (const g of grants) {
+      if (!g.permission_key || !['allow', 'deny'].includes(g.effect)) {
+        throw new ValidationError('Each grant needs permission_key and effect (allow|deny)');
+      }
+    }
+
+    await prisma.userPermissionGrant.deleteMany({
+      where: { user_id: user.id, org_id: req.user!.org_id },
+    });
+
+    if (grants.length) {
+      await prisma.userPermissionGrant.createMany({
+        data: grants.map(g => ({
+          user_id: user.id,
+          org_id: req.user!.org_id,
+          permission_key: g.permission_key,
+          effect: g.effect,
+        })),
+      });
+    }
+
+    const saved = await prisma.userPermissionGrant.findMany({
+      where: { user_id: user.id, org_id: req.user!.org_id },
+      select: { permission_key: true, effect: true },
+    });
+    ok(res, saved);
   } catch (e) { next(e); }
 });
 
@@ -200,7 +264,11 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
 router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
-    const { name, role, department, job_title, phone, hourly_rate, manager_id } = req.body;
+    const { name, role, department, job_title, phone, hourly_rate, manager_id, email, password } = req.body as {
+      name?: string; role?: string; department?: string; job_title?: string;
+      phone?: string; hourly_rate?: number; manager_id?: string | null;
+      email?: string; password?: string;
+    };
 
     if (role !== undefined) {
       const VALID_ROLES = ['employee', 'manager', 'hr_admin', 'super_admin'];
@@ -218,6 +286,30 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
       if (!mgr) throw new ValidationError('Manager not found in your organisation');
     }
 
+    // ─── Credentials update: email / password ──────────
+    const credentialFields: Record<string, unknown> = {};
+    if (email !== undefined || password !== undefined) {
+      // Requires credentials.update permission OR super_admin role
+      const isSuperAdmin = req.user!.role === 'super_admin';
+      let canUpdateCreds = isSuperAdmin;
+      if (!canUpdateCreds) {
+        const perms = await resolveUserPermissions(req.user!.sub, req.user!.org_id, req.user!.role);
+        canUpdateCreds = can(perms, 'employees.credentials.update');
+      }
+      if (!canUpdateCreds) throw new ForbiddenError('employees.credentials.update permission required');
+
+      if (email !== undefined) {
+        if (!email.includes('@')) throw new ValidationError('Invalid email address');
+        const existing = await prisma.user.findFirst({ where: { email, id: { not: id } } });
+        if (existing) throw new ValidationError('Email already in use');
+        credentialFields.email = email.toLowerCase().trim();
+      }
+      if (password !== undefined) {
+        if (password.length < 8) throw new ValidationError('Password must be at least 8 characters');
+        credentialFields.password_hash = await hashPassword(password);
+      }
+    }
+
     const updated = await prisma.user.update({
       where: { id },
       data: {
@@ -228,6 +320,7 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
         ...(phone !== undefined      && { phone }),
         ...(hourly_rate !== undefined && { hourly_rate }),
         manager_id: manager_id !== undefined ? (manager_id || null) : user.manager_id,
+        ...credentialFields,
       },
       select: USER_SELECT,
     });

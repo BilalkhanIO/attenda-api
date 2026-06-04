@@ -2,6 +2,15 @@ import { Request, Response, NextFunction } from 'express';
 import { verifyAccessToken, JwtPayload } from '../utils/auth';
 import { UnauthorizedError, ForbiddenError } from '../utils/response';
 import prisma from '../utils/prisma';
+import {
+  can,
+  hasFeature,
+  legacyRoleHasPermission,
+  resolveOrgFeatures,
+  resolvePlatformPermissions,
+  resolveUserPermissions,
+  type PlanFeatures,
+} from '../services/authorization';
 
 // Extend Express Request
 declare global {
@@ -66,6 +75,46 @@ export function requireRole(...roles: string[]) {
 export const requireManager   = requireRole('manager');
 export const requireHRAdmin   = requireRole('hr_admin');
 export const requireSuperAdmin = requireRole('super_admin');
+
+// ─── Permission gating (with legacy role fallback) ────
+export function requirePermission(...permissionKeys: string[]) {
+  return async (req: Request, _res: Response, next: NextFunction) => {
+    try {
+      if (!req.user) return next(new UnauthorizedError());
+
+      if (req.user.role === 'platform_admin') {
+        const platformPerms = await resolvePlatformPermissions(req.user.sub);
+        if (permissionKeys.some(k => can(platformPerms, k))) return next();
+        return next(new ForbiddenError());
+      }
+
+      const perms = await resolveUserPermissions(req.user.sub, req.user.org_id, req.user.role);
+      if (permissionKeys.some(k => can(perms, k))) return next();
+
+      if (permissionKeys.some(k => legacyRoleHasPermission(req.user!.role, k))) return next();
+
+      return next(new ForbiddenError());
+    } catch (e) {
+      next(e);
+    }
+  };
+}
+
+// ─── Org plan feature gating ──────────────────────────
+export function requireOrgFeature(...featureKeys: string[]) {
+  return async (req: Request, _res: Response, next: NextFunction) => {
+    try {
+      if (!req.user) return next(new UnauthorizedError());
+      if (req.user.role === 'platform_admin') return next(new ForbiddenError());
+
+      const features: PlanFeatures = await resolveOrgFeatures(req.user.org_id);
+      if (featureKeys.every(k => hasFeature(features, k))) return next();
+      return next(new ForbiddenError('Feature not available on your plan'));
+    } catch (e) {
+      next(e);
+    }
+  };
+}
 
 // ─── Org scoping helper ───────────────────────────────
 export function sameOrg(req: Request, orgId: string): boolean {

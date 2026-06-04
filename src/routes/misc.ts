@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { Router } from 'express';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requireOrgFeature, requirePermission } from '../middleware/auth';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
@@ -580,7 +580,7 @@ orgRouter.put('/office-ssids', requireRole('super_admin'), async (req, res, next
 });
 
 // GET /org/whatsapp
-orgRouter.get('/whatsapp', requireRole('super_admin'), async (req, res, next) => {
+orgRouter.get('/whatsapp', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     ok(res, {
@@ -595,7 +595,7 @@ orgRouter.get('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
 });
 
 // PUT /org/whatsapp
-orgRouter.put('/whatsapp', requireRole('super_admin'), async (req, res, next) => {
+orgRouter.put('/whatsapp', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const { enabled, phone_number_id, access_token, groups, events, dept_groups } = req.body;
     const data: Record<string, unknown> = {};
@@ -611,7 +611,7 @@ orgRouter.put('/whatsapp', requireRole('super_admin'), async (req, res, next) =>
 });
 
 // POST /org/whatsapp/test
-orgRouter.post('/whatsapp/test', requireRole('hr_admin'), async (req, res, next) => {
+orgRouter.post('/whatsapp/test', requireRole('hr_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     if (!org?.wa_phone_number_id || !org?.wa_access_token) {
@@ -630,7 +630,7 @@ orgRouter.post('/whatsapp/test', requireRole('hr_admin'), async (req, res, next)
 });
 
 // GET /org/whatsapp/logs
-orgRouter.get('/whatsapp/logs', requireRole('hr_admin'), async (req, res, next) => {
+orgRouter.get('/whatsapp/logs', requireRole('hr_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const { page = '1', limit = '50', event_type, status } = req.query as Record<string, string>;
     const take = Math.min(parseInt(limit) || 50, 200);
@@ -677,7 +677,7 @@ orgRouter.post('/qr-code/regenerate', requireRole('hr_admin'), async (req, res, 
 
 // ─── REPORTS (analytics/generate + download) ──────────
 export const reportsRouter = Router();
-reportsRouter.use(authenticate, requireRole('hr_admin'));
+reportsRouter.use(authenticate, requirePermission('reports.export'));
 
 reportsRouter.post('/:type', async (req, res, next) => {
   try {

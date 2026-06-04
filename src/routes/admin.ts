@@ -81,6 +81,19 @@ router.get('/orgs/pending', async (_req: Request, res: Response, next: NextFunct
   } catch (e) { next(e); }
 });
 
+function mapOrgDetail(org: any) {
+  const base = mapOrg(org);
+  const counts = org._count ?? {};
+  return {
+    ...base,
+    record_counts: {
+      attendance: counts.attendance_records ?? 0,
+      leave:      counts.leave_requests ?? 0,
+      payroll:    counts.payroll_records ?? 0,
+    },
+  };
+}
+
 router.get('/orgs/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUniqueOrThrow({
@@ -96,7 +109,40 @@ router.get('/orgs/:id', async (req: Request, res: Response, next: NextFunction) 
         },
       },
     });
-    ok(res, mapOrg({ ...org, _count: (org as any)._count }));
+    ok(res, mapOrgDetail(org));
+  } catch (e) { next(e); }
+});
+
+// PATCH /admin/orgs/:id — org profile fields
+router.patch('/orgs/:id', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { name, timezone, contact_name, contact_email, company_size, billing_email } = req.body;
+    const data: Record<string, unknown> = {};
+    if (name !== undefined) {
+      if (!String(name).trim()) throw new ValidationError('name is required');
+      data.name = String(name).trim();
+    }
+    if (timezone !== undefined) data.timezone = timezone;
+    if (contact_name !== undefined) data.contact_name = contact_name;
+    if (contact_email !== undefined) data.contact_email = contact_email;
+    if (company_size !== undefined) data.company_size = company_size;
+    if (billing_email !== undefined) data.billing_email = billing_email;
+
+    const org = await prisma.organisation.update({
+      where: { id: req.params.id as string },
+      data,
+      include: {
+        _count: {
+          select: {
+            users:              { where: { deleted_at: null } },
+            attendance_records: true,
+            leave_requests:     true,
+            payroll_records:    true,
+          },
+        },
+      },
+    });
+    ok(res, mapOrgDetail(org));
   } catch (e) { next(e); }
 });
 

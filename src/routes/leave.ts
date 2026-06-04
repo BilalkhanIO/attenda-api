@@ -179,6 +179,14 @@ router.put('/requests/:id/approve', requireRole('manager'), async (req, res, nex
     });
     if (!request) throw new NotFoundError('Leave request');
 
+    if (req.user!.role === 'manager') {
+      const requester = await prisma.user.findFirst({
+        where: { id: request.user_id, org_id: req.user!.org_id, manager_id: req.user!.sub },
+        select: { id: true },
+      });
+      if (!requester) throw new ForbiddenError('You can only approve leave for your direct reports');
+    }
+
     await prisma.$transaction(async (tx) => {
       await tx.leaveRequest.update({
         where: { id: req.params.id },
@@ -263,6 +271,14 @@ router.put('/requests/:id/reject', requireRole('manager'), async (req, res, next
       where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
     });
     if (!request) throw new NotFoundError('Leave request');
+
+    if (req.user!.role === 'manager') {
+      const requester = await prisma.user.findFirst({
+        where: { id: request.user_id, org_id: req.user!.org_id, manager_id: req.user!.sub },
+        select: { id: true },
+      });
+      if (!requester) throw new ForbiddenError('You can only reject leave for your direct reports');
+    }
 
     const updated = await prisma.leaveRequest.update({
       where: { id: req.params.id },

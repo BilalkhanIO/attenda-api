@@ -198,6 +198,40 @@ Paginated:
 
 See `.env.example` for all required variables.
 
+## Dynamic RBAC
+
+Authorization uses a single evaluator in `src/services/authorization.ts`:
+
+**Effective features** = plan `features` merged with `organisations.features_override` (explicit `false` disables a feature).
+
+**Effective permissions** = org role permissions ∪ user `allow` grants − user `deny` grants. During migration, if a user has no `user_org_roles` row, permissions fall back to the legacy `users.role` matrix below.
+
+### Legacy role → permission matrix
+
+| Legacy role | Matches today’s `requireRole` access |
+|-------------|--------------------------------------|
+| `employee` | Self-service only (no manager/HR routes) |
+| `manager` | Team attendance, leave approve, shifts view/breaks/swaps, performance, analytics view, remote approve |
+| `hr_admin` | All manager permissions + employees CRUD, payroll, reports, overtime, WhatsApp test/logs, org QR |
+| `super_admin` | All HR permissions + org settings/office/WhatsApp, custom roles, permission grants |
+
+System org roles (`employee`, `manager`, `hr_admin`, `super_admin`) are seeded per organisation with these permission sets. Assign users via `user_org_roles`; keep `users.role` in sync when using system roles.
+
+### Key API endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/users/me/capabilities` | `{ permissions, features, org_role, platform_permissions }` |
+| GET | `/org/permissions` | Permission catalog |
+| GET/POST/PUT/DELETE | `/org/roles` | Custom org roles |
+| PUT | `/org/roles/:id/permissions` | Role permission matrix |
+| PUT | `/org/users/:userId/role` | Assign org role |
+| GET/PUT | `/users/:id/permissions` | Per-user allow/deny overrides |
+
+Middleware: `requirePermission('key')` and `requireOrgFeature('payroll')` in `src/middleware/auth.ts` (legacy role fallback included).
+
+After schema changes: `npm run db:migrate` then `npm run db:seed` (or `POST /org/roles/ensure-system` for existing orgs).
+
 ## Project Structure
 
 ```

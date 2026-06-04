@@ -128,6 +128,10 @@ async function seed() {
   });
   console.log('✅ Sample leave request created');
 
+  const { seedAllRbac } = await import('./rbac-seed');
+  await seedAllRbac();
+  console.log('✅ RBAC catalog, org roles, and assignments seeded');
+
   console.log('\n🎉 Seed complete!\n');
   console.log('Demo credentials:');
   console.log('  Super Admin: admin@demo.attenda.app  / Demo1234!');

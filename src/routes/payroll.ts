@@ -1,12 +1,12 @@
-// @ts-nocheck
 import { Router } from 'express';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requireOrgFeature } from '../middleware/auth';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfMonth, endOfMonth } from '../utils/auth';
 import prisma from '../utils/prisma';
 
 const router = Router();
 router.use(authenticate);
+router.use(requireOrgFeature('payroll'));
 
 const RECORD_INCLUDE = {
   user: { select: { id: true, name: true, department: true, job_title: true } },

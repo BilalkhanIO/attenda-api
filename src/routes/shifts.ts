@@ -1,11 +1,12 @@
-// @ts-nocheck
 import { Router } from 'express';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requireRole, requireOrgFeature } from '../middleware/auth';
 import { ok, created, noContent, NotFoundError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
 
 const router = Router();
 router.use(authenticate);
+
+// Employee self-service routes (visible without shifts plan feature)
 
 function timeToMins(t: string): number {
   const [h, m] = t.split(':').map(Number);
@@ -18,7 +19,7 @@ const ASSIGN_INCLUDE = {
 };
 
 // ─── GET /shifts ───────────────────────────────────────
-router.get('/', requireRole('manager'), async (req, res, next) => {
+router.get('/', requireOrgFeature('shifts'), requireRole('manager'), async (req, res, next) => {
   try {
     const shifts = await prisma.shift.findMany({
       where: { org_id: req.user!.org_id },
@@ -30,7 +31,7 @@ router.get('/', requireRole('manager'), async (req, res, next) => {
 });
 
 // ─── POST /shifts ──────────────────────────────────────
-router.post('/', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/', requireOrgFeature('shifts'), requireRole('hr_admin'), async (req, res, next) => {
   try {
     const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins } = req.body;
     if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');

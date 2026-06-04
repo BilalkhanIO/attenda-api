@@ -1,0 +1,23 @@
+import { can, hasFeature, legacyRoleHasPermission } from '../../services/authorization';
+
+describe('authorization helpers', () => {
+  it('can checks permission membership', () => {
+    const perms = new Set(['leave.approve', 'employees.view']);
+    expect(can(perms, 'leave.approve')).toBe(true);
+    expect(can(perms, 'payroll.view')).toBe(false);
+  });
+
+  it('hasFeature requires explicit true', () => {
+    expect(hasFeature({ payroll: true, shifts: false }, 'payroll')).toBe(true);
+    expect(hasFeature({ payroll: false }, 'payroll')).toBe(false);
+    expect(hasFeature({}, 'payroll')).toBe(false);
+  });
+
+  it('legacyRoleHasPermission follows hierarchy matrix', () => {
+    expect(legacyRoleHasPermission('manager', 'leave.approve')).toBe(true);
+    expect(legacyRoleHasPermission('employee', 'leave.approve')).toBe(false);
+    expect(legacyRoleHasPermission('hr_admin', 'payroll.view')).toBe(true);
+    expect(legacyRoleHasPermission('super_admin', 'org.roles.manage')).toBe(true);
+    expect(legacyRoleHasPermission('manager', 'org.roles.manage')).toBe(false);
+  });
+});
