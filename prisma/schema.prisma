@@ -216,6 +216,8 @@ model LeaveRequest {
   working_days     Float     // supports 0.5 for half-day
   is_half_day      Boolean   @default(false)
   half_day_period  String?   @db.VarChar(20) // 'morning' | 'afternoon'
+  leave_start_time String?   @db.VarChar(10) // optional HH:MM for mid-shift leave
+  leave_end_time   String?   @db.VarChar(10) // optional HH:MM for mid-shift leave
   reason           String?
   status           String    @default("pending")
   reviewed_by      String?

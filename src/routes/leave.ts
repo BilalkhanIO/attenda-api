@@ -62,7 +62,7 @@ router.get('/requests', requireRole('hr_admin'), async (req, res, next) => {
 //   → start_date = end_date (single day), working_days = 0.5
 router.post('/requests', async (req, res, next) => {
   try {
-    const { leave_type, start_date, end_date, reason, is_half_day, half_day_period } = req.body;
+    const { leave_type, start_date, end_date, reason, is_half_day, half_day_period, leave_start_time, leave_end_time } = req.body;
     if (!leave_type || !start_date || !end_date) throw new ValidationError('leave_type, start_date and end_date required');
 
     const start = new Date(start_date);
@@ -78,7 +78,25 @@ router.post('/requests', async (req, res, next) => {
       }
     }
 
-    const working_days = is_half_day ? 0.5 : calculateWorkingDays(start, end);
+    const hasTimeWindow = !!leave_start_time || !!leave_end_time;
+    if (hasTimeWindow) {
+      if (!leave_start_time || !leave_end_time) throw new ValidationError('leave_start_time and leave_end_time must both be provided');
+      if (start_date !== end_date) throw new ValidationError('Mid-shift leave must be on a single day');
+      if (!/^\d{1,2}:\d{2}$/.test(leave_start_time) || !/^\d{1,2}:\d{2}$/.test(leave_end_time)) {
+        throw new ValidationError('leave_start_time and leave_end_time must be HH:MM');
+      }
+      const toMins = (t: string) => {
+        const [h, m] = t.split(':').map(Number);
+        return h * 60 + m;
+      };
+      if (toMins(leave_end_time) <= toMins(leave_start_time)) {
+        throw new ValidationError('leave_end_time must be after leave_start_time');
+      }
+    }
+
+    const working_days = hasTimeWindow
+      ? Math.max(0.1, Math.round((((leave_end_time.split(':').map(Number)[0] * 60 + leave_end_time.split(':').map(Number)[1]) - (leave_start_time.split(':').map(Number)[0] * 60 + leave_start_time.split(':').map(Number)[1])) / (8 * 60)) * 100) / 100)
+      : is_half_day ? 0.5 : calculateWorkingDays(start, end);
 
     // Check leave balance (skip for unpaid leave)
     if (leave_type !== 'unpaid') {
@@ -115,6 +133,7 @@ router.post('/requests', async (req, res, next) => {
         leave_type, start_date: start, end_date: end, working_days, reason,
         is_half_day: !!is_half_day,
         ...(is_half_day && { half_day_period }),
+        ...(hasTimeWindow && { leave_start_time, leave_end_time }),
       },
       include: LEAVE_INCLUDE,
     });
@@ -122,7 +141,9 @@ router.post('/requests', async (req, res, next) => {
     // Notify manager (in-app)
     const submitter = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true, manager_id: true } });
     if (submitter?.manager_id) {
-      const label = is_half_day ? `a half-day (${half_day_period}) of ${leave_type}` : `${working_days} day(s) of ${leave_type}`;
+      const label = hasTimeWindow
+        ? `${leave_type} leave from ${leave_start_time} to ${leave_end_time}`
+        : is_half_day ? `a half-day (${half_day_period}) of ${leave_type}` : `${working_days} day(s) of ${leave_type}`;
       const { createNotification } = await import('../services/notifications');
       createNotification({
         userId: submitter.manager_id, orgId: req.user!.org_id,
@@ -169,9 +190,10 @@ router.put('/requests/:id/approve', requireRole('manager'), async (req, res, nex
         data: { used_days: { increment: request.working_days } },
       });
       // Update attendance records to 'leave'.
-      // For half-day leave: only set status='half_leave' — the employee is
-      // expected to check in for the other half, so we don't block check-in.
-      const leaveStatus = request.is_half_day ? 'half_leave' : 'leave';
+      // For half-day/timed leave: only set status='half_leave' — the employee
+      // is expected to check in for the remaining shift window.
+      const isPartialLeave = request.is_half_day || !!request.leave_start_time;
+      const leaveStatus = isPartialLeave ? 'half_leave' : 'leave';
       const cur = new Date(request.start_date);
       while (cur <= request.end_date) {
         if (cur.getDay() !== 0 && cur.getDay() !== 6) {
@@ -180,7 +202,7 @@ router.put('/requests/:id/approve', requireRole('manager'), async (req, res, nex
           const existingRecord = await tx.attendanceRecord.findUnique({
             where: { user_id_date: { user_id: request.user_id, date: new Date(cur) } },
           });
-          if (request.is_half_day && existingRecord?.check_in_at) {
+          if (isPartialLeave && existingRecord?.check_in_at) {
             // Employee already checked in — just note the half-leave on the record
             await tx.attendanceRecord.update({
               where: { id: existingRecord.id },

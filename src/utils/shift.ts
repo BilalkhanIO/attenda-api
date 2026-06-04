@@ -41,6 +41,11 @@ export function localDateStr(at: Date, timezone?: string | null): string {
   return `${z.getFullYear()}-${m}-${d}`;
 }
 
+/** A UTC-midnight Date carrying the org-local YYYY-MM-DD for @db.Date fields. */
+export function dateOnlyInTz(at: Date, timezone?: string | null): Date {
+  return new Date(`${localDateStr(at, timezone)}T00:00:00.000Z`);
+}
+
 /**
  * The exact UTC instant of wall-clock `hhmm` on `dateStr` (YYYY-MM-DD) in
  * `timezone`. Used to anchor scheduled_start / scheduled_end correctly
@@ -91,10 +96,10 @@ export function lateMinutes(checkInAt: Date, shift: ShiftLike | null | undefined
   if (!shift) return 0;
   const start  = hhmmToMins(shift.start_time);
   const actual = minutesOfDayInTz(checkInAt, timezone);
-  const diff   = actual - start;
-  // Overnight wrap (e.g. shift starts 22:00, checked in 22:05 reads fine;
-  // a -1380 diff means we crossed midnight — not "23h early").
-  if (diff < -720) return 0;
+  let diff   = actual - start;
+  // Overnight wrap
+  if (diff < -720) diff += 1440;
+  if (diff > 720)  diff -= 1440;
   return Math.max(0, diff);
 }
 
@@ -104,9 +109,9 @@ export function earlyOutMinutes(checkOutAt: Date, shift: ShiftLike | null | unde
   const end    = hhmmToMins(shift.end_time);
   const actual = minutesOfDayInTz(checkOutAt, timezone);
   let diff = end - actual;
-  // For overnight shifts whose end wraps past midnight (end < 120 but actual > 1320),
-  // diff goes to ~ -1400. Add a day's worth of minutes to normalise.
+  // Overnight wrap
   if (diff < -720) diff += 1440;
+  if (diff > 720)  diff -= 1440;
   return Math.max(0, diff);
 }
 
@@ -136,8 +141,10 @@ export function shiftAutoCheckoutDue(
   const end     = hhmmToMins(shift.end_time);
   const buffer  = shift.auto_checkout_buffer_mins ?? 30;
   const nowMins = minutesOfDayInTz(now, timezone);
-  // Only fire on the same calendar day the shift ends (avoids overnight-shift
-  // false positives where nowMins has wrapped past midnight).
-  const diff = nowMins - (end + buffer);
-  return diff >= 0 && diff < 720;
+  let diff = nowMins - (end + buffer);
+  // Overnight wrap
+  if (diff < -720) diff += 1440;
+  if (diff > 720)  diff -= 1440;
+  // Fire if we are past the buffered end, but within a reasonable window (e.g. 2 hours)
+  return diff >= 0 && diff < 120;
 }
