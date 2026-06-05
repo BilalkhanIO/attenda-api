@@ -7,9 +7,24 @@ import {
   sendRemoteNudge, notifyShiftReminder, formatTime12h, notify
 } from '../services/whatsapp';
 import {
-  minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz
+  minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow
 } from '../utils/shift';
 import { settleBreaks, netHoursWorked } from '../utils/attendance';
+
+async function netExtraMinutesAfterShift(attendanceId: string, checkOutAt: Date, shift: any, tz: string): Promise<number> {
+  if (!shift) return 0;
+  const { end } = scheduledWindow(shift, tz, checkOutAt);
+  if (checkOutAt <= end) return 0;
+  const breaks = await prisma.breakRecord.findMany({
+    where: { attendance_id: attendanceId, is_paid: false, break_end: { not: null } },
+  });
+  const unpaidOverlap = breaks.reduce((sum, b) => {
+    const start = b.break_start > end ? b.break_start : end;
+    const stop = b.break_end && b.break_end < checkOutAt ? b.break_end : checkOutAt;
+    return stop > start ? sum + Math.round((stop.getTime() - start.getTime()) / 60000) : sum;
+  }, 0);
+  return Math.max(0, Math.round((checkOutAt.getTime() - end.getTime()) / 60000) - unpaidOverlap);
+}
 
 // ─── Job: Late Arrival Detector ───────────────────────
 export function startLateArrivalDetector() {
@@ -242,6 +257,9 @@ export function startHeartbeatExpiryMonitor() {
         const breaks = await settleBreaks(record.id, checkOut);
         const earlyMins = earlyOutMinutes(checkOut, record.shift, tz);
         const score = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
+        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, record.shift, tz);
+        const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
+        const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
 
         await prisma.attendanceRecord.update({
           where: { id: record.id },
@@ -250,6 +268,8 @@ export function startHeartbeatExpiryMonitor() {
             hours_worked: parseFloat(hoursWorked.toFixed(2)),
             status: 'out',
             net_hours_worked: netHoursWorked(hoursWorked, breaks.unpaidMins),
+            overtime_hours: overtimeHours,
+            extra_office_minutes: autoCountOvertime ? 0 : extraOfficeMins,
             break_minutes: breaks.totalMins,
             paid_break_minutes: breaks.paidMins,
             auto_checked_out: true,
@@ -277,14 +297,18 @@ export function startStaleRecordSweep() {
     try {
       const stale = await prisma.attendanceRecord.findMany({
         where: { date: yesterday, check_in_at: { not: null }, check_out_at: null },
-        include: { shift: true },
+        include: { shift: true, user: { include: { org: { select: { timezone: true } } } } },
       });
 
       for (const record of stale) {
+        const tz = record.user?.org?.timezone || 'UTC';
         const checkOut = record.scheduled_end ? new Date(record.scheduled_end) : new Date(yesterday.getTime() + 23 * 3600000 + 59 * 60000);
         const effectiveOut = checkOut > record.check_in_at! ? checkOut : record.check_in_at!;
         const hoursWorked = (effectiveOut.getTime() - record.check_in_at!.getTime()) / 3600000;
         const breaks = await settleBreaks(record.id, effectiveOut);
+        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, effectiveOut, record.shift, tz);
+        const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
+        const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
 
         await prisma.attendanceRecord.update({
           where: { id: record.id },
@@ -293,6 +317,8 @@ export function startStaleRecordSweep() {
             hours_worked: parseFloat(hoursWorked.toFixed(2)),
             status: 'out',
             net_hours_worked: netHoursWorked(hoursWorked, breaks.unpaidMins),
+            overtime_hours: overtimeHours,
+            extra_office_minutes: autoCountOvertime ? 0 : extraOfficeMins,
             break_minutes: breaks.totalMins,
             paid_break_minutes: breaks.paidMins,
             auto_checked_out: true,
@@ -466,6 +492,7 @@ export function startShiftBreakAutoManager() {
         for (const record of openRecords) {
           const nowMins = minutesOfDayInTz(now, tz);
           for (const tmpl of record.shift?.breaks || []) {
+            if (tmpl.break_kind === 'flexible') continue;
             if (!tmpl.break_start_time || !tmpl.break_end_time) continue;
             const bStart = hhmmToMins(tmpl.break_start_time);
             const bEnd = hhmmToMins(tmpl.break_end_time);
@@ -474,7 +501,7 @@ export function startShiftBreakAutoManager() {
             if (!existing && nowMins >= bStart && nowMins < bEnd) {
               if (!record.break_records.find(br => !br.break_end)) {
                 await prisma.breakRecord.create({
-                  data: { attendance_id: record.id, shift_break_id: tmpl.id, break_start: now, break_type: 'shift_break', is_paid: tmpl.is_paid, auto_started: true },
+                  data: { attendance_id: record.id, shift_break_id: tmpl.id, break_start: now, break_type: tmpl.name || 'shift_break', is_paid: tmpl.is_paid, auto_started: true, source: 'system' },
                 });
               }
             } else if (existing && !existing.break_end && nowMins >= bEnd) {

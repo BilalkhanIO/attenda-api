@@ -47,6 +47,7 @@ model Organisation {
   whatsapp_logs       WhatsappLog[]
   performance_reviews PerformanceReview[]
   overtime_rules      OvertimeRule[]
+  overtime_requests   OvertimeRequest[]
   notifications       InAppNotification[]
   late_arrival_notices LateArrivalNotice[]
   org_roles             OrgRole[]
@@ -101,6 +102,7 @@ model User {
   remote_sessions         RemoteSession[]
   notifications           InAppNotification[]
   late_arrival_notices    LateArrivalNotice[]
+  overtime_requests       OvertimeRequest[]
   org_role_assignment     UserOrgRole?
   permission_grants       UserPermissionGrant[]
   platform_role_assignments PlatformUserRole[]
@@ -119,6 +121,7 @@ model AttendanceRecord {
   status          String    @db.VarChar(20)
   hours_worked    Decimal?  @db.Decimal(5, 2)
   overtime_hours  Decimal   @default(0) @db.Decimal(5, 2)
+  extra_office_minutes Int   @default(0)
   ip_detected     String?   @db.VarChar(50)
   is_overridden              Boolean   @default(false)
   override_by                String?
@@ -151,6 +154,7 @@ model AttendanceRecord {
   late_notice    LateArrivalNotice? @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
   remote_session RemoteSession?
   break_records  BreakRecord[]
+  overtime_request OvertimeRequest?
 
   @@unique([user_id, date])
   @@map("attendance_records")
@@ -167,6 +171,9 @@ model BreakRecord {
   auto_ended      Boolean   @default(false)
   auto_started    Boolean   @default(false)
   shift_break_id  String?
+  limit_exceeded  Boolean   @default(false)
+  counted_as_extra Boolean  @default(false)
+  source          String    @default("manual") @db.VarChar(30)
 
   attendance  AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
   shift_break ShiftBreak?      @relation(fields: [shift_break_id], references: [id], onDelete: SetNull)
@@ -274,6 +281,9 @@ model Shift {
   early_checkout_tolerance_mins Int      @default(15)
   auto_checkout                 Boolean  @default(true)
   auto_checkout_buffer_mins     Int      @default(30)
+  overtime_enabled              Boolean  @default(false)
+  overtime_requires_approval    Boolean  @default(true)
+  extra_time_label              String   @default("Extra office time") @db.VarChar(100)
 
   org                Organisation       @relation(fields: [org_id], references: [id])
   assignments        ShiftAssignment[]
@@ -287,11 +297,18 @@ model ShiftBreak {
   id               String  @id @default(uuid())
   shift_id         String
   name             String  @db.VarChar(100)
+  break_kind       String  @default("fixed") @db.VarChar(20)
   break_minutes    Int
   is_paid          Boolean @default(false)
   after_minutes    Int
   break_start_time String? @db.VarChar(10)
   break_end_time   String? @db.VarChar(10)
+  allowed_count_per_shift Int @default(1)
+  paid_within_limit       Boolean @default(true)
+  deduct_extra_time       Boolean @default(true)
+  allow_extra_breaks      Boolean @default(true)
+  applies_days            Int[] @default([])
+  exception_dates         String[] @default([])
 
   shift         Shift         @relation(fields: [shift_id], references: [id], onDelete: Cascade)
   break_records BreakRecord[]
@@ -333,6 +350,26 @@ model ShiftSwap {
   target_assignment    ShiftAssignment @relation("TargetAssignment", fields: [target_assign_id], references: [id])
 
   @@map("shift_swaps")
+}
+
+model OvertimeRequest {
+  id                String   @id @default(uuid())
+  attendance_id     String   @unique
+  user_id           String
+  org_id            String
+  requested_minutes Int
+  reason            String?
+  status            String   @default("pending") @db.VarChar(20)
+  reviewed_by       String?
+  reviewed_at       DateTime?
+  rejection_reason  String?
+  created_at        DateTime @default(now())
+
+  attendance AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
+  user       User             @relation(fields: [user_id], references: [id])
+  org        Organisation     @relation(fields: [org_id], references: [id])
+
+  @@map("overtime_requests")
 }
 
 model PayrollRecord {

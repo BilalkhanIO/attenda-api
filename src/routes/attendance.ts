@@ -3,7 +3,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requireRole } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
-import { lateThresholdFor, lateMinutes, earlyOutMinutes, adherenceScore, scheduledWindow, dateOnlyInTz } from '../utils/shift';
+import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
 import { settleBreaks, netHoursWorked } from '../utils/attendance';
 import prisma from '../utils/prisma';
 
@@ -12,7 +12,7 @@ router.use(authenticate);
 
 const RECORD_INCLUDE = {
   user:  { select: { id: true, name: true, avatar_url: true, department: true, job_title: true } },
-  shift: { select: { id: true, name: true, start_time: true, end_time: true, color: true } },
+  shift: { select: { id: true, name: true, start_time: true, end_time: true, color: true, overtime_enabled: true, overtime_requires_approval: true, extra_time_label: true } },
 };
 
 async function orgTimeContext(orgId: string) {
@@ -24,11 +24,128 @@ async function orgTimeContext(orgId: string) {
   return { org, timezone, today: dateOnlyInTz(new Date(), timezone) };
 }
 
+function parseDateOnly(value: string, field = 'date'): Date {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new ValidationError(`${field} must be YYYY-MM-DD`);
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (isNaN(parsed.getTime())) throw new ValidationError(`Invalid ${field}`);
+  return parsed;
+}
+
+function dayMatchesBreak(b: any, date: Date): boolean {
+  const day = date.getUTCDay();
+  const dateStr = date.toISOString().split('T')[0];
+  const days = Array.isArray(b.applies_days) ? b.applies_days : [];
+  const dates = Array.isArray(b.exception_dates) ? b.exception_dates : [];
+  return (days.length === 0 || days.includes(day)) && (dates.length === 0 || dates.includes(dateStr));
+}
+
+async function effectiveShiftForUser(userId: string, orgId: string, date: Date, at = new Date(), includeBreaks = false) {
+  const include = includeBreaks ? { breaks: { orderBy: { after_minutes: 'asc' } } } : undefined;
+  const assignment = await prisma.shiftAssignment.findFirst({
+    where: { user_id: userId, date },
+    include: { shift: include ? { include } : true },
+  });
+  if (assignment?.shift) return assignment.shift;
+
+  const weekday = at.getDay();
+  return await prisma.shift.findFirst({
+    where: { org_id: orgId, is_org_wide: true, active_days: { has: weekday }, is_published: true },
+    include,
+  }) || await prisma.shift.findFirst({
+    where: { org_id: orgId, is_default: true, active_days: { has: weekday }, is_published: true },
+    include,
+  });
+}
+
+async function netExtraMinutesAfterShift(attendanceId: string, checkOutAt: Date, shift: any, tz: string): Promise<number> {
+  if (!shift) return 0;
+  const { end } = scheduledWindow(shift, tz, checkOutAt);
+  if (checkOutAt <= end) return 0;
+  const breaks = await prisma.breakRecord.findMany({
+    where: { attendance_id: attendanceId, is_paid: false, break_end: { not: null } },
+  });
+  const unpaidOverlap = breaks.reduce((sum, b) => {
+    const start = b.break_start > end ? b.break_start : end;
+    const stop = b.break_end && b.break_end < checkOutAt ? b.break_end : checkOutAt;
+    return stop > start ? sum + Math.round((stop.getTime() - start.getTime()) / 60000) : sum;
+  }, 0);
+  return Math.max(0, Math.round((checkOutAt.getTime() - end.getTime()) / 60000) - unpaidOverlap);
+}
+
+function minutesToDateOnShiftDay(minutes: number, base: Date, tz: string): Date {
+  const dateStr = dateOnlyInTz(base, tz).toISOString().split('T')[0];
+  const h = Math.floor(minutes / 60) % 24;
+  const m = minutes % 60;
+  const instant = scheduledInstant(dateStr, `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`, tz);
+  return minutes >= 1440 ? new Date(instant.getTime() + 24 * 60 * 60 * 1000) : instant;
+}
+
+function adjustedWindowForLeave(shift: any, tz: string, at: Date, leave?: any | null): { start: Date; end: Date } {
+  const win = scheduledWindow(shift, tz, at);
+  if (!leave || (!leave.is_half_day && !leave.leave_start_time)) return win;
+
+  const startMins = hhmmToMins(shift.start_time);
+  const endMinsRaw = hhmmToMins(shift.end_time);
+  const endMins = endMinsRaw <= startMins ? endMinsRaw + 1440 : endMinsRaw;
+  const midpoint = startMins + Math.round((endMins - startMins) / 2);
+
+  if (leave.leave_start_time && leave.leave_end_time) {
+    const leaveStart = hhmmToMins(leave.leave_start_time);
+    const leaveEnd = hhmmToMins(leave.leave_end_time);
+    return {
+      start: leaveStart <= startMins ? minutesToDateOnShiftDay(leaveEnd, at, tz) : win.start,
+      end: leaveEnd >= endMinsRaw ? minutesToDateOnShiftDay(leaveStart, at, tz) : win.end,
+    };
+  }
+
+  if (leave.is_half_day && leave.half_day_period === 'morning') {
+    return { start: minutesToDateOnShiftDay(midpoint % 1440, at, tz), end: win.end };
+  }
+  if (leave.is_half_day && leave.half_day_period === 'afternoon') {
+    return { start: win.start, end: minutesToDateOnShiftDay(midpoint % 1440, at, tz) };
+  }
+  return win;
+}
+
+async function createAwayGapBreak(record: any, reentryTime: Date, opts: { countAsBreak?: boolean; shiftBreakId?: string | null }) {
+  const gapMins = Math.max(1, Math.round((reentryTime.getTime() - record.check_out_at.getTime()) / 60000));
+  let policy: any = null;
+  if (opts.countAsBreak && opts.shiftBreakId && record.shift_id) {
+    policy = await prisma.shiftBreak.findFirst({
+      where: { id: opts.shiftBreakId, shift_id: record.shift_id },
+    });
+  }
+  const previousCount = policy
+    ? await prisma.breakRecord.count({ where: { attendance_id: record.id, shift_break_id: policy.id } })
+    : 0;
+  const limitExceeded = !!policy && previousCount >= (policy.allowed_count_per_shift ?? 1);
+  const isPaid = policy
+    ? !!policy.is_paid && (limitExceeded ? !policy.deduct_extra_time : policy.paid_within_limit)
+    : false;
+
+  await prisma.breakRecord.create({
+    data: {
+      attendance_id: record.id,
+      shift_break_id: policy?.id ?? undefined,
+      break_start: record.check_out_at,
+      break_end: reentryTime,
+      break_type: policy?.name ?? 'away',
+      duration_mins: gapMins,
+      is_paid: isPaid,
+      limit_exceeded: limitExceeded,
+      counted_as_extra: limitExceeded,
+      source: policy ? 'away_choice' : 'away',
+    },
+  });
+  return { gapMins, policy, limitExceeded };
+}
+
 // ─── GET /attendance/today ─────────────────────────────
 router.get('/today', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawDate = req.query.date as string | undefined;
-    const date = rawDate ? startOfDay(new Date(rawDate)) : startOfDay(new Date());
+    const { today } = await orgTimeContext(req.user!.org_id);
+    const date = rawDate ? parseDateOnly(rawDate) : today;
     const where: Record<string, unknown> = { org_id: req.user!.org_id, date };
     if (req.user!.role === 'manager') {
       const teamIds = await prisma.user.findMany({
@@ -267,25 +384,48 @@ const PAID_BREAK_TYPES = new Set(['rest', 'short', 'prayer']);
 
 router.post('/break/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { break_type = 'rest' } = req.body;
+    const { break_type = 'rest', shift_break_id } = req.body;
     const { today } = await orgTimeContext(req.user!.org_id);
     const record = await prisma.attendanceRecord.findUnique({
       where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      include: { break_records: { where: { break_end: null } } },
+      include: { break_records: true, shift: { include: { breaks: true } } },
     });
     if (!record || !record.check_in_at) throw new AppError('Not checked in', 400, 'NOT_CHECKED_IN');
     if (record.check_out_at) throw new AppError('Already checked out', 400, 'CHECKED_OUT');
-    if (record.break_records.length > 0) throw new AppError('Break already in progress', 400, 'BREAK_IN_PROGRESS');
+    if (record.break_records.some(b => !b.break_end)) throw new AppError('Break already in progress', 400, 'BREAK_IN_PROGRESS');
+
+    const shift = record.shift ?? await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, new Date(), true);
+    const availableBreaks = (shift?.breaks ?? []).filter(b => dayMatchesBreak(b, today));
+    const policy = shift_break_id
+      ? availableBreaks.find(b => b.id === shift_break_id)
+      : availableBreaks.find(b => b.name === break_type || b.id === break_type);
+
+    const takenCount = policy
+      ? record.break_records.filter(b => b.shift_break_id === policy.id).length
+      : record.break_records.filter(b => b.break_type === break_type).length;
+    const allowedCount = policy?.allowed_count_per_shift ?? 1;
+    const limitExceeded = !!policy && policy.break_kind === 'flexible' && takenCount >= allowedCount;
+    const isPaid = policy
+      ? !!policy.is_paid && (limitExceeded ? !policy.deduct_extra_time : policy.paid_within_limit)
+      : PAID_BREAK_TYPES.has(break_type);
 
     const breakRecord = await prisma.breakRecord.create({
       data: {
         attendance_id: record.id,
         break_start: new Date(),
-        break_type,
-        is_paid: PAID_BREAK_TYPES.has(break_type),
+        break_type: policy?.name ?? break_type,
+        is_paid: isPaid,
+        shift_break_id: policy?.id ?? undefined,
+        limit_exceeded: limitExceeded,
+        counted_as_extra: limitExceeded,
+        source: 'manual',
       },
     });
-    ok(res, breakRecord);
+    ok(res, {
+      ...breakRecord,
+      warning: limitExceeded ? 'This is an extra break and may be unpaid by policy.' : null,
+      policy,
+    });
   } catch (e) { next(e); }
 });
 
@@ -337,15 +477,27 @@ router.get('/break/status', async (req: Request, res: Response, next: NextFuncti
     const { today } = await orgTimeContext(req.user!.org_id);
     const record = await prisma.attendanceRecord.findUnique({
       where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      include: { break_records: { orderBy: { break_start: 'asc' } } },
+      include: { break_records: { orderBy: { break_start: 'asc' } }, shift: { include: { breaks: { orderBy: { after_minutes: 'asc' } } } } },
     });
-    if (!record) return ok(res, { on_break: false, breaks: [] });
+    const shift = record?.shift ?? await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, new Date(), true);
+    const availableBreaks = (shift?.breaks ?? []).filter(b => dayMatchesBreak(b, today));
+    if (!record) return ok(res, { on_break: false, breaks: [], available_breaks: availableBreaks });
     const activeBreak = record.break_records.find(b => !b.break_end);
+    const history = record.break_records.map(b => ({
+      ...b,
+      started_at: b.break_start,
+      ended_at: b.break_end,
+      minutes: b.duration_mins,
+    }));
     ok(res, {
       on_break: !!activeBreak,
-      active_break: activeBreak || null,
-      breaks: record.break_records,
+      break_type: activeBreak?.break_type ?? null,
+      started_at: activeBreak?.break_start ?? null,
+      active_break: activeBreak ? { ...activeBreak, started_at: activeBreak.break_start } : null,
+      breaks: history,
       total_break_mins: record.break_minutes,
+      total_break_minutes: record.break_minutes,
+      available_breaks: availableBreaks,
     });
   } catch (e) { next(e); }
 });
@@ -372,14 +524,13 @@ router.post('/late-notice', async (req: Request, res: Response, next: NextFuncti
     if (!date || !expected_time || !reason) throw new ValidationError('date, expected_time and reason required');
     if (!reason.trim() || reason.trim().length < 5) throw new ValidationError('reason must be at least 5 characters');
 
-    const noticeDate = new Date(date);
-    if (isNaN(noticeDate.getTime())) throw new ValidationError('Invalid date');
+    const noticeDate = parseDateOnly(date);
 
     // Validate expected_time format HH:MM
     if (!/^\d{1,2}:\d{2}$/.test(expected_time)) throw new ValidationError('expected_time must be HH:MM');
 
     // Can't submit a notice for a past date (allow today and future)
-    const today = startOfDay(new Date());
+    const { today } = await orgTimeContext(req.user!.org_id);
     if (noticeDate < today) throw new ValidationError('Cannot submit a late notice for a past date');
 
     const notice = await prisma.lateArrivalNotice.upsert({
@@ -420,7 +571,7 @@ router.post('/late-notice', async (req: Request, res: Response, next: NextFuncti
 // Manager/HR: view pending late notices for the org (today + future)
 router.get('/late-notices', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const today = startOfDay(new Date());
+    const { today } = await orgTimeContext(req.user!.org_id);
     const { status } = req.query as { status?: string };
 
     const isManager = req.user!.role === 'manager';
@@ -496,23 +647,13 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
     const now   = new Date();
     const { org, timezone: tz, today } = await orgTimeContext(req.user!.org_id);
 
-    // Find today's shift assignment
-    const assignment = await prisma.shiftAssignment.findFirst({
-      where: { user_id: req.user!.sub, date: today },
-      include: {
-        shift: {
-          include: { breaks: { orderBy: { after_minutes: 'asc' } } },
-        },
-      },
-    });
-
     // Find today's attendance record (with active break)
     const record = await prisma.attendanceRecord.findUnique({
       where: { user_id_date: { user_id: req.user!.sub, date: today } },
       include: { break_records: { orderBy: { break_start: 'asc' } } },
     });
 
-    const shift = assignment?.shift ?? null;
+    const shift = await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, now, true);
 
     // ── Break timing enrichment ─────────────────────────
     // Convert "HH:mm" wall-clock string to today's UTC Date in org timezone
@@ -528,7 +669,7 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
 
     const activeBreak = record?.break_records.find(b => !b.break_end) ?? null;
 
-    const enrichedBreaks = (shift?.breaks ?? []).map(sb => {
+    const enrichedBreaks = (shift?.breaks ?? []).filter(sb => dayMatchesBreak(sb, today)).map(sb => {
       // Determine break window in UTC
       let breakStartUtc: Date | null = null;
       let breakEndUtc:   Date | null = null;
@@ -597,7 +738,12 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
     let shift_start_utc: string | null = null;
     let shift_end_utc: string | null = null;
     if (!record?.check_in_at && shift) {
-      const rawLate = lateMinutes(now, shift, tz);
+      const approvedLeave = await prisma.leaveRequest.findFirst({
+        where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
+        select: { is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
+      });
+      const adjusted = adjustedWindowForLeave(shift, tz, now, approvedLeave);
+      const rawLate = Math.max(0, Math.round((now.getTime() - adjusted.start.getTime()) / 60000));
       pre_checkin_late_minutes = rawLate > lateThresholdFor(shift, org) ? rawLate : 0;
     }
     if (shift) {
@@ -613,6 +759,9 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
         start_time: shift.start_time,
         end_time:   shift.end_time,
         color:      shift.color,
+        overtime_enabled: shift.overtime_enabled,
+        overtime_requires_approval: shift.overtime_requires_approval,
+        extra_time_label: shift.extra_time_label,
         breaks:     enrichedBreaks,
         shift_start_utc,
         shift_end_utc,
@@ -626,6 +775,8 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
         early_out_minutes: record.early_out_minutes,
         early_checkin_minutes: record.early_checkin_minutes,
         net_hours_worked: record.net_hours_worked,
+        overtime_hours: record.overtime_hours,
+        extra_office_minutes: record.extra_office_minutes,
         break_minutes: record.break_minutes,
         paid_break_minutes: record.paid_break_minutes,
         break_records: record.break_records,
@@ -667,7 +818,7 @@ router.get('/leave-check', async (req: Request, res: Response, next: NextFunctio
 // ─── POST /attendance/checkin ──────────────────────────
 router.post('/checkin', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { type = 'manual', qr_code, duration_type = 'full_day' } = req.body;
+    const { type = 'manual', qr_code, duration_type = 'full_day', count_away_as_break, away_shift_break_id } = req.body;
     const { org: orgInfo, timezone: orgTimezone, today } = await orgTimeContext(req.user!.org_id);
     // Capture client IP — prefer X-Forwarded-For (behind proxy/load balancer)
     const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || null;
@@ -682,16 +833,9 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     // unpaid 'away' break and reopen the record so the rest of the day continues.
     if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
       const reentryTime = new Date();
-      const gapMins = Math.max(1, Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000));
-      await prisma.breakRecord.create({
-        data: {
-          attendance_id: existing.id,
-          break_start:   existing.check_out_at,
-          break_end:     reentryTime,
-          break_type:    'away',
-          duration_mins: gapMins,
-          is_paid:       false,
-        },
+      const { gapMins, limitExceeded } = await createAwayGapBreak(existing, reentryTime, {
+        countAsBreak: !!count_away_as_break,
+        shiftBreakId: away_shift_break_id,
       });
       const reopened = await prisma.attendanceRecord.update({
         where: { id: existing.id },
@@ -712,7 +856,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
         notifyCheckIn(req.user!.org_id, reopened.user.name, formatTime12h(reentryTime), reopened.user.department ?? undefined).catch(console.error);
       }
-      return ok(res, reopened);
+      return ok(res, { ...reopened, action: 're_entered', gap_mins: gapMins, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
     }
 
     if (existing?.check_in_at) {
@@ -738,7 +882,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     // Full-day leave: allow check-in but flag is_on_approved_leave=true + notify manager.
     const approvedLeave = await prisma.leaveRequest.findFirst({
       where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
-      select: { id: true, leave_type: true, is_half_day: true, half_day_period: true },
+      select: { id: true, leave_type: true, is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
     });
     // Half-day leave: not an override — employee IS expected to show up for the other half
     const isFullDayLeaveOverride = !!approvedLeave && !approvedLeave.is_half_day;
@@ -761,29 +905,15 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     let shiftId: string | null = null;
 
     if (type !== 'remote') {
-      const weekday = now.getDay();
-      const assignment = await prisma.shiftAssignment.findFirst({
-        where: { user_id: req.user!.sub, date: today },
-        include: { shift: true },
-      });
-
-      let shift = assignment?.shift;
-      if (!shift) {
-        shift = await prisma.shift.findFirst({
-          where: { org_id: req.user!.org_id, is_org_wide: true, active_days: { has: weekday }, is_published: true },
-        }) || await prisma.shift.findFirst({
-          where: { org_id: req.user!.org_id, is_default: true, active_days: { has: weekday }, is_published: true },
-        }) || undefined;
-      }
+      const shift = await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, now);
 
       if (shift) {
         shiftId = shift.id;
-        lateMins = lateMinutes(now, shift, orgTimezone);
-        if (lateMins > lateThresholdFor(shift, orgInfo)) status = 'late';
-
-        const win = scheduledWindow(shift, orgTimezone, now);
+        const win = adjustedWindowForLeave(shift, orgTimezone, now, approvedLeave);
         scheduledStart = win.start;
         scheduledEnd = win.end;
+        lateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
+        if (lateMins > lateThresholdFor(shift, orgInfo)) status = 'late';
 
         if (scheduledStart && now < scheduledStart) {
           earlyCheckinMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
@@ -954,16 +1084,29 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
     // Settle breaks (close any open break) and compute net hours
     const breaks   = await settleBreaks(record.id, now);
     const netHours = netHoursWorked(hoursWorked, breaks.unpaidMins);
+    const approvedLeave = await prisma.leaveRequest.findFirst({
+      where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
+      select: { is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
+    });
 
     // Shift-based compliance on checkout (timezone-aware)
-    const earlyMins = earlyOutMinutes(now, record.shift, orgTimezone);
+    const earlyMins = record.shift
+      ? Math.max(0, Math.round((adjustedWindowForLeave(record.shift, orgTimezone, now, approvedLeave).end.getTime() - now.getTime()) / 60000))
+      : earlyOutMinutes(now, record.shift, orgTimezone);
     const score     = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
+    const extraOfficeMins = await netExtraMinutesAfterShift(record.id, now, record.shift, orgTimezone);
+    const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
+    const overtimeHours = autoCountOvertime
+      ? parseFloat((extraOfficeMins / 60).toFixed(2))
+      : 0;
 
     const updated = await prisma.attendanceRecord.update({
       where: { id: record.id },
       data: {
         check_out_at: now, hours_worked: hoursWorked, status: 'out',
         net_hours_worked: netHours,
+        overtime_hours: overtimeHours,
+        extra_office_minutes: autoCountOvertime ? 0 : extraOfficeMins,
         break_minutes: breaks.totalMins, paid_break_minutes: breaks.paidMins,
         early_out_minutes: earlyMins,
         ...(score != null && { adherence_score: score }),
@@ -1053,7 +1196,7 @@ router.post('/heartbeat', async (req: Request, res: Response, next: NextFunction
 // SSID matching is preferred — more reliable than IP for orgs without static IPs.
 router.post('/ip-event', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { event, ip, ssid } = req.body;
+    const { event, ip, ssid, count_away_as_break, away_shift_break_id } = req.body;
     if (!event) throw new ValidationError('event is required');
     if (!ip && !ssid) throw new ValidationError('ip or ssid is required');
     const { today } = await orgTimeContext(req.user!.org_id);
@@ -1085,18 +1228,18 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
         let scheduledStart: Date | null = null;
         let scheduledEnd:   Date | null = null;
         let shiftId: string | null = null;
-        const assignment = await prisma.shiftAssignment.findFirst({
-          where: { user_id: req.user!.sub, date: today },
-          include: { shift: true },
+        const shift = await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, now);
+        const approvedLeave = await prisma.leaveRequest.findFirst({
+          where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
+          select: { is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
         });
-        if (assignment?.shift) {
-          const shift = assignment.shift;
+        if (shift) {
           shiftId  = shift.id;
-          lateMins = lateMinutes(now, shift, org?.timezone);
-          if (lateMins > lateThresholdFor(shift, org)) status = 'late';
-          const win = scheduledWindow(shift, org?.timezone, now);
+          const win = adjustedWindowForLeave(shift, org?.timezone ?? 'UTC', now, approvedLeave);
           scheduledStart = win.start;
           scheduledEnd   = win.end;
+          lateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
+          if (lateMins > lateThresholdFor(shift, org)) status = 'late';
         }
 
         let earlyIpMins = 0;
@@ -1185,16 +1328,9 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
       // Re-entry after WiFi dropout: employee was auto-checked out and has reconnected.
       if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
         const reentryTime = new Date();
-        const gapMins = Math.max(1, Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000));
-        await prisma.breakRecord.create({
-          data: {
-            attendance_id: existing.id,
-            break_start:   existing.check_out_at,
-            break_end:     reentryTime,
-            break_type:    'away',
-            duration_mins: gapMins,
-            is_paid:       false,
-          },
+        const { gapMins, limitExceeded } = await createAwayGapBreak(existing, reentryTime, {
+          countAsBreak: !!count_away_as_break,
+          shiftBreakId: away_shift_break_id,
         });
         await prisma.attendanceRecord.update({
           where: { id: existing.id },
@@ -1216,7 +1352,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
           notifyCheckIn(req.user!.org_id, reu.name, formatTime12h(reentryTime)).catch(console.error);
         }
-        return ok(res, { action: 're_entered', gap_mins: gapMins });
+        return ok(res, { action: 're_entered', gap_mins: gapMins, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
       }
 
       return ok(res, { action: 'already_in' });
@@ -1269,10 +1405,12 @@ router.get('/report/export', requireRole('hr_admin'), async (req: Request, res: 
   try {
     const { start_date, end_date, department } = req.query as Record<string, string>;
     if (!start_date || !end_date) throw new ValidationError('start_date and end_date required');
+    const startDate = parseDateOnly(start_date, 'start_date');
+    const endDate = parseDateOnly(end_date, 'end_date');
 
     const where: Record<string, unknown> = {
       org_id: req.user!.org_id,
-      date: { gte: new Date(start_date), lte: new Date(end_date) },
+      date: { gte: startDate, lte: endDate },
     };
     if (department) {
       const deptUsers = await prisma.user.findMany({ where: { org_id: req.user!.org_id, department }, select: { id: true } });
@@ -1301,19 +1439,8 @@ router.get('/:userId', requireRole('manager'), async (req: Request, res: Respons
     const where: Record<string, unknown> = { user_id: userId };
     if (start || end) {
       where.date = {};
-      if (start) (where.date as Record<string, unknown>).gte = new Date(start);
-      if (end)   (where.date as Record<string, unknown>).lte = new Date(end);
-    }
-
-    const records = await prisma.attendanceRecord.findMany({
-      where, include: RECORD_INCLUDE, orderBy: { date: 'desc' }, take: 90,
-    });
-    ok(res, records);
-  } catch (e) { next(e); }
-});
-
-export default router;
-<string, unknown>).lte = new Date(end);
+      if (start) (where.date as Record<string, unknown>).gte = parseDateOnly(start, 'start');
+      if (end)   (where.date as Record<string, unknown>).lte = parseDateOnly(end, 'end');
     }
 
     const records = await prisma.attendanceRecord.findMany({

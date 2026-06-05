@@ -43,6 +43,7 @@ export async function settleBreaks(attendanceId: string, at: Date): Promise<Brea
     let missingUnpaid = 0;
     
     for (const shiftBreak of attendance.shift.breaks) {
+      if (shiftBreak.break_kind === 'flexible') continue;
       if (shiftBreak.is_paid || minutesSinceCheckIn <= shiftBreak.after_minutes) continue;
       const takenForTemplate = all
         .filter(b => b.shift_break_id === shiftBreak.id)

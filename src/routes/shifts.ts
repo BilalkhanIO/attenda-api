@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authenticate, requireRole, requireOrgFeature } from '../middleware/auth';
+import { authenticate, requireOrgFeature, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, NotFoundError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
 
@@ -13,13 +13,73 @@ function timeToMins(t: string): number {
   return h * 60 + m;
 }
 
+function parseDateOnly(value: string, field = 'date'): Date {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) throw new ValidationError(`${field} must be YYYY-MM-DD`);
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  if (isNaN(parsed.getTime())) throw new ValidationError(`Invalid ${field}`);
+  return parsed;
+}
+
+function startOfCurrentWeek(): Date {
+  const d = new Date();
+  const utc = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  utc.setUTCDate(utc.getUTCDate() - ((utc.getUTCDay() + 6) % 7));
+  return utc;
+}
+
+function addUtcDays(date: Date, days: number): Date {
+  const next = new Date(date);
+  next.setUTCDate(next.getUTCDate() + days);
+  return next;
+}
+
 const ASSIGN_INCLUDE = {
   shift: true,
   user: { select: { id: true, name: true, avatar_url: true, department: true } },
 };
 
+function readBreakPolicy(body: Record<string, unknown>, shiftStart: string, existing?: { break_kind?: string | null; break_start_time?: string | null; break_end_time?: string | null; break_minutes?: number | null; after_minutes?: number | null; allowed_count_per_shift?: number | null; paid_within_limit?: boolean | null; deduct_extra_time?: boolean | null; allow_extra_breaks?: boolean | null; applies_days?: number[] | null; exception_dates?: string[] | null }) {
+  const breakKind = String(body.break_kind ?? body.kind ?? existing?.break_kind ?? 'fixed');
+  if (!['fixed', 'flexible'].includes(breakKind)) throw new ValidationError('break_kind must be fixed or flexible');
+
+  const startTime = body.start_time as string | undefined;
+  const endTime = body.end_time as string | undefined;
+  let afterMinutes = 0;
+  let breakMinutes = Number(body.break_minutes ?? body.duration_minutes ?? existing?.break_minutes ?? 0);
+  let breakStartTime: string | null | undefined = startTime ?? existing?.break_start_time ?? null;
+  let breakEndTime: string | null | undefined = endTime ?? existing?.break_end_time ?? null;
+
+  if (breakKind === 'fixed') {
+    if (!breakStartTime || !breakEndTime) throw new ValidationError('start_time and end_time required for fixed breaks');
+    afterMinutes = timeToMins(breakStartTime) - timeToMins(shiftStart);
+    breakMinutes = timeToMins(breakEndTime) - timeToMins(breakStartTime);
+    if (breakMinutes <= 0) throw new ValidationError('end_time must be after start_time');
+  } else {
+    if (!breakMinutes || breakMinutes <= 0) throw new ValidationError('duration_minutes is required for flexible breaks');
+    afterMinutes = Number(body.after_minutes ?? existing?.after_minutes ?? 0);
+    breakStartTime = null;
+    breakEndTime = null;
+  }
+
+  const appliesDays = Array.isArray(body.applies_days) ? body.applies_days.map(Number) : (existing?.applies_days ?? []);
+  const exceptionDates = Array.isArray(body.exception_dates) ? body.exception_dates.map(String) : (existing?.exception_dates ?? []);
+  return {
+    break_kind: breakKind,
+    break_minutes: breakMinutes,
+    after_minutes: afterMinutes,
+    break_start_time: breakStartTime,
+    break_end_time: breakEndTime,
+    allowed_count_per_shift: Number(body.allowed_count_per_shift ?? existing?.allowed_count_per_shift ?? 1),
+    paid_within_limit: body.paid_within_limit !== undefined ? !!body.paid_within_limit : (existing?.paid_within_limit ?? true),
+    deduct_extra_time: body.deduct_extra_time !== undefined ? !!body.deduct_extra_time : (existing?.deduct_extra_time ?? true),
+    allow_extra_breaks: body.allow_extra_breaks !== undefined ? !!body.allow_extra_breaks : (existing?.allow_extra_breaks ?? true),
+    applies_days: appliesDays,
+    exception_dates: exceptionDates,
+  };
+}
+
 // ─── GET /shifts ───────────────────────────────────────
-router.get('/', requireOrgFeature('shifts'), requireRole('manager'), async (req, res, next) => {
+router.get('/', requireOrgFeature('shifts'), requirePermission('shifts.view'), async (req, res, next) => {
   try {
     const shifts = await prisma.shift.findMany({
       where: { org_id: req.user!.org_id },
@@ -31,9 +91,9 @@ router.get('/', requireOrgFeature('shifts'), requireRole('manager'), async (req,
 });
 
 // ─── POST /shifts ──────────────────────────────────────
-router.post('/', requireOrgFeature('shifts'), requireRole('hr_admin'), async (req, res, next) => {
+router.post('/', requireOrgFeature('shifts'), requirePermission('shifts.manage'), async (req, res, next) => {
   try {
-    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins } = req.body;
+    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, overtime_enabled, overtime_requires_approval, extra_time_label, is_org_wide, is_default } = req.body;
     if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
     const shift = await prisma.shift.create({
       data: {
@@ -46,6 +106,11 @@ router.post('/', requireOrgFeature('shifts'), requireRole('hr_admin'), async (re
         ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
         ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
         ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
+        ...(overtime_enabled !== undefined && { overtime_enabled: !!overtime_enabled }),
+        ...(overtime_requires_approval !== undefined && { overtime_requires_approval: !!overtime_requires_approval }),
+        ...(extra_time_label !== undefined && { extra_time_label: String(extra_time_label || 'Extra office time') }),
+        ...(is_org_wide !== undefined && { is_org_wide: !!is_org_wide }),
+        ...(is_default !== undefined && { is_default: !!is_default }),
       },
     });
     created(res, shift);
@@ -53,51 +118,40 @@ router.post('/', requireOrgFeature('shifts'), requireRole('hr_admin'), async (re
 });
 
 // ─── POST /shifts/:id/breaks ───────────────────────────
-router.post('/:id/breaks', requireRole('manager'), async (req, res, next) => {
+router.post('/:id/breaks', requirePermission('shifts.breaks.manage'), async (req, res, next) => {
   try {
-    const { name, start_time, end_time, is_paid } = req.body;
-    if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
+    const { name, is_paid } = req.body;
+    if (!name) throw new ValidationError('name required');
     const shift = await prisma.shift.findUnique({ where: { id: req.params.id as string } });
     if (!shift || shift.org_id !== req.user!.org_id) throw new NotFoundError('Shift');
-    const after_minutes = timeToMins(start_time) - timeToMins(shift.start_time);
-    const break_minutes = timeToMins(end_time) - timeToMins(start_time);
-    if (break_minutes <= 0) throw new ValidationError('end_time must be after start_time');
+    const policy = readBreakPolicy(req.body, shift.start_time);
     const b = await prisma.shiftBreak.create({
-      data: { shift_id: shift.id, name, break_minutes, is_paid: !!is_paid, after_minutes, break_start_time: start_time, break_end_time: end_time },
+      data: { shift_id: shift.id, name, is_paid: !!is_paid, ...policy },
     });
     created(res, b);
   } catch (e) { next(e); }
 });
 
 // ─── PUT /shifts/:shiftId/breaks/:breakId ─────────────
-router.put('/:shiftId/breaks/:breakId', requireRole('manager'), async (req, res, next) => {
+router.put('/:shiftId/breaks/:breakId', requirePermission('shifts.breaks.manage'), async (req, res, next) => {
   try {
-    const { name, start_time, end_time, is_paid } = req.body;
+    const { name, is_paid } = req.body;
     const b = await prisma.shiftBreak.findFirst({
       where: { id: req.params.breakId as string, shift: { org_id: req.user!.org_id } },
       include: { shift: true },
     });
     if (!b) throw new NotFoundError('ShiftBreak');
-    const timeData: Record<string, unknown> = {};
-    if (start_time || end_time) {
-      if (!start_time || !end_time) throw new ValidationError('start_time and end_time must both be provided together');
-      const bm = timeToMins(end_time) - timeToMins(start_time);
-      if (bm <= 0) throw new ValidationError('end_time must be after start_time');
-      timeData.break_minutes    = bm;
-      timeData.after_minutes    = timeToMins(start_time) - timeToMins(b.shift.start_time);
-      timeData.break_start_time = start_time;
-      timeData.break_end_time   = end_time;
-    }
+    const policy = readBreakPolicy(req.body, b.shift.start_time, b);
     const updated = await prisma.shiftBreak.update({
       where: { id: b.id },
-      data: { ...(name !== undefined && { name }), ...(is_paid !== undefined && { is_paid: !!is_paid }), ...timeData },
+      data: { ...(name !== undefined && { name }), ...(is_paid !== undefined && { is_paid: !!is_paid }), ...policy },
     });
     ok(res, updated);
   } catch (e) { next(e); }
 });
 
 // ─── DELETE /shifts/:shiftId/breaks/:breakId ──────────
-router.delete('/:shiftId/breaks/:breakId', requireRole('manager'), async (req, res, next) => {
+router.delete('/:shiftId/breaks/:breakId', requirePermission('shifts.breaks.manage'), async (req, res, next) => {
   try {
     const b = await prisma.shiftBreak.findFirst({
       where: { id: req.params.breakId as string, shift: { org_id: req.user!.org_id } },
@@ -109,11 +163,11 @@ router.delete('/:shiftId/breaks/:breakId', requireRole('manager'), async (req, r
 });
 
 // ─── PUT /shifts/:id ───────────────────────────────────
-router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
+router.put('/:id', requirePermission('shifts.manage'), async (req, res, next) => {
   try {
     const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
-    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, is_org_wide, is_default } = req.body;
+    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, overtime_enabled, overtime_requires_approval, extra_time_label, is_org_wide, is_default } = req.body;
 
     if (is_default && !shift.is_default) {
       await prisma.shift.updateMany({ where: { org_id: req.user!.org_id }, data: { is_default: false } });
@@ -132,6 +186,9 @@ router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
         ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
         ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
         ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
+        ...(overtime_enabled !== undefined && { overtime_enabled: !!overtime_enabled }),
+        ...(overtime_requires_approval !== undefined && { overtime_requires_approval: !!overtime_requires_approval }),
+        ...(extra_time_label !== undefined && { extra_time_label: String(extra_time_label || 'Extra office time') }),
       },
     });
     ok(res, updated);
@@ -139,7 +196,7 @@ router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // ─── PUT /shifts/:id/set-default ──────────────────────
-router.put('/:id/set-default', requireRole('hr_admin'), async (req, res, next) => {
+router.put('/:id/set-default', requirePermission('shifts.manage'), async (req, res, next) => {
   try {
     const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
@@ -154,7 +211,7 @@ router.put('/:id/set-default', requireRole('hr_admin'), async (req, res, next) =
 });
 
 // ─── DELETE /shifts/:id ────────────────────────────────
-router.delete('/:id', requireRole('hr_admin'), async (req, res, next) => {
+router.delete('/:id', requirePermission('shifts.manage'), async (req, res, next) => {
   try {
     const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
@@ -164,11 +221,11 @@ router.delete('/:id', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // ─── GET /shifts/schedule ──────────────────────────────
-router.get('/schedule', requireRole('manager'), async (req, res, next) => {
+router.get('/schedule', requirePermission('shifts.view'), async (req, res, next) => {
   try {
     const { week_start } = req.query as { week_start?: string };
-    const ws = week_start ? new Date(week_start) : (() => { const d = new Date(); d.setDate(d.getDate() - d.getDay() + 1); return d; })();
-    const we = new Date(ws); we.setDate(we.getDate() + 6);
+    const ws = week_start ? parseDateOnly(week_start, 'week_start') : startOfCurrentWeek();
+    const we = addUtcDays(ws, 6);
 
     const assignments = await prisma.shiftAssignment.findMany({
       where: { date: { gte: ws, lte: we }, shift: { org_id: req.user!.org_id } },
@@ -180,11 +237,11 @@ router.get('/schedule', requireRole('manager'), async (req, res, next) => {
 });
 
 // ─── GET /shifts/assignments ───────────────────────────
-router.get('/assignments', requireRole('manager'), async (req, res, next) => {
+router.get('/assignments', requirePermission('shifts.view'), async (req, res, next) => {
   try {
     const { week_start, department } = req.query as Record<string, string>;
-    const ws = week_start ? new Date(week_start) : (() => { const d = new Date(); d.setDate(d.getDate() - d.getDay() + 1); return d; })();
-    const we = new Date(ws); we.setDate(we.getDate() + 6);
+    const ws = week_start ? parseDateOnly(week_start, 'week_start') : startOfCurrentWeek();
+    const we = addUtcDays(ws, 6);
 
     const where: Record<string, unknown> = { date: { gte: ws, lte: we }, shift: { org_id: req.user!.org_id } };
     if (department) {
@@ -198,13 +255,12 @@ router.get('/assignments', requireRole('manager'), async (req, res, next) => {
 });
 
 // ─── POST /shifts/assignments ──────────────────────────
-router.post('/assignments', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/assignments', requirePermission('shifts.assign'), async (req, res, next) => {
   try {
     const { user_id, shift_id, date } = req.body;
     if (!user_id || !shift_id || !date) throw new ValidationError('user_id, shift_id and date required');
 
-    const assignDate = new Date(date);
-    if (isNaN(assignDate.getTime())) throw new ValidationError('Invalid date');
+    const assignDate = parseDateOnly(date);
 
     // Both the employee and the shift must belong to the caller's org
     const [user, shift] = await Promise.all([
@@ -241,7 +297,7 @@ router.post('/assignments', requireRole('hr_admin'), async (req, res, next) => {
 
 // ─── PUT /shifts/assignments/:id ──────────────────────
 // Change the shift or date of an existing assignment.
-router.put('/assignments/:id', requireRole('hr_admin'), async (req, res, next) => {
+router.put('/assignments/:id', requirePermission('shifts.assign'), async (req, res, next) => {
   try {
     const assignment = await prisma.shiftAssignment.findFirst({
       where: { id: req.params.id, shift: { org_id: req.user!.org_id } },
@@ -258,8 +314,7 @@ router.put('/assignments/:id', requireRole('hr_admin'), async (req, res, next) =
     }
 
     if (date) {
-      const assignDate = new Date(date);
-      if (isNaN(assignDate.getTime())) throw new ValidationError('Invalid date');
+      const assignDate = parseDateOnly(date);
 
       // Conflict check: ensure no other assignment exists for this user on the new date
       const conflict = await prisma.shiftAssignment.findFirst({
@@ -280,10 +335,54 @@ router.put('/assignments/:id', requireRole('hr_admin'), async (req, res, next) =
   } catch (e) { next(e); }
 });
 
+// ─── GET /shifts/assignments/:id/detail ───────────────
+router.get('/assignments/:id/detail', async (req, res, next) => {
+  try {
+    const assignment = await prisma.shiftAssignment.findFirst({
+      where: {
+        id: req.params.id,
+        ...(req.user!.role === 'employee'
+          ? { user_id: req.user!.sub }
+          : { shift: { org_id: req.user!.org_id } }),
+      },
+      include: {
+        shift: { include: { breaks: { orderBy: { after_minutes: 'asc' } } } },
+        user: { select: { id: true, name: true, avatar_url: true, department: true, job_title: true } },
+      },
+    });
+    if (!assignment) throw new NotFoundError('Assignment');
+
+    const attendance = await prisma.attendanceRecord.findUnique({
+      where: { user_id_date: { user_id: assignment.user_id, date: assignment.date } },
+      include: { break_records: { orderBy: { break_start: 'asc' } } },
+    });
+
+    ok(res, {
+      assignment,
+      shift: assignment.shift,
+      user: assignment.user,
+      attendance,
+      history: attendance ? {
+        check_in_at: attendance.check_in_at,
+        check_out_at: attendance.check_out_at,
+        late_minutes: attendance.late_minutes,
+        early_out_minutes: attendance.early_out_minutes,
+        early_checkin_minutes: attendance.early_checkin_minutes,
+        break_minutes: attendance.break_minutes,
+        paid_break_minutes: attendance.paid_break_minutes,
+        net_hours_worked: attendance.net_hours_worked,
+        overtime_hours: attendance.overtime_hours,
+        extra_office_minutes: attendance.extra_office_minutes,
+        breaks: attendance.break_records,
+      } : null,
+    });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /shifts/assignments/bulk ────────────────────
 // Assign a shift to multiple employees across multiple dates in one call.
 // Returns created assignments, skipped conflicts, and leave/off-day warnings.
-router.post('/assignments/bulk', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/assignments/bulk', requirePermission('shifts.assign'), async (req, res, next) => {
   try {
     const { user_ids, shift_id, dates } = req.body;
     if (!Array.isArray(user_ids) || user_ids.length === 0) throw new ValidationError('user_ids array required');
@@ -300,11 +399,7 @@ router.post('/assignments/bulk', requireRole('hr_admin'), async (req, res, next)
     });
     if (users.length !== user_ids.length) throw new ValidationError('One or more employees not found in your organisation');
 
-    const parsedDates = dates.map((d: string) => {
-      const dt = new Date(d);
-      if (isNaN(dt.getTime())) throw new ValidationError(`Invalid date: ${d}`);
-      return dt;
-    });
+    const parsedDates = dates.map((d: string) => parseDateOnly(d));
 
     // Pre-fetch existing assignments and approved leave to avoid N+1 checks
     const existingAssignments = await prisma.shiftAssignment.findMany({
@@ -360,7 +455,7 @@ router.post('/assignments/bulk', requireRole('hr_admin'), async (req, res, next)
 });
 
 // ─── DELETE /shifts/assignments/:id ───────────────────
-router.delete('/assignments/:id', requireRole('hr_admin'), async (req, res, next) => {
+router.delete('/assignments/:id', requirePermission('shifts.assign'), async (req, res, next) => {
   try {
     const assignment = await prisma.shiftAssignment.findFirst({
       where: { id: req.params.id, shift: { org_id: req.user!.org_id } },
@@ -372,11 +467,11 @@ router.delete('/assignments/:id', requireRole('hr_admin'), async (req, res, next
 });
 
 // ─── POST /shifts/schedule/publish ────────────────────
-router.post('/schedule/publish', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/schedule/publish', requirePermission('shifts.assign'), async (req, res, next) => {
   try {
     const { week_start } = req.body;
-    const ws = week_start ? new Date(week_start) : (() => { const d = new Date(); d.setDate(d.getDate() - d.getDay() + 1); return d; })();
-    const we = new Date(ws); we.setDate(we.getDate() + 6);
+    const ws = week_start ? parseDateOnly(week_start, 'week_start') : startOfCurrentWeek();
+    const we = addUtcDays(ws, 6);
 
     // Get all assignments for the week and notify employees
     const assignments = await prisma.shiftAssignment.findMany({
@@ -421,8 +516,9 @@ router.post('/schedule/publish', requireRole('hr_admin'), async (req, res, next)
 // ─── GET /shifts/assignments/me ────────────────────────
 router.get('/assignments/me', async (req, res, next) => {
   try {
-    const future = new Date(); future.setDate(future.getDate() - 1);
-    const until  = new Date(); until.setDate(until.getDate() + 28);
+    const today = parseDateOnly(new Date().toISOString().split('T')[0]);
+    const future = addUtcDays(today, -1);
+    const until  = addUtcDays(today, 28);
     const assignments = await prisma.shiftAssignment.findMany({
       where: { user_id: req.user!.sub, date: { gte: future, lte: until } },
       include: { shift: { include: { breaks: { orderBy: { after_minutes: 'asc' } } } } },
@@ -455,7 +551,7 @@ router.get('/swaps/me', async (req, res, next) => {
 });
 
 // ─── GET /shifts/swaps ─────────────────────────────────
-router.get('/swaps', requireRole('manager'), async (req, res, next) => {
+router.get('/swaps', requirePermission('shifts.swaps.approve'), async (req, res, next) => {
   try {
     const swaps = await prisma.shiftSwap.findMany({
       where: {
@@ -500,7 +596,7 @@ router.post('/swaps', async (req, res, next) => {
 });
 
 // ─── PUT /shifts/swaps/:id/approve ────────────────────
-router.put('/swaps/:id/approve', requireRole('manager'), async (req, res, next) => {
+router.put('/swaps/:id/approve', requirePermission('shifts.swaps.approve'), async (req, res, next) => {
   try {
     const swap = await prisma.shiftSwap.findFirst({
       where: { id: req.params.id, requester: { org_id: req.user!.org_id } },
@@ -519,7 +615,7 @@ router.put('/swaps/:id/approve', requireRole('manager'), async (req, res, next) 
 });
 
 // ─── PUT /shifts/swaps/:id/reject ─────────────────────
-router.put('/swaps/:id/reject', requireRole('manager'), async (req, res, next) => {
+router.put('/swaps/:id/reject', requirePermission('shifts.swaps.approve'), async (req, res, next) => {
   try {
     const { reason } = req.body;
     if (!reason) throw new ValidationError('Rejection reason required');
@@ -534,7 +630,7 @@ router.put('/swaps/:id/reject', requireRole('manager'), async (req, res, next) =
 
 // ─── POST /shifts/ai-schedule ─────────────────────────
 // Describe staffing needs in plain English; AI returns a shift plan
-router.post('/ai-schedule', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/ai-schedule', requirePermission('shifts.ai_schedule'), async (req, res, next) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new ValidationError('AI service not configured');
@@ -575,7 +671,7 @@ router.post('/ai-schedule', requireRole('hr_admin'), async (req, res, next) => {
 
 // ─── GET /shifts/:id/breaks ────────────────────────────
 // Must be registered after all literal two-segment routes (/assignments/me, /swaps/me)
-router.get('/:id/breaks', async (req, res, next) => {
+router.get('/:id/breaks', requirePermission('shifts.view'), async (req, res, next) => {
   try {
     const shift = await prisma.shift.findUnique({
       where: { id: req.params.id as string },
@@ -588,7 +684,7 @@ router.get('/:id/breaks', async (req, res, next) => {
 
 // ─── GET /shifts/:id ───────────────────────────────────
 // Must be registered after all literal single-segment routes (/schedule, /assignments, /swaps)
-router.get('/:id', requireRole('manager'), async (req, res, next) => {
+router.get('/:id', requirePermission('shifts.view'), async (req, res, next) => {
   try {
     const shift = await prisma.shift.findUnique({
       where: { id: req.params.id as string },

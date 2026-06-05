@@ -1,13 +1,130 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../utils/prisma';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, ValidationError, NotFoundError } from '../utils/response';
 
 const router = Router();
 router.use(authenticate);
 
+// ─── POST /overtime/requests ──────────────────────────
+router.post('/requests', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { attendance_id, reason } = req.body;
+    if (!attendance_id) throw new ValidationError('attendance_id required');
+
+    const record = await prisma.attendanceRecord.findFirst({
+      where: { id: attendance_id, user_id: req.user!.sub, org_id: req.user!.org_id },
+      include: { shift: true },
+    });
+    if (!record) throw new NotFoundError('Attendance record');
+    if (!record.shift?.overtime_enabled) throw new ValidationError('Overtime is not enabled for this shift');
+    if (!record.shift.overtime_requires_approval) throw new ValidationError('This shift counts overtime automatically');
+    if ((record.extra_office_minutes ?? 0) <= 0) throw new ValidationError('No extra office time available to request');
+
+    const request = await prisma.overtimeRequest.upsert({
+      where: { attendance_id: record.id },
+      update: {
+        requested_minutes: record.extra_office_minutes,
+        reason: reason?.trim() || null,
+        status: 'pending',
+        reviewed_by: null,
+        reviewed_at: null,
+        rejection_reason: null,
+      },
+      create: {
+        attendance_id: record.id,
+        user_id: req.user!.sub,
+        org_id: req.user!.org_id,
+        requested_minutes: record.extra_office_minutes,
+        reason: reason?.trim() || null,
+      },
+    });
+
+    created(res, request);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /overtime/requests ───────────────────────────
+router.get('/requests', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { status = 'pending' } = req.query as { status?: string };
+    const requests = await prisma.overtimeRequest.findMany({
+      where: { org_id: req.user!.org_id, ...(status ? { status } : {}) },
+      include: {
+        user: { select: { id: true, name: true, department: true, avatar_url: true } },
+        attendance: { include: { shift: true } },
+      },
+      orderBy: { created_at: 'desc' },
+    });
+    ok(res, requests);
+  } catch (e) { next(e); }
+});
+
+// ─── GET /overtime/requests/me ────────────────────────
+router.get('/requests/me', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const requests = await prisma.overtimeRequest.findMany({
+      where: { user_id: req.user!.sub },
+      include: { attendance: { include: { shift: true } } },
+      orderBy: { created_at: 'desc' },
+      take: 30,
+    });
+    ok(res, requests);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /overtime/requests/:id/approve ───────────────
+router.put('/requests/:id/approve', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const request = await prisma.overtimeRequest.findFirst({
+      where: { id: req.params.id, org_id: req.user!.org_id },
+      include: { attendance: true },
+    });
+    if (!request) throw new NotFoundError('Overtime request');
+    if (request.status !== 'pending') throw new ValidationError('Request is not pending');
+
+    const overtimeHours = parseFloat((request.requested_minutes / 60).toFixed(2));
+    const remainingExtra = Math.max(0, (request.attendance.extra_office_minutes ?? 0) - request.requested_minutes);
+
+    const updated = await prisma.$transaction(async (tx) => {
+      await tx.attendanceRecord.update({
+        where: { id: request.attendance_id },
+        data: {
+          overtime_hours: overtimeHours,
+          extra_office_minutes: remainingExtra,
+        },
+      });
+      return tx.overtimeRequest.update({
+        where: { id: request.id },
+        data: { status: 'approved', reviewed_by: req.user!.sub, reviewed_at: new Date() },
+      });
+    });
+
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /overtime/requests/:id/reject ────────────────
+router.put('/requests/:id/reject', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { reason } = req.body;
+    if (!reason) throw new ValidationError('Rejection reason required');
+    const request = await prisma.overtimeRequest.findFirst({
+      where: { id: req.params.id, org_id: req.user!.org_id },
+    });
+    if (!request) throw new NotFoundError('Overtime request');
+    if (request.status !== 'pending') throw new ValidationError('Request is not pending');
+
+    const updated = await prisma.overtimeRequest.update({
+      where: { id: request.id },
+      data: { status: 'rejected', reviewed_by: req.user!.sub, reviewed_at: new Date(), rejection_reason: reason },
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
 // ─── GET /overtime/rules ───────────────────────────────
-router.get('/rules', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/rules', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rules = await prisma.overtimeRule.findMany({
       where: { org_id: req.user!.org_id },
@@ -18,7 +135,7 @@ router.get('/rules', requireRole('hr_admin'), async (req: Request, res: Response
 });
 
 // ─── POST /overtime/rules ──────────────────────────────
-router.post('/rules', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/rules', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, rule_type, threshold_hours, multiplier, priority } = req.body;
     if (!name || !rule_type || !threshold_hours || !multiplier) {
@@ -42,7 +159,7 @@ router.post('/rules', requireRole('hr_admin'), async (req: Request, res: Respons
 });
 
 // ─── PUT /overtime/rules/:id ───────────────────────────
-router.put('/rules/:id', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/rules/:id', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rule = await prisma.overtimeRule.findFirst({
       where: { id: req.params.id as string, org_id: req.user!.org_id },
@@ -65,7 +182,7 @@ router.put('/rules/:id', requireRole('hr_admin'), async (req: Request, res: Resp
 });
 
 // ─── DELETE /overtime/rules/:id ───────────────────────
-router.delete('/rules/:id', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/rules/:id', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rule = await prisma.overtimeRule.findFirst({
       where: { id: req.params.id as string, org_id: req.user!.org_id },
@@ -77,7 +194,7 @@ router.delete('/rules/:id', requireRole('hr_admin'), async (req: Request, res: R
 });
 
 // ─── GET /overtime/summary ─────────────────────────────
-router.get('/summary', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/summary', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { week_start } = req.query;
     const start = week_start
