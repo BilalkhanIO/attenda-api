@@ -168,6 +168,9 @@ async function run() {
       'prisma/migrations/20260612000000_absent_alerted/migration.sql',
       'prisma/migrations/20260613000000_shift_is_org_wide/migration.sql',
       'prisma/migrations/20260614000000_attendance_extra_minutes/migration.sql',
+      'prisma/migrations/20260613000000_mid_shift_leave_times/migration.sql',
+      'prisma/migrations/20260614000000_dynamic_rbac/migration.sql',
+      'prisma/migrations/20260615000000_shift_break_policies/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {
