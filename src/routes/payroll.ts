@@ -26,7 +26,7 @@ router.get('/', requireRole('hr_admin'), async (req, res, next) => {
     });
 
     // Group into payroll periods
-    const grouped = records.reduce((acc: Record<string, { id: string; month: number; year: number; status: string; records: typeof records; total_gross: number; total_employees: number }>, r) => {
+    const grouped = records.reduce((acc: Record<string, { id: string; month: number; year: number; status: string; records: typeof records; total_gross: number; total_employees: number }>, r: typeof records[0]) => {
       const key = `${r.period_year}-${r.period_month}`;
       if (!acc[key]) {
         acc[key] = { id: key, month: r.period_month, year: r.period_year, status: r.status, records: [], total_gross: 0, total_employees: 0 };
@@ -72,8 +72,8 @@ router.post('/generate', requireRole('hr_admin'), async (req, res, next) => {
       });
 
       // Prefer net_hours_worked (gross minus unpaid breaks) — fall back to hours_worked for old records
-      const regularHours  = attendance.reduce((s, r) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
-      const overtimeHours = attendance.reduce((s, r) => s + Number(r.overtime_hours), 0);
+      const regularHours  = attendance.reduce((s: number, r: typeof attendance[0]) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
+      const overtimeHours = attendance.reduce((s: number, r: typeof attendance[0]) => s + Number(r.overtime_hours), 0);
 
       // Get unpaid leave days
       const unpaidLeave = await prisma.leaveRequest.findMany({
@@ -83,7 +83,7 @@ router.post('/generate', requireRole('hr_admin'), async (req, res, next) => {
           start_date: { lte: end }, end_date: { gte: start },
         },
       });
-      const unpaidDays  = unpaidLeave.reduce((s, l) => s + l.working_days, 0);
+      const unpaidDays  = unpaidLeave.reduce((s: number, l: typeof unpaidLeave[0]) => s + l.working_days, 0);
       const hourlyRate  = Number(user.hourly_rate);
       const dailyRate   = (hourlyRate * 8);
       const basePay     = regularHours * hourlyRate;
@@ -129,7 +129,7 @@ router.get('/me', async (req, res, next) => {
 router.get('/:id', requireRole('hr_admin'), async (req, res, next) => {
   try {
     const record = await prisma.payrollRecord.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id },
+      where: { id: req.params.id as string, org_id: req.user!.org_id },
       include: RECORD_INCLUDE,
     });
     if (!record) throw new NotFoundError('Payroll record');
@@ -145,7 +145,7 @@ router.put('/:id/adjust', requireRole('hr_admin'), async (req, res, next) => {
     if (reason.length < 10) throw new ValidationError('Reason must be at least 10 characters');
 
     const record = await prisma.payrollRecord.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id },
+      where: { id: req.params.id as string, org_id: req.user!.org_id },
     });
     if (!record) throw new NotFoundError('Payroll record');
     if (record.status === 'processed') throw new AppError('Cannot adjust processed payroll', 400, 'LOCKED');
@@ -180,7 +180,7 @@ router.put('/:id/adjust', requireRole('hr_admin'), async (req, res, next) => {
     updateData.net_pay            = Math.max(0, grossPay - taxDeduction - pensionDeduction);
 
     const updated = await prisma.payrollRecord.update({
-      where: { id: req.params.id },
+      where: { id: req.params.id as string },
       data: updateData,
       include: RECORD_INCLUDE,
     });

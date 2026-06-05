@@ -86,7 +86,7 @@ router.put('/me/notification-prefs', async (req: Request, res: Response, next: N
 router.get('/:id/permissions', requirePermission('org.permissions.grant'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = await prisma.user.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id, deleted_at: null },
+      where: { id: req.params.id as string, org_id: req.user!.org_id, deleted_at: null },
     });
     if (!user) throw new NotFoundError('User');
 
@@ -105,7 +105,7 @@ router.put('/:id/permissions', requirePermission('org.permissions.grant'), async
     if (!Array.isArray(grants)) throw new ValidationError('grants must be an array');
 
     const user = await prisma.user.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id, deleted_at: null },
+      where: { id: req.params.id as string, org_id: req.user!.org_id, deleted_at: null },
     });
     if (!user) throw new NotFoundError('User');
 
@@ -147,7 +147,7 @@ router.get('/meta/departments', async (req: Request, res: Response, next: NextFu
       select: { department: true },
       distinct: ['department'],
     });
-    ok(res, users.map(u => u.department).filter(Boolean));
+    ok(res, users.map((u: typeof users[0]) => u.department).filter(Boolean));
   } catch (e) { next(e); }
 });
 
@@ -246,7 +246,7 @@ router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, ne
 // ─── GET /users/:id ────────────────────────────────────
 router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
     // Users can see their own profile; managers/admins can see others in same org
     if (id !== req.user!.sub && !['manager', 'hr_admin', 'super_admin'].includes(req.user!.role)) {
       throw new ForbiddenError();
@@ -263,7 +263,7 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
 // ─── PUT /users/:id ────────────────────────────────────
 router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
     const { name, role, department, job_title, phone, hourly_rate, manager_id, email, password } = req.body as {
       name?: string; role?: string; department?: string; job_title?: string;
       phone?: string; hourly_rate?: number; manager_id?: string | null;
@@ -331,7 +331,7 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
 // ─── PATCH /users/:id/deactivate ───────────────────────
 router.patch('/:id/deactivate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
     if (id === req.user!.sub) throw new ValidationError('Cannot deactivate yourself');
 
     const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
@@ -351,7 +351,7 @@ router.patch('/:id/deactivate', requireRole('hr_admin'), async (req: Request, re
 // ─── PATCH /users/:id/activate ─────────────────────────
 router.patch('/:id/activate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
 
     const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
     if (!user) throw new NotFoundError('User');
@@ -412,7 +412,7 @@ router.post('/import', requireRole('hr_admin'), async (req: Request, res: Respon
 // ─── POST /users/:id/resend-invite ─────────────────────
 router.post('/:id/resend-invite', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { id } = req.params;
+    const id = req.params.id as string;
     const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
     if (!user) throw new NotFoundError('User');
     if (user.setup_complete) throw new ValidationError('Account is already set up');
