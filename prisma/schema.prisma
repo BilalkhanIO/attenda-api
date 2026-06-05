@@ -263,6 +263,8 @@ model Shift {
   color        String    @default("#1D4ED8") @db.VarChar(20)
   active_days  Int[]
   is_published Boolean   @default(false)
+  is_org_wide  Boolean   @default(false)
+  is_default   Boolean   @default(false)
   created_by   String?
   created_at   DateTime  @default(now())
 

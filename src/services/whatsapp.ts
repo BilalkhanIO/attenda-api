@@ -277,10 +277,13 @@ Respond ONLY with valid JSON (no markdown):
       },
     });
 
-    // If morning reply → mark as checked in
+    // If morning reply → mark as checked in if not already
     if (nudgeType === 'morning') {
-      const session = await prisma.remoteSession.findUnique({ where: { id: sessionId } });
-      if (session) {
+      const session = await prisma.remoteSession.findUnique({ 
+        where: { id: sessionId },
+        include: { attendance: true }
+      });
+      if (session && session.attendance && !session.attendance.check_in_at) {
         await prisma.attendanceRecord.update({
           where: { id: session.attendance_id },
           data: { check_in_at: new Date() },

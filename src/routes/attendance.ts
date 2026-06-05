@@ -761,26 +761,30 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     let shiftId: string | null = null;
 
     if (type !== 'remote') {
-      const [assignment, org] = await Promise.all([
-        prisma.shiftAssignment.findFirst({
-          where: { user_id: req.user!.sub, date: today },
-          include: { shift: true },
-        }),
-        Promise.resolve(orgInfo),
-      ]);
+      const weekday = now.getDay();
+      const assignment = await prisma.shiftAssignment.findFirst({
+        where: { user_id: req.user!.sub, date: today },
+        include: { shift: true },
+      });
 
-      if (assignment?.shift) {
-        const shift = assignment.shift;
+      let shift = assignment?.shift;
+      if (!shift) {
+        shift = await prisma.shift.findFirst({
+          where: { org_id: req.user!.org_id, is_org_wide: true, active_days: { has: weekday }, is_published: true },
+        }) || await prisma.shift.findFirst({
+          where: { org_id: req.user!.org_id, is_default: true, active_days: { has: weekday }, is_published: true },
+        }) || undefined;
+      }
+
+      if (shift) {
         shiftId = shift.id;
         lateMins = lateMinutes(now, shift, orgTimezone);
-        if (lateMins > lateThresholdFor(shift, org)) status = 'late';
+        if (lateMins > lateThresholdFor(shift, orgInfo)) status = 'late';
 
-        // Persist the scheduled window as correct UTC instants in the org's tz
         const win = scheduledWindow(shift, orgTimezone, now);
         scheduledStart = win.start;
-        scheduledEnd   = win.end;
+        scheduledEnd = win.end;
 
-        // Early check-in: employee arrived before their shift started
         if (scheduledStart && now < scheduledStart) {
           earlyCheckinMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
         }
@@ -1299,6 +1303,17 @@ router.get('/:userId', requireRole('manager'), async (req: Request, res: Respons
       where.date = {};
       if (start) (where.date as Record<string, unknown>).gte = new Date(start);
       if (end)   (where.date as Record<string, unknown>).lte = new Date(end);
+    }
+
+    const records = await prisma.attendanceRecord.findMany({
+      where, include: RECORD_INCLUDE, orderBy: { date: 'desc' }, take: 90,
+    });
+    ok(res, records);
+  } catch (e) { next(e); }
+});
+
+export default router;
+<string, unknown>).lte = new Date(end);
     }
 
     const records = await prisma.attendanceRecord.findMany({

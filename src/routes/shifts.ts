@@ -113,12 +113,19 @@ router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
   try {
     const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
-    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins } = req.body;
+    const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, is_org_wide, is_default } = req.body;
+
+    if (is_default && !shift.is_default) {
+      await prisma.shift.updateMany({ where: { org_id: req.user!.org_id }, data: { is_default: false } });
+    }
+
     const updated = await prisma.shift.update({
       where: { id: req.params.id },
       data: {
         name, start_time, end_time, color,
         active_days: active_days ?? days_of_week,
+        is_org_wide: is_org_wide !== undefined ? !!is_org_wide : undefined,
+        is_default: is_default !== undefined ? !!is_default : undefined,
         ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
         ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
         ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
@@ -128,6 +135,21 @@ router.put('/:id', requireRole('hr_admin'), async (req, res, next) => {
       },
     });
     ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /shifts/:id/set-default ──────────────────────
+router.put('/:id/set-default', requireRole('hr_admin'), async (req, res, next) => {
+  try {
+    const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
+    if (!shift) throw new NotFoundError('Shift');
+
+    await prisma.$transaction([
+      prisma.shift.updateMany({ where: { org_id: req.user!.org_id }, data: { is_default: false } }),
+      prisma.shift.update({ where: { id: req.params.id }, data: { is_default: true } }),
+    ]);
+
+    ok(res, { message: 'Shift set as default for the organisation' });
   } catch (e) { next(e); }
 });
 
