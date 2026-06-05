@@ -1,6 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate } from '../middleware/auth';
-import { requirePlatformPermission } from '../middleware/auth';
+import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, NotFoundError, ValidationError, ForbiddenError } from '../utils/response';
 import { hashPassword } from '../utils/auth';
 import prisma from '../utils/prisma';
@@ -9,14 +8,14 @@ const router = Router();
 router.use(authenticate);
 
 // ─── GET /admin/users ──────────────────────────────────
-router.get('/', requirePlatformPermission('platform.users.read'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { role } = req.query;
+    const role = typeof req.query.role === 'string' ? req.query.role : undefined;
     const where: any = {};
     
     // Role filter
     if (role) {
-      where.platform_roles = {
+      where.platform_role_assignments = {
         some: {
           platform_role: {
             slug: role
@@ -29,7 +28,7 @@ router.get('/', requirePlatformPermission('platform.users.read'), async (req: Re
       where: {
         ...where,
         // Only get users who have at least one platform role
-        platform_roles: {
+        platform_role_assignments: {
           some: {}
         },
         deleted_at: null
@@ -39,8 +38,7 @@ router.get('/', requirePlatformPermission('platform.users.read'), async (req: Re
         name: true,
         email: true,
         created_at: true,
-        last_active: true,
-        platform_roles: {
+        platform_role_assignments: {
           include: {
             platform_role: true
           }
@@ -54,9 +52,8 @@ router.get('/', requirePlatformPermission('platform.users.read'), async (req: Re
       name: u.name,
       email: u.email,
       created_at: u.created_at,
-      last_active: u.last_active,
-      roles: u.platform_roles.map(pr => ({
-        id: pr.platform_role.id,
+      roles: u.platform_role_assignments.map((pr: any) => ({
+        id: pr.platform_role.slug,
         name: pr.platform_role.name,
         slug: pr.platform_role.slug
       }))
@@ -67,12 +64,13 @@ router.get('/', requirePlatformPermission('platform.users.read'), async (req: Re
 });
 
 // ─── GET /admin/users/:id ──────────────────────────────
-router.get('/:id', requirePlatformPermission('platform.users.read'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/:id', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = req.params.id as string;
     const user = await prisma.user.findFirst({
       where: { 
-        id: req.params.id,
-        platform_roles: { some: {} },
+        id,
+        platform_role_assignments: { some: {} },
         deleted_at: null
       },
       select: {
@@ -80,8 +78,7 @@ router.get('/:id', requirePlatformPermission('platform.users.read'), async (req:
         name: true,
         email: true,
         created_at: true,
-        last_active: true,
-        platform_roles: {
+        platform_role_assignments: {
           include: {
             platform_role: true
           }
@@ -93,8 +90,8 @@ router.get('/:id', requirePlatformPermission('platform.users.read'), async (req:
 
     ok(res, {
       ...user,
-      roles: user.platform_roles.map(pr => ({
-        id: pr.platform_role.id,
+      roles: user.platform_role_assignments.map((pr: any) => ({
+        id: pr.platform_role.slug,
         name: pr.platform_role.name,
         slug: pr.platform_role.slug
       }))
@@ -103,7 +100,7 @@ router.get('/:id', requirePlatformPermission('platform.users.read'), async (req:
 });
 
 // ─── POST /admin/users ─────────────────────────────────
-router.post('/', requirePlatformPermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, email, password, roles } = req.body;
     
@@ -149,7 +146,7 @@ router.post('/', requirePlatformPermission('platform.users.manage'), async (req:
         await tx.platformUserRole.create({
           data: {
             user_id: u.id,
-            role_id: role.id
+            platform_role_slug: role.slug
           }
         });
       }
@@ -162,14 +159,15 @@ router.post('/', requirePlatformPermission('platform.users.manage'), async (req:
 });
 
 // ─── PUT /admin/users/:id ──────────────────────────────
-router.put('/:id', requirePlatformPermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = req.params.id as string;
     const { name, email, password, roles } = req.body;
     
     const user = await prisma.user.findFirst({
       where: { 
-        id: req.params.id,
-        platform_roles: { some: {} },
+        id,
+        platform_role_assignments: { some: {} },
         deleted_at: null
       }
     });
@@ -182,7 +180,7 @@ router.put('/:id', requirePlatformPermission('platform.users.manage'), async (re
     const updateData: any = {};
     if (name) updateData.name = name;
     if (email) {
-      const existing = await prisma.user.findFirst({ where: { email, id: { not: req.params.id } } });
+      const existing = await prisma.user.findFirst({ where: { email, id: { not: id } } });
       if (existing) throw new ValidationError('Email already in use');
       updateData.email = email;
     }
@@ -217,7 +215,7 @@ router.put('/:id', requirePlatformPermission('platform.users.manage'), async (re
           await tx.platformUserRole.create({
             data: {
               user_id: user.id,
-              role_id: role.id
+              platform_role_slug: role.slug
             }
           });
         }
@@ -229,17 +227,18 @@ router.put('/:id', requirePlatformPermission('platform.users.manage'), async (re
 });
 
 // ─── DELETE /admin/users/:id ───────────────────────────
-router.delete('/:id', requirePlatformPermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = req.params.id as string;
     // Prevent self-deletion
-    if (req.params.id === req.user!.sub) {
+    if (id === req.user!.sub) {
       throw new ForbiddenError('You cannot delete your own account');
     }
 
     const user = await prisma.user.findFirst({
       where: { 
-        id: req.params.id,
-        platform_roles: { some: {} },
+        id,
+        platform_role_assignments: { some: {} },
         deleted_at: null
       }
     });

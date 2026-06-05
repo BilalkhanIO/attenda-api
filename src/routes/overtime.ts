@@ -47,7 +47,7 @@ router.post('/requests', async (req: Request, res: Response, next: NextFunction)
 // ─── GET /overtime/requests ───────────────────────────
 router.get('/requests', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { status = 'pending' } = req.query as { status?: string };
+    const status = typeof req.query.status === 'string' ? req.query.status : 'pending';
     const requests = await prisma.overtimeRequest.findMany({
       where: { org_id: req.user!.org_id, ...(status ? { status } : {}) },
       include: {
@@ -76,10 +76,11 @@ router.get('/requests/me', async (req: Request, res: Response, next: NextFunctio
 // ─── PUT /overtime/requests/:id/approve ───────────────
 router.put('/requests/:id/approve', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = req.params.id as string;
     const request = await prisma.overtimeRequest.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id },
+      where: { id, org_id: req.user!.org_id },
       include: { attendance: true },
-    });
+    }) as any;
     if (!request) throw new NotFoundError('Overtime request');
     if (request.status !== 'pending') throw new ValidationError('Request is not pending');
 
@@ -107,10 +108,11 @@ router.put('/requests/:id/approve', requirePermission('overtime.manage'), async 
 // ─── PUT /overtime/requests/:id/reject ────────────────
 router.put('/requests/:id/reject', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
+    const id = req.params.id as string;
     const { reason } = req.body;
     if (!reason) throw new ValidationError('Rejection reason required');
     const request = await prisma.overtimeRequest.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id },
+      where: { id, org_id: req.user!.org_id },
     });
     if (!request) throw new NotFoundError('Overtime request');
     if (request.status !== 'pending') throw new ValidationError('Request is not pending');

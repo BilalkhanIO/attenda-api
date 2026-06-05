@@ -165,7 +165,8 @@ router.delete('/:shiftId/breaks/:breakId', requirePermission('shifts.breaks.mana
 // ─── PUT /shifts/:id ───────────────────────────────────
 router.put('/:id', requirePermission('shifts.manage'), async (req, res, next) => {
   try {
-    const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
+    const id = req.params.id as string;
+    const shift = await prisma.shift.findFirst({ where: { id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
     const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, overtime_enabled, overtime_requires_approval, extra_time_label, is_org_wide, is_default } = req.body;
 
@@ -174,7 +175,7 @@ router.put('/:id', requirePermission('shifts.manage'), async (req, res, next) =>
     }
 
     const updated = await prisma.shift.update({
-      where: { id: req.params.id },
+      where: { id },
       data: {
         name, start_time, end_time, color,
         active_days: active_days ?? days_of_week,
@@ -198,12 +199,13 @@ router.put('/:id', requirePermission('shifts.manage'), async (req, res, next) =>
 // ─── PUT /shifts/:id/set-default ──────────────────────
 router.put('/:id/set-default', requirePermission('shifts.manage'), async (req, res, next) => {
   try {
-    const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
+    const id = req.params.id as string;
+    const shift = await prisma.shift.findFirst({ where: { id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
 
     await prisma.$transaction([
       prisma.shift.updateMany({ where: { org_id: req.user!.org_id }, data: { is_default: false } }),
-      prisma.shift.update({ where: { id: req.params.id }, data: { is_default: true } }),
+      prisma.shift.update({ where: { id }, data: { is_default: true } }),
     ]);
 
     ok(res, { message: 'Shift set as default for the organisation' });
@@ -213,9 +215,10 @@ router.put('/:id/set-default', requirePermission('shifts.manage'), async (req, r
 // ─── DELETE /shifts/:id ────────────────────────────────
 router.delete('/:id', requirePermission('shifts.manage'), async (req, res, next) => {
   try {
-    const shift = await prisma.shift.findFirst({ where: { id: req.params.id, org_id: req.user!.org_id } });
+    const id = req.params.id as string;
+    const shift = await prisma.shift.findFirst({ where: { id, org_id: req.user!.org_id } });
     if (!shift) throw new NotFoundError('Shift');
-    await prisma.shift.delete({ where: { id: req.params.id } });
+    await prisma.shift.delete({ where: { id } });
     ok(res, { message: 'Shift template deleted' });
   } catch (e) { next(e); }
 });
@@ -299,8 +302,9 @@ router.post('/assignments', requirePermission('shifts.assign'), async (req, res,
 // Change the shift or date of an existing assignment.
 router.put('/assignments/:id', requirePermission('shifts.assign'), async (req, res, next) => {
   try {
+    const id = req.params.id as string;
     const assignment = await prisma.shiftAssignment.findFirst({
-      where: { id: req.params.id, shift: { org_id: req.user!.org_id } },
+      where: { id, shift: { org_id: req.user!.org_id } },
     });
     if (!assignment) throw new NotFoundError('Assignment');
 
@@ -338,9 +342,10 @@ router.put('/assignments/:id', requirePermission('shifts.assign'), async (req, r
 // ─── GET /shifts/assignments/:id/detail ───────────────
 router.get('/assignments/:id/detail', async (req, res, next) => {
   try {
+    const id = req.params.id as string;
     const assignment = await prisma.shiftAssignment.findFirst({
       where: {
-        id: req.params.id,
+        id,
         ...(req.user!.role === 'employee'
           ? { user_id: req.user!.sub }
           : { shift: { org_id: req.user!.org_id } }),
@@ -457,11 +462,12 @@ router.post('/assignments/bulk', requirePermission('shifts.assign'), async (req,
 // ─── DELETE /shifts/assignments/:id ───────────────────
 router.delete('/assignments/:id', requirePermission('shifts.assign'), async (req, res, next) => {
   try {
+    const id = req.params.id as string;
     const assignment = await prisma.shiftAssignment.findFirst({
-      where: { id: req.params.id, shift: { org_id: req.user!.org_id } },
+      where: { id, shift: { org_id: req.user!.org_id } },
     });
     if (!assignment) throw new NotFoundError('Assignment');
-    await prisma.shiftAssignment.delete({ where: { id: req.params.id } });
+    await prisma.shiftAssignment.delete({ where: { id } });
     ok(res, { message: 'Assignment removed' });
   } catch (e) { next(e); }
 });
@@ -598,10 +604,11 @@ router.post('/swaps', async (req, res, next) => {
 // ─── PUT /shifts/swaps/:id/approve ────────────────────
 router.put('/swaps/:id/approve', requirePermission('shifts.swaps.approve'), async (req, res, next) => {
   try {
+    const id = req.params.id as string;
     const swap = await prisma.shiftSwap.findFirst({
-      where: { id: req.params.id, requester: { org_id: req.user!.org_id } },
+      where: { id, requester: { org_id: req.user!.org_id } },
       include: { requester_assignment: true, target_assignment: true },
-    });
+    }) as any;
     if (!swap) throw new NotFoundError('Swap request');
 
     await prisma.$transaction(async (tx) => {
@@ -617,10 +624,11 @@ router.put('/swaps/:id/approve', requirePermission('shifts.swaps.approve'), asyn
 // ─── PUT /shifts/swaps/:id/reject ─────────────────────
 router.put('/swaps/:id/reject', requirePermission('shifts.swaps.approve'), async (req, res, next) => {
   try {
+    const id = req.params.id as string;
     const { reason } = req.body;
     if (!reason) throw new ValidationError('Rejection reason required');
     const swap = await prisma.shiftSwap.findFirst({
-      where: { id: req.params.id, requester: { org_id: req.user!.org_id } },
+      where: { id, requester: { org_id: req.user!.org_id } },
     });
     if (!swap) throw new NotFoundError('Swap request');
     await prisma.shiftSwap.update({ where: { id: swap.id }, data: { status: 'rejected', manager_id: req.user!.sub, rejection_reason: reason } });
