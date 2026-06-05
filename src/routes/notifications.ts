@@ -6,6 +6,51 @@ import { verifyAccessToken } from '../utils/auth';
 import prisma from '../utils/prisma';
 
 const router = Router();
+
+// ─── GET /notifications/stream ────────────────────────
+// SSE endpoint — token passed as query param because EventSource can't set headers.
+// Must be registered BEFORE router.use(authenticate) since EventSource cannot
+// send an Authorization header; the token is validated inline from the query string.
+router.get('/stream', async (req: Request, res: Response) => {
+  const token = req.query.token as string | undefined;
+  if (!token) { res.status(401).json({ error: 'No token provided' }); return; }
+
+  let userId: string;
+  let orgId: string;
+  try {
+    const payload = verifyAccessToken(token);
+    userId = payload.sub;
+    orgId  = payload.org_id;
+  } catch {
+    res.status(401).json({ error: 'Invalid or expired token' });
+    return;
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = async () => {
+    try {
+      const count = await prisma.inAppNotification.count({
+        where: { user_id: userId, read_at: null },
+      });
+      res.write(`data: ${JSON.stringify({ type: 'count', count })}\n\n`);
+    } catch { /* DB may be transiently unavailable */ }
+  };
+
+  await send();
+  const interval = setInterval(send, 15_000);
+
+  req.on('close', () => {
+    clearInterval(interval);
+    res.end();
+  });
+});
+
+// All remaining routes require a Bearer token in the Authorization header
 router.use(authenticate);
 
 // ─── GET /notifications ───────────────────────────────
@@ -42,47 +87,6 @@ router.get('/count', async (req, res, next) => {
     });
     ok(res, { count });
   } catch (e) { next(e); }
-});
-
-// ─── GET /notifications/stream ────────────────────────
-// SSE endpoint — token passed as query param because EventSource can't set headers
-router.get('/stream', async (req: Request, res: Response) => {
-  const token = req.query.token as string | undefined;
-  if (!token) { res.status(401).end(); return; }
-
-  let userId: string;
-  let orgId: string;
-  try {
-    const payload = verifyAccessToken(token);
-    userId = payload.sub;
-    orgId  = payload.org_id;
-  } catch {
-    res.status(401).end();
-    return;
-  }
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.setHeader('X-Accel-Buffering', 'no');
-  res.flushHeaders();
-
-  const send = async () => {
-    try {
-      const count = await prisma.inAppNotification.count({
-        where: { user_id: userId, read_at: null },
-      });
-      res.write(`data: ${JSON.stringify({ type: 'count', count })}\n\n`);
-    } catch { /* DB may be transiently unavailable */ }
-  };
-
-  await send();
-  const interval = setInterval(send, 15_000);
-
-  req.on('close', () => {
-    clearInterval(interval);
-    res.end();
-  });
 });
 
 // ─── PUT /notifications/read-all ──────────────────────
