@@ -75,7 +75,11 @@ function readBreakPolicy(body: Record<string, unknown>, shiftStart: string, exis
     allow_extra_breaks: body.allow_extra_breaks !== undefined ? !!body.allow_extra_breaks : (existing?.allow_extra_breaks ?? true),
     applies_days: appliesDays,
     exception_dates: exceptionDates,
-  };
+    // Auto-start: only meaningful for fixed breaks
+    auto_start: breakKind === 'fixed' ? !!body.auto_start : false,
+    reminder_after_mins: Number(body.reminder_after_mins ?? 30),
+    deduct_if_skipped: body.deduct_if_skipped !== undefined ? !!body.deduct_if_skipped : true,
+  } as any;
 }
 
 // ─── GET /shifts ───────────────────────────────────────

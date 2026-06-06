@@ -174,6 +174,8 @@ model BreakRecord {
   limit_exceeded  Boolean   @default(false)
   counted_as_extra Boolean  @default(false)
   source          String    @default("manual") @db.VarChar(30)
+  late_return_minutes Int?
+  wifi_on_at_end  Boolean   @default(false)
 
   attendance  AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
   shift_break ShiftBreak?      @relation(fields: [shift_break_id], references: [id], onDelete: SetNull)
@@ -309,6 +311,10 @@ model ShiftBreak {
   allow_extra_breaks      Boolean @default(true)
   applies_days            Int[] @default([])
   exception_dates         String[] @default([])
+  // Auto-start: fixed breaks only
+  auto_start              Boolean @default(false)
+  reminder_after_mins     Int     @default(30)
+  deduct_if_skipped       Boolean @default(true)
 
   shift         Shift         @relation(fields: [shift_id], references: [id], onDelete: Cascade)
   break_records BreakRecord[]

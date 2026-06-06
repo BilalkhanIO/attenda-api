@@ -254,7 +254,7 @@ export function startHeartbeatExpiryMonitor() {
 
         const checkOut = record.last_heartbeat_at!;
         const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
-        const breaks = await settleBreaks(record.id, checkOut);
+        const breaks = await settleBreaks(record.id, checkOut, tz);
         const earlyMins = earlyOutMinutes(checkOut, record.shift, tz);
         const score = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
         const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, record.shift, tz);
@@ -305,7 +305,7 @@ export function startStaleRecordSweep() {
         const checkOut = record.scheduled_end ? new Date(record.scheduled_end) : new Date(yesterday.getTime() + 23 * 3600000 + 59 * 60000);
         const effectiveOut = checkOut > record.check_in_at! ? checkOut : record.check_in_at!;
         const hoursWorked = (effectiveOut.getTime() - record.check_in_at!.getTime()) / 3600000;
-        const breaks = await settleBreaks(record.id, effectiveOut);
+        const breaks = await settleBreaks(record.id, effectiveOut, tz);
         const extraOfficeMins = await netExtraMinutesAfterShift(record.id, effectiveOut, record.shift, tz);
         const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
         const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
@@ -498,7 +498,7 @@ export function startShiftBreakAutoManager() {
             const bEnd = hhmmToMins(tmpl.break_end_time);
             const existing = record.break_records.find(br => br.shift_break_id === tmpl.id);
 
-            if (!existing && nowMins >= bStart && nowMins < bEnd) {
+            if (!existing && nowMins >= bStart && nowMins < bEnd && tmpl.auto_start) {
               if (!record.break_records.find(br => !br.break_end)) {
                 await prisma.breakRecord.create({
                   data: { attendance_id: record.id, shift_break_id: tmpl.id, break_start: now, break_type: tmpl.name || 'shift_break', is_paid: tmpl.is_paid, auto_started: true, source: 'system' },

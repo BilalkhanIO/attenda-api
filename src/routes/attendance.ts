@@ -430,40 +430,78 @@ router.post('/break/start', async (req: Request, res: Response, next: NextFuncti
 });
 
 // ─── POST /attendance/break/end ───────────────────────
+// Body: { wifi_connected?: boolean }
+// wifi_connected = true when the device was on the office WiFi at the moment
+// the employee tapped "End Break". Used to populate wifi_on_at_end on the
+// break record for history and analytics.
 router.post('/break/end', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { today } = await orgTimeContext(req.user!.org_id);
+    const { wifi_connected = false } = req.body as { wifi_connected?: boolean };
+    const { today, timezone: tz } = await orgTimeContext(req.user!.org_id);
+
     const record = await prisma.attendanceRecord.findUnique({
       where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      include: { break_records: { where: { break_end: null } } },
+      include: {
+        break_records: {
+          where: { break_end: null },
+          include: { shift_break: true },
+        },
+      },
     });
     if (!record) throw new AppError('Not checked in today', 400, 'NOT_CHECKED_IN');
     const activeBreak = record.break_records[0];
     if (!activeBreak) throw new AppError('No break in progress', 400, 'NO_BREAK');
 
-    const now = new Date();
-    const durationMins = Math.round((now.getTime() - activeBreak.break_start.getTime()) / 60000);
+    const now          = new Date();
+    const durationMins = Math.max(0, Math.round((now.getTime() - activeBreak.break_start.getTime()) / 60000));
+
+    // ── Compute late_return_minutes ──────────────────────────────────────────
+    // Fixed break  : compare actual break_end against the scheduled wall-clock
+    //                end time converted to UTC via org timezone.
+    // Flexible break: compare actual duration against the allowed break_minutes.
+    // Ad-hoc break  : no policy → null (unknown).
+    let lateReturnMins: number | null = null;
+    const sb = activeBreak.shift_break;
+    if (sb) {
+      if (sb.break_kind === 'fixed' && sb.break_end_time) {
+        const { fromZonedTime, toZonedTime } = await import('date-fns-tz');
+        const [h, m]          = sb.break_end_time.split(':').map(Number);
+        const localNow        = toZonedTime(now, tz);
+        const localEnd        = new Date(localNow);
+        localEnd.setHours(h, m, 0, 0);
+        const scheduledEndUtc = fromZonedTime(localEnd, tz);
+        lateReturnMins        = Math.max(0, Math.round((now.getTime() - scheduledEndUtc.getTime()) / 60000));
+      } else if (sb.break_kind === 'flexible') {
+        lateReturnMins = Math.max(0, durationMins - sb.break_minutes);
+      }
+    }
 
     const ended = await prisma.breakRecord.update({
       where: { id: activeBreak.id },
-      data: { break_end: now, duration_mins: durationMins },
+      data: {
+        break_end:           now,
+        duration_mins:       durationMins,
+        late_return_minutes: lateReturnMins,
+        wifi_on_at_end:      !!wifi_connected,
+      },
     });
 
-    // Recalculate net_hours_worked
+    // Recalculate net_hours_worked on the parent attendance record
     const allBreaks = await prisma.breakRecord.findMany({
       where: { attendance_id: record.id, break_end: { not: null } },
     });
-    const unpaidBreakMins = allBreaks.filter(b => !b.is_paid).reduce((sum, b) => sum + (b.duration_mins || 0), 0);
-    const paidBreakMins = allBreaks.filter(b => b.is_paid).reduce((sum, b) => sum + (b.duration_mins || 0), 0);
-    const totalMins = record.check_in_at ? Math.round((now.getTime() - record.check_in_at.getTime()) / 60000) : 0;
-    const netMins = totalMins - unpaidBreakMins;
+    const unpaidBreakMins = allBreaks.filter(b => !b.is_paid).reduce((s, b) => s + (b.duration_mins ?? 0), 0);
+    const paidBreakMins   = allBreaks.filter(b =>  b.is_paid).reduce((s, b) => s + (b.duration_mins ?? 0), 0);
+    const totalMins       = record.check_in_at
+      ? Math.round((now.getTime() - record.check_in_at.getTime()) / 60000)
+      : 0;
 
     await prisma.attendanceRecord.update({
       where: { id: record.id },
       data: {
-        break_minutes: unpaidBreakMins + paidBreakMins,
+        break_minutes:    unpaidBreakMins + paidBreakMins,
         paid_break_minutes: paidBreakMins,
-        net_hours_worked: parseFloat((netMins / 60).toFixed(2)),
+        net_hours_worked: parseFloat(((totalMins - unpaidBreakMins) / 60).toFixed(2)),
       },
     });
 
@@ -1082,7 +1120,7 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
     const hoursWorked  = calcHoursWorked(record.check_in_at, now);
 
     // Settle breaks (close any open break) and compute net hours
-    const breaks   = await settleBreaks(record.id, now);
+    const breaks   = await settleBreaks(record.id, now, orgTimezone);
     const netHours = netHoursWorked(hoursWorked, breaks.unpaidMins);
     const approvedLeave = await prisma.leaveRequest.findFirst({
       where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },

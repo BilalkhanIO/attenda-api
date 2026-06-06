@@ -10,18 +10,55 @@ export interface BreakSettlement {
 }
 
 /**
+ * Compute how many minutes late an employee returned from a break.
+ * Returns null when there is no linked policy (ad-hoc break) or the
+ * information needed to compute lateness is unavailable.
+ */
+function calcLateReturnMins(
+  shiftBreak: { break_kind: string; break_minutes: number; break_end_time?: string | null } | null,
+  breakEnd: Date,
+  orgTimezone: string,
+  durationMins: number,
+): number | null {
+  if (!shiftBreak) return null;
+
+  if (shiftBreak.break_kind === 'fixed' && shiftBreak.break_end_time) {
+    const { fromZonedTime, toZonedTime } = require('date-fns-tz');
+    const [h, m] = shiftBreak.break_end_time.split(':').map(Number);
+    const localNow  = toZonedTime(breakEnd, orgTimezone);
+    const localEnd  = new Date(localNow);
+    localEnd.setHours(h, m, 0, 0);
+    const scheduledEndUtc = fromZonedTime(localEnd, orgTimezone);
+    return Math.max(0, Math.round((breakEnd.getTime() - scheduledEndUtc.getTime()) / 60000));
+  }
+
+  if (shiftBreak.break_kind === 'flexible') {
+    return Math.max(0, durationMins - shiftBreak.break_minutes);
+  }
+
+  return null;
+}
+
+/**
  * Close any still-open break for an attendance record (marking it auto_ended),
  * then return the paid / unpaid / total break minutes for the day.
  * Called at checkout so an employee who forgot to end a break isn't credited
  * for break time as work time.
+ *
+ * @param orgTimezone  IANA timezone string used to convert fixed break wall-clock
+ *                     end times to UTC for late-return calculation.
  */
-export async function settleBreaks(attendanceId: string, at: Date): Promise<BreakSettlement> {
-  const open = await prisma.breakRecord.findMany({ where: { attendance_id: attendanceId, break_end: null } });
+export async function settleBreaks(attendanceId: string, at: Date, orgTimezone = 'UTC'): Promise<BreakSettlement> {
+  const open = await prisma.breakRecord.findMany({
+    where: { attendance_id: attendanceId, break_end: null },
+    include: { shift_break: true },
+  });
   for (const b of open) {
-    const mins = Math.max(0, Math.round((at.getTime() - b.break_start.getTime()) / 60000));
+    const mins           = Math.max(0, Math.round((at.getTime() - b.break_start.getTime()) / 60000));
+    const lateReturnMins = calcLateReturnMins(b.shift_break as any, at, orgTimezone, mins);
     await prisma.breakRecord.update({
       where: { id: b.id },
-      data:  { break_end: at, duration_mins: mins, auto_ended: true },
+      data:  { break_end: at, duration_mins: mins, auto_ended: true, late_return_minutes: lateReturnMins, wifi_on_at_end: false } as any,
     });
   }
 
@@ -42,8 +79,10 @@ export async function settleBreaks(attendanceId: string, at: Date): Promise<Brea
     const minutesSinceCheckIn = Math.round((at.getTime() - attendance.check_in_at.getTime()) / 60000);
     let missingUnpaid = 0;
     
-    for (const shiftBreak of attendance.shift.breaks) {
+    for (const shiftBreak of (attendance.shift.breaks as any[])) {
       if (shiftBreak.break_kind === 'flexible') continue;
+      const deductIfSkipped = (shiftBreak as any).deduct_if_skipped ?? true;
+      if (!deductIfSkipped) continue;
       if (shiftBreak.is_paid || minutesSinceCheckIn <= shiftBreak.after_minutes) continue;
       const takenForTemplate = all
         .filter(b => b.shift_break_id === shiftBreak.id)
