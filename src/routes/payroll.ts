@@ -188,28 +188,6 @@ router.put('/:id/adjust', requireRole('hr_admin'), async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-// ─── POST /payroll/process ─────────────────────────────
-router.post('/process', requireRole('hr_admin'), async (req, res, next) => {
-  try {
-    const { month, year } = req.body;
-    const m = month || new Date().getMonth() + 1;
-    const y = year  || new Date().getFullYear();
-
-    const incomplete = await prisma.payrollRecord.count({
-      where: { org_id: req.user!.org_id, period_month: m, period_year: y, is_incomplete: true },
-    });
-    if (incomplete > 0) throw new ValidationError(`${incomplete} records have missing data. Fix them before processing.`);
-
-    const updated = await prisma.payrollRecord.updateMany({
-      where: { org_id: req.user!.org_id, period_month: m, period_year: y, status: { not: 'processed' } },
-      data: { status: 'processed', processed_at: new Date(), processed_by: req.user!.sub },
-    });
-
-    // TODO: Generate PDFs and send WhatsApp notifications
-    ok(res, { processed: updated.count, month: m, year: y, message: 'Payroll processed. Payslips will be sent to employees.' });
-  } catch (e) { next(e); }
-});
-
 // ─── GET /payroll/payslips/:id ─────────────────────────
 router.get('/payslips/:id', async (req, res, next) => {
   try {
@@ -243,7 +221,7 @@ router.post('/process-full', requireRole('hr_admin'), async (req, res, next) => 
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     const { generatePayslipPDF }  = await import('../services/pdf');
     const { sendPayslipEmail }    = await import('../services/email');
-    const { notifyPayslip, formatTime12h } = await import('../services/whatsapp');
+    const { notifyPayslip } = await import('../services/whatsapp');
     const periodLabel = new Date(y, m - 1).toLocaleString('en-US', { month: 'long', year: 'numeric' });
 
     let processed = 0;
