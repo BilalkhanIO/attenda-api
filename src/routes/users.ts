@@ -319,7 +319,7 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
       const isSuperAdmin = req.user!.role === 'super_admin';
       let canUpdateCreds = isSuperAdmin;
       if (!canUpdateCreds) {
-        const perms = await resolveUserPermissions(req.user!.sub, req.user!.org_id, req.user!.role);
+        const perms = await resolveUserPermissions(req.user!.sub, req.user!.org_id);
         canUpdateCreds = can(perms, 'employees.credentials.update');
       }
       if (!canUpdateCreds) throw new ForbiddenError('employees.credentials.update permission required');
