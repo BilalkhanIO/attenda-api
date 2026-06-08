@@ -3,7 +3,7 @@ import { authenticate, requireRole, requirePermission } from '../middleware/auth
 import { ok, created, NotFoundError, ValidationError, ForbiddenError } from '../utils/response';
 import prisma from '../utils/prisma';
 import { PERMISSION_CATALOG } from '../constants/rbac';
-import { seedOrgRbacForOrganisation } from '../utils/rbac-seed';
+import { seedOrgRbacForOrganisation, seedRbacCatalog } from '../utils/rbac-seed';
 
 const router = Router();
 router.use(authenticate);
@@ -145,7 +145,7 @@ router.delete('/roles/:id', requirePermission('org.roles.manage'), async (req: R
 // ─── PUT /org/users/:userId/role — assign org role ─────
 router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { org_role_id, sync_legacy_role } = req.body as { org_role_id?: string; sync_legacy_role?: boolean };
+    const { org_role_id } = req.body as { org_role_id?: string };
     if (!org_role_id) throw new ValidationError('org_role_id is required');
 
     const userId = String(req.params.userId);
@@ -165,10 +165,6 @@ router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (
       create: { user_id: target.id, org_role_id: orgRole.id },
     });
 
-    if (sync_legacy_role && orgRole.is_system) {
-      await prisma.user.update({ where: { id: target.id }, data: { role: orgRole.slug } });
-    }
-
     ok(res, { user_id: target.id, org_role_id: orgRole.id, slug: orgRole.slug });
   } catch (e) { next(e); }
 });
@@ -176,6 +172,7 @@ router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (
 // Ensure system roles exist (lazy init for orgs created before RBAC)
 router.post('/roles/ensure-system', requireRole('super_admin'), async (req: Request, res: Response, next: NextFunction) => {
   try {
+    await seedRbacCatalog();
     await seedOrgRbacForOrganisation(req.user!.org_id);
     ok(res, { message: 'System roles ensured' });
   } catch (e) { next(e); }

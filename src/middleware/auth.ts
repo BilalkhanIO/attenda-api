@@ -1,11 +1,10 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyAccessToken, JwtPayload } from '../utils/auth';
 import { UnauthorizedError, ForbiddenError } from '../utils/response';
-import prisma from '../utils/prisma';
+import redis from '../utils/redis';
 import {
   can,
   hasFeature,
-  legacyRoleHasPermission,
   resolveOrgFeatures,
   resolvePlatformPermissions,
   resolveUserPermissions,
@@ -22,12 +21,22 @@ declare global {
 }
 
 const ROLE_HIERARCHY: Record<string, number> = {
-  employee:      1,
-  manager:       2,
-  hr_admin:      3,
-  super_admin:   4,
+  employee:       1,
+  manager:        2,
+  hr_admin:       3,
+  super_admin:    4,
   platform_admin: 99,
 };
+
+async function isBlacklisted(jti: string): Promise<boolean> {
+  try {
+    const val = await redis.get(`jti:${jti}`);
+    return val !== null;
+  } catch {
+    // Fail closed — treat Redis error as blacklisted to prevent revoked tokens from being accepted
+    return true;
+  }
+}
 
 // ─── Authenticate ─────────────────────────────────────
 export async function authenticate(req: Request, _res: Response, next: NextFunction) {
@@ -39,26 +48,23 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
     const token = authHeader.slice(7);
     const payload = verifyAccessToken(token);
 
-    // Check token not blacklisted
-    const blacklisted = await prisma.tokenBlacklist.findUnique({ where: { jti: payload.jti } });
-    if (blacklisted) throw new UnauthorizedError('Token has been revoked');
+    if (await isBlacklisted(payload.jti)) {
+      throw new UnauthorizedError('Token has been revoked');
+    }
 
     req.user = payload;
     next();
   } catch (err: unknown) {
     if (err instanceof UnauthorizedError) return next(err);
-    // JWT errors
     const message = err instanceof Error ? err.message : 'Invalid token';
     next(new UnauthorizedError(message.includes('expired') ? 'Token expired' : 'Invalid token'));
   }
 }
 
-// ─── Require role ─────────────────────────────────────
+// ─── Require role (route-level access control) ────────
 export function requireRole(...roles: string[]) {
   return (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user) return next(new UnauthorizedError());
-    // platform_admin is a cross-tenant role; it must not pass org-scoped route
-    // guards automatically. Admin routes enforce their own explicit check.
     if (req.user.role === 'platform_admin' && !roles.includes('platform_admin')) {
       return next(new ForbiddenError());
     }
@@ -72,11 +78,11 @@ export function requireRole(...roles: string[]) {
 }
 
 // ─── At least manager ─────────────────────────────────
-export const requireManager   = requireRole('manager');
-export const requireHRAdmin   = requireRole('hr_admin');
+export const requireManager    = requireRole('manager');
+export const requireHRAdmin    = requireRole('hr_admin');
 export const requireSuperAdmin = requireRole('super_admin');
 
-// ─── Permission gating (with legacy role fallback) ────
+// ─── Permission gating (dynamic RBAC only) ────────────
 export function requirePermission(...permissionKeys: string[]) {
   return async (req: Request, _res: Response, next: NextFunction) => {
     try {
@@ -88,10 +94,8 @@ export function requirePermission(...permissionKeys: string[]) {
         return next(new ForbiddenError());
       }
 
-      const perms = await resolveUserPermissions(req.user.sub, req.user.org_id, req.user.role);
+      const perms = await resolveUserPermissions(req.user.sub, req.user.org_id);
       if (permissionKeys.some(k => can(perms, k))) return next();
-
-      if (permissionKeys.some(k => legacyRoleHasPermission(req.user!.role, k))) return next();
 
       return next(new ForbiddenError());
     } catch (e) {
@@ -121,14 +125,23 @@ export function sameOrg(req: Request, orgId: string): boolean {
   return req.user?.org_id === orgId;
 }
 
-// ─── Optional auth (for public endpoints that can be enriched) ─
+// ─── Optional auth (blacklist-aware) ─────────────────
 export async function optionalAuth(req: Request, _res: Response, next: NextFunction) {
   try {
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith('Bearer ')) {
       const token = authHeader.slice(7);
-      req.user = verifyAccessToken(token);
+      const payload = verifyAccessToken(token);
+      // Fail open for blacklist — if Redis is down, let the request through as unauthenticated
+      try {
+        const blacklisted = await redis.get(`jti:${payload.jti}`);
+        if (!blacklisted) {
+          req.user = payload;
+        }
+      } catch {
+        req.user = payload;
+      }
     }
-  } catch { /* ignore */ }
+  } catch { /* ignore — treat as unauthenticated */ }
   next();
 }

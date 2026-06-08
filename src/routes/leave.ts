@@ -138,8 +138,11 @@ router.post('/requests', async (req, res, next) => {
       include: LEAVE_INCLUDE,
     });
 
-    // Notify manager (in-app)
-    const submitter = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { name: true, manager_id: true } });
+    // Notify manager (in-app + WhatsApp)
+    const submitter = await prisma.user.findUnique({
+      where: { id: req.user!.sub },
+      select: { name: true, manager_id: true, manager: { select: { phone: true } } },
+    });
     if (submitter?.manager_id) {
       const label = hasTimeWindow
         ? `${leave_type} leave from ${leave_start_time} to ${leave_end_time}`
@@ -152,6 +155,12 @@ router.post('/requests', async (req, res, next) => {
         body: `${submitter.name} has requested ${label} leave`,
         actionType: 'leave_request', actionId: request.id,
       }).catch(console.error);
+
+      if (submitter.manager?.phone) {
+        const dates = `${start.toDateString()} – ${end.toDateString()}`;
+        const { notifyLeaveRequest } = await import('../services/whatsapp');
+        notifyLeaveRequest(req.user!.org_id, submitter.name, leave_type, dates, submitter.manager.phone).catch(console.error);
+      }
     }
 
     ok(res, request, 201);

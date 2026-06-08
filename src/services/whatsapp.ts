@@ -1,4 +1,3 @@
-// @ts-nocheck
 import axios from 'axios';
 import prisma from '../utils/prisma';
 
@@ -8,26 +7,32 @@ const RETRY_DELAY_MS = 30_000;
 
 // ─── Message Templates ────────────────────────────────
 export const Templates = {
-  CHECK_IN:       (name: string, time: string)       => `✅ ${name} checked in — ${time}`,
-  CHECK_OUT:      (name: string, time: string)       => `🔴 ${name} checked out — ${time}`,
-  LATE_ARRIVAL:   (name: string, mins: number)       => `⚠️ ${name} has not checked in — shift started ${mins} min ago`,
-  ABSENT:         (name: string)                     => `❌ ${name} is absent — no check-in recorded today`,
-  REMOTE:         (name: string)                     => `🏠 ${name} is working remotely today`,
-  REMOTE_REQUEST: (name: string, duration: string)   => `📋 Remote work request from ${name} (${duration.replace(/_/g, ' ')}) — please review and approve in Attenda`,
-  LEAVE_APPROVED: (name: string, type: string, dates: string) => `📋 Leave approved: ${name} — ${type}, ${dates}`,
-  LEAVE_REJECTED: (name: string, type: string, dates: string, reason: string) => `📋 Leave rejected: ${name} — ${type}, ${dates}. Reason: ${reason}`,
-  SHIFT_REMINDER: (name: string, time: string)       => `⏰ Reminder: ${name}, your shift starts in 30 minutes — ${time}`,
-  PAYSLIP_READY:  (name: string, month: string)      => `💰 ${name}, your payslip for ${month} is now available in Attenda`,
-  REMOTE_MORNING: (name: string)                     => `Good morning ${name}! 👋 Quick check-in — what are you working on today?`,
-  REMOTE_MIDDAY:  (name: string)                     => `Afternoon check-in ${name}! Any updates or blockers I should know about?`,
-  REMOTE_EOD:     (name: string)                     => `Wrapping up ${name}? What did you accomplish today? Any carry-overs for tomorrow?`,
+  CHECK_IN:          (name: string, time: string)                                => `✅ ${name} checked in — ${time}`,
+  CHECK_OUT:         (name: string, time: string)                                => `🔴 ${name} checked out — ${time}`,
+  LATE_ARRIVAL:      (name: string, mins: number)                                => `⚠️ ${name} has not checked in — shift started ${mins} min ago`,
+  ABSENT:            (name: string)                                               => `❌ ${name} is absent — no check-in recorded today`,
+  REMOTE:            (name: string)                                               => `🏠 ${name} is working remotely today`,
+  REMOTE_REQUEST:    (name: string, duration: string)                             => `📋 Remote work request from ${name} (${duration.replace(/_/g, ' ')}) — please review and approve in Attenda`,
+  LEAVE_APPROVED:    (name: string, type: string, dates: string)                  => `📋 Leave approved: ${name} — ${type}, ${dates}`,
+  LEAVE_REJECTED:    (name: string, type: string, dates: string, reason: string)  => `📋 Leave rejected: ${name} — ${type}, ${dates}. Reason: ${reason}`,
+  LEAVE_REQUEST:     (name: string, type: string, dates: string)                  => `📋 Leave request from ${name} — ${type}, ${dates}. Please review and approve in Attenda.`,
+  SHIFT_REMINDER:    (name: string, time: string)                                => `⏰ Reminder: ${name}, your shift starts in 30 minutes — ${time}`,
+  PAYSLIP_READY:     (name: string, month: string)                               => `💰 ${name}, your payslip for ${month} is now available in Attenda`,
+  REMOTE_MORNING:    (name: string)                                               => `Good morning ${name}! 👋 Quick check-in — what are you working on today?`,
+  REMOTE_MIDDAY:     (name: string)                                               => `Afternoon check-in ${name}! Any updates or blockers I should know about?`,
+  REMOTE_EOD:        (name: string)                                               => `Wrapping up ${name}? What did you accomplish today? Any carry-overs for tomorrow?`,
+  REMOTE_DAILY:      (name: string)                                               => `🏠 Good morning ${name}! You're working remotely today — respond to your check-in nudges throughout the day.`,
+  INVITE:            (name: string, orgName: string, setupLink: string)           => `👋 Welcome to ${orgName}, ${name}! Set up your Attenda account: ${setupLink}`,
+  OVERTIME_APPROVED: (name: string, minutes: number)                              => `✅ Your overtime request (${(minutes / 60).toFixed(1)}h) has been approved — it will be reflected in your next payslip.`,
+  OVERTIME_REJECTED: (_name: string, reason: string)                              => `❌ Your overtime request was not approved. Reason: ${reason}`,
 };
 
 export type NotificationEvent =
   | 'check_in' | 'check_out' | 'late_arrival' | 'absent'
-  | 'remote' | 'remote_request' | 'leave_approved' | 'leave_rejected'
-  | 'shift_reminder' | 'payslip_ready'
-  | 'remote_morning' | 'remote_midday' | 'remote_eod';
+  | 'remote' | 'remote_request' | 'leave_approved' | 'leave_rejected' | 'leave_request'
+  | 'shift_reminder' | 'payslip_ready' | 'invite'
+  | 'remote_morning' | 'remote_midday' | 'remote_eod' | 'remote_daily'
+  | 'overtime_approved' | 'overtime_rejected';
 
 interface SendOptions {
   orgId:         string;
@@ -164,6 +169,22 @@ export async function notifyShiftReminder(orgId: string, name: string, time: str
   await notify({ orgId, event: 'shift_reminder', message: Templates.SHIFT_REMINDER(name, time), recipientType: 'individual', recipientId: employeePhone });
 }
 
+export async function notifyLeaveRequest(orgId: string, name: string, type: string, dates: string, managerPhone: string): Promise<void> {
+  await notify({ orgId, event: 'leave_request', message: Templates.LEAVE_REQUEST(name, type, dates), recipientType: 'individual', recipientId: managerPhone });
+}
+
+export async function notifyOvertimeApproved(orgId: string, name: string, minutes: number, employeePhone: string): Promise<void> {
+  await notify({ orgId, event: 'overtime_approved', message: Templates.OVERTIME_APPROVED(name, minutes), recipientType: 'individual', recipientId: employeePhone });
+}
+
+export async function notifyOvertimeRejected(orgId: string, name: string, reason: string, employeePhone: string): Promise<void> {
+  await notify({ orgId, event: 'overtime_rejected', message: Templates.OVERTIME_REJECTED(name, reason), recipientType: 'individual', recipientId: employeePhone });
+}
+
+export async function sendDailyRemoteNudge(orgId: string, name: string, employeePhone: string): Promise<void> {
+  await notify({ orgId, event: 'remote_daily', message: Templates.REMOTE_DAILY(name), recipientType: 'individual', recipientId: employeePhone });
+}
+
 // AI remote nudges
 export async function sendRemoteNudge(orgId: string, name: string, nudgeType: 'morning' | 'midday' | 'eod', employeePhone: string): Promise<void> {
   const event = nudgeType === 'morning' ? 'remote_morning' : nudgeType === 'midday' ? 'remote_midday' : 'remote_eod';
@@ -206,16 +227,32 @@ export async function handleWebhookReply(body: any): Promise<void> {
     if (hour >= 12 && hour < 16) nudgeType = 'midday';
     else if (hour >= 16) nudgeType = 'end_of_day';
 
-    // Log the raw reply
-    await prisma.remoteCheckinLog.create({
-      data: {
-        remote_session_id: session.id,
-        nudge_type: nudgeType,
-        nudge_sent_at: nudgeType === 'morning' ? (session.morning_nudge_at || new Date()) : (session.midday_nudge_at || new Date()),
-        reply_text: text,
-        reply_at: timestamp,
-      },
+    // Match to open RemoteCheckinLog (nudge sent, no reply yet) or create a fallback row
+    const openLog = await prisma.remoteCheckinLog.findFirst({
+      where: { remote_session_id: session.id, nudge_type: nudgeType, reply_text: null },
     });
+
+    if (openLog) {
+      await prisma.remoteCheckinLog.update({
+        where: { id: openLog.id },
+        data: { reply_text: text, reply_at: timestamp },
+      });
+    } else {
+      const nudgeSentAt = nudgeType === 'morning'
+        ? (session.morning_nudge_at || new Date())
+        : nudgeType === 'midday'
+        ? (session.midday_nudge_at || new Date())
+        : (session.end_nudge_at || new Date());
+      await prisma.remoteCheckinLog.create({
+        data: {
+          remote_session_id: session.id,
+          nudge_type: nudgeType,
+          nudge_sent_at: nudgeSentAt,
+          reply_text: text,
+          reply_at: timestamp,
+        },
+      });
+    }
 
     // Parse with Claude AI
     await parseRemoteReplyWithClaude(session.id, text, user, nudgeType);
@@ -243,7 +280,7 @@ async function parseRemoteReplyWithClaude(
     const res = await axios.post(
       'https://api.anthropic.com/v1/messages',
       {
-        model: 'claude-sonnet-4-20250514',
+        model: process.env.ANTHROPIC_MODEL || 'claude-sonnet-4-6',
         max_tokens: 300,
         messages: [{
           role: 'user',
@@ -307,7 +344,7 @@ async function getOrgGroups(orgId: string, department?: string): Promise<{ group
     if (deptGroupId) return { groupIds: [deptGroupId] };
   }
 
-  return { groupIds: org.wa_group_ids || [] };
+  return { groupIds: (org.wa_groups as { phone: string }[] | null)?.map(g => g.phone).filter(Boolean) || [] };
 }
 
 function sleep(ms: number): Promise<void> {

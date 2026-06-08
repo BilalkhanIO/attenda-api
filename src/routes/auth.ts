@@ -4,12 +4,16 @@ import {
   hashPassword, comparePassword, signAccessToken, signRefreshToken,
   verifyRefreshToken, generateToken
 } from '../utils/auth';
-import { ok, created, AppError, UnauthorizedError, ValidationError } from '../utils/response';
+import { ok, AppError, UnauthorizedError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
-import { generateSecret, generateSync, verifySync, generateURI } from 'otplib';
+import redis from '../utils/redis';
+import { generateSecret, verifySync, generateURI } from 'otplib';
 import jwt from 'jsonwebtoken';
+import crypto from 'crypto';
 
 const router = Router();
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
 
 function isValidIanaTz(tz: string): boolean {
   try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; }
@@ -23,8 +27,18 @@ function validatePasswordStrength(password: string): void {
   if (!/[^A-Za-z0-9]/.test(password)) throw new ValidationError('Password must contain at least one special character');
 }
 
+async function blacklistToken(jti: string, expUnix: number): Promise<void> {
+  const ttl = expUnix - Math.floor(Date.now() / 1000);
+  if (ttl > 0) {
+    try {
+      await redis.setex(`jti:${jti}`, ttl, '1');
+    } catch (e) {
+      console.error('[Auth] Failed to blacklist token:', e);
+    }
+  }
+}
+
 // ─── POST /auth/register ───────────────────────────────
-// Register new organisation + Super Admin
 router.post('/register', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { org_name, timezone, currency, name, email, password } = req.body;
@@ -47,6 +61,36 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
       },
     });
 
+    // Seed org RBAC and assign super_admin role
+    const { seedOrgRbacForOrganisation } = await import('../utils/rbac-seed');
+    await seedOrgRbacForOrganisation(org.id);
+
+    const orgRole = await prisma.orgRole.findUnique({
+      where: { org_id_slug: { org_id: org.id, slug: 'super_admin' } },
+    });
+    if (orgRole) {
+      await prisma.userOrgRole.upsert({
+        where: { user_id: user.id },
+        update: { org_role_id: orgRole.id },
+        create: { user_id: user.id, org_role_id: orgRole.id },
+      });
+    }
+
+    // WhatsApp invite if org has it enabled and user has a phone
+    if (org.wa_enabled && user.phone) {
+      try {
+        const { notify } = await import('../services/whatsapp');
+        const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+        await notify({
+          orgId: org.id,
+          event: 'invite',
+          message: `Welcome to ${org.name}! Set up your Attenda account: ${frontendUrl}`,
+          recipientType: 'individual',
+          recipientId: user.phone,
+        });
+      } catch { /* silent */ }
+    }
+
     const accessToken  = signAccessToken({ sub: user.id, org_id: org.id, role: user.role, name: user.name, email: user.email });
     const refreshToken = signRefreshToken(user.id);
 
@@ -63,39 +107,103 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
     const user = await prisma.user.findUnique({ where: { email }, include: { org: true } });
     if (!user || !user.is_active) throw new UnauthorizedError('Invalid email or password');
 
-    // Check lockout
-    if (user.locked_until && user.locked_until > new Date()) {
+    // Check lockout BEFORE password validation
+    const isCurrentlyLocked = user.locked_until && user.locked_until > new Date();
+    if (isCurrentlyLocked) {
+      // Still increment attempts while locked (for escalation tracking)
+      const attempts = user.login_attempts + 1;
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { login_attempts: attempts },
+      });
       throw new AppError('Account locked. Try again later.', 423, 'ACCOUNT_LOCKED');
     }
 
     const valid = await comparePassword(password, user.password_hash);
     if (!valid) {
       const attempts = user.login_attempts + 1;
-      const locked   = attempts >= 5;
+      const lockUntil = attempts >= 5 ? new Date(Date.now() + 30 * 60 * 1000) : user.locked_until;
+
       await prisma.user.update({
         where: { id: user.id },
         data: {
           login_attempts: attempts,
-          locked_until: locked ? new Date(Date.now() + 30 * 60 * 1000) : null,
+          locked_until: lockUntil,
         },
       });
-      if (locked) throw new AppError('Account locked for 30 minutes due to failed attempts', 423, 'ACCOUNT_LOCKED');
+
+      // At exactly 5 attempts: lock + notify org super_admins
+      if (attempts === 5) {
+        const { createNotification } = await import('../services/notifications');
+        const { sendAccountLockedEmail } = await import('../services/email');
+
+        const superAdmins = await prisma.userOrgRole.findMany({
+          where: { org_role: { org_id: user.org_id, slug: 'super_admin' } },
+          include: { user: { select: { id: true, email: true, name: true } } },
+        });
+
+        for (const sa of superAdmins) {
+          if (sa.user.id === user.id) continue;
+          createNotification({
+            userId: sa.user.id, orgId: user.org_id,
+            type: 'account_locked',
+            title: 'Account locked',
+            body: `${user.name} (${user.email}) has been locked out after 5 failed login attempts.`,
+            actionType: 'user', actionId: user.id,
+          }).catch(console.error);
+          sendAccountLockedEmail(sa.user.email, sa.user.name, user.email, 5).catch(console.error);
+        }
+
+        throw new AppError('Account locked for 30 minutes due to failed attempts', 423, 'ACCOUNT_LOCKED');
+      }
+
+      // At exactly 10 attempts: additionally notify platform_admins
+      if (attempts === 10) {
+        const { createNotification } = await import('../services/notifications');
+        const { sendAccountLockedEmail } = await import('../services/email');
+
+        const platformAdmins = await prisma.platformUserRole.findMany({
+          where: { platform_role_slug: 'platform_admin' },
+          include: { user: { select: { id: true, email: true, name: true } } },
+        });
+
+        for (const pa of platformAdmins) {
+          createNotification({
+            userId: pa.user.id, orgId: user.org_id,
+            type: 'account_locked',
+            title: 'Account locked (escalation)',
+            body: `${user.name} (${user.email}) has reached 10 failed login attempts.`,
+            actionType: 'user', actionId: user.id,
+          }).catch(console.error);
+          sendAccountLockedEmail(pa.user.email, pa.user.name, user.email, 10).catch(console.error);
+        }
+      }
+
       throw new UnauthorizedError('Invalid email or password');
     }
 
-    // Reset attempts on success
-    await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
+    // Org-wide 2FA enforcement check (before issuing any token)
+    if (user.org.totp_required && !user.totp_enabled) {
+      return next(new AppError(
+        'Your organisation requires 2FA. Please set up an authenticator app before logging in.',
+        403,
+        'totp_setup_required',
+      ));
+    }
 
-    // 2FA challenge — issue a short-lived partial token
+    // 2FA challenge — issue a short-lived partial token (do NOT reset attempts yet)
     if (user.totp_enabled && user.totp_secret) {
       const partial = jwt.sign(
         { sub: user.id, pending_2fa: true },
-        process.env.JWT_ACCESS_SECRET || 'secret',
+        JWT_SECRET,
         { expiresIn: '5m' },
       );
       ok(res, { requires_2fa: true, partial_token: partial });
       return;
     }
+
+    // Full success — reset attempts
+    await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
     const refreshToken = signRefreshToken(user.id);
@@ -112,12 +220,8 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
 router.post('/logout', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const jti = req.user!.jti;
-    const exp = new Date((req.user as unknown as { exp: number }).exp * 1000);
-    await prisma.tokenBlacklist.upsert({
-      where: { jti },
-      update: {},
-      create: { jti, expires_at: exp },
-    });
+    const exp = (req.user as unknown as { exp: number }).exp;
+    await blacklistToken(jti, exp as unknown as number);
     ok(res, { message: 'Logged out successfully' });
   } catch (e) { next(e); }
 });
@@ -144,10 +248,9 @@ router.post('/forgot-password', async (req: Request, res: Response, next: NextFu
     if (!email) throw new ValidationError('Email required');
 
     const user = await prisma.user.findUnique({ where: { email } });
-    // Always return 200 to prevent email enumeration
     if (user && user.is_active) {
       const token   = generateToken();
-      const expires = new Date(Date.now() + 15 * 60 * 1000); // 15 min
+      const expires = new Date(Date.now() + 15 * 60 * 1000);
       await prisma.user.update({ where: { id: user.id }, data: { reset_token: token, reset_expires: expires } });
       const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
       const resetLink   = `${frontendUrl}/reset-password?token=${token}`;
@@ -180,7 +283,6 @@ router.post('/reset-password', async (req: Request, res: Response, next: NextFun
 });
 
 // ─── POST /auth/setup-account ──────────────────────────
-// First-time password setup via invite link
 router.post('/setup-account', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { token, password } = req.body;
@@ -220,12 +322,17 @@ router.put('/change-password', authenticate, async (req: Request, res: Response,
 
     const hash = await hashPassword(new_password);
     await prisma.user.update({ where: { id: user.id }, data: { password_hash: hash } });
+
+    // Invalidate current session
+    const jti = req.user!.jti;
+    const exp = (req.user as unknown as { exp: number }).exp;
+    await blacklistToken(jti, exp);
+
     ok(res, { message: 'Password changed successfully' });
   } catch (e) { next(e); }
 });
 
 // ─── POST /auth/2fa/authenticate ───────────────────────
-// Complete login when 2FA is enabled — exchange partial_token + TOTP code for real tokens
 router.post('/2fa/authenticate', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { partial_token, code } = req.body;
@@ -233,17 +340,46 @@ router.post('/2fa/authenticate', async (req: Request, res: Response, next: NextF
 
     let payload: any;
     try {
-      payload = jwt.verify(partial_token, process.env.JWT_ACCESS_SECRET || 'secret');
+      payload = jwt.verify(partial_token, JWT_SECRET);
     } catch {
       throw new AppError('Invalid or expired partial token', 401, 'INVALID_TOKEN');
     }
     if (!payload.pending_2fa) throw new AppError('Not a 2FA partial token', 400, 'BAD_REQUEST');
 
+    // Brute-force protection on 2FA codes
+    const attemptsKey = `2fa_attempts:${partial_token}`;
+    let attemptCount = 0;
+    try {
+      const raw = await redis.get(attemptsKey);
+      attemptCount = raw ? parseInt(raw, 10) : 0;
+    } catch { /* Redis down — continue */ }
+
+    if (attemptCount >= 5) {
+      throw new AppError('Too many failed 2FA attempts. Please log in again.', 429, 'TOO_MANY_ATTEMPTS');
+    }
+
     const user = await prisma.user.findUnique({ where: { id: payload.sub } });
     if (!user || !user.totp_secret) throw new AppError('User not found', 404, 'NOT_FOUND');
 
     const result = verifySync({ secret: user.totp_secret, token: String(code) });
-    if (!result.valid) throw new UnauthorizedError('Invalid 2FA code');
+    if (!result.valid) {
+      // Increment attempt counter
+      try {
+        const newCount = await redis.incr(attemptsKey);
+        if (newCount === 1) await redis.expire(attemptsKey, 600); // 10 min TTL on first attempt
+        if (newCount >= 5) {
+          throw new AppError('Too many failed 2FA attempts. Please log in again.', 429, 'TOO_MANY_ATTEMPTS');
+        }
+      } catch (redisErr: any) {
+        if (redisErr instanceof AppError) throw redisErr;
+        /* Redis down — allow retry */
+      }
+      throw new UnauthorizedError('Invalid 2FA code');
+    }
+
+    // Success — clear attempt counter and reset login_attempts
+    try { await redis.del(attemptsKey); } catch { /* ignore */ }
+    await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
     const refreshToken = signRefreshToken(user.id);
@@ -256,7 +392,6 @@ router.post('/2fa/authenticate', async (req: Request, res: Response, next: NextF
 });
 
 // ─── POST /auth/2fa/setup ──────────────────────────────
-// Generate TOTP secret + QR URI for the authenticated user
 router.post('/2fa/setup', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
@@ -274,7 +409,6 @@ router.post('/2fa/setup', authenticate, async (req: Request, res: Response, next
 });
 
 // ─── POST /auth/2fa/verify ─────────────────────────────
-// Confirm TOTP code and activate 2FA
 router.post('/2fa/verify', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.body;
@@ -292,7 +426,7 @@ router.post('/2fa/verify', authenticate, async (req: Request, res: Response, nex
   } catch (e) { next(e); }
 });
 
-// ─── DELETE /auth/2fa (disable 2FA) ────────────────────
+// ─── DELETE /auth/2fa (disable 2FA — requires TOTP code) ─
 router.delete('/2fa', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.body as { code: string };
@@ -306,28 +440,8 @@ router.delete('/2fa', authenticate, async (req: Request, res: Response, next: Ne
   } catch (e) { next(e); }
 });
 
-// ─── DELETE /auth/2fa/disable ─────────────────────────
-// Disable 2FA (requires password confirmation)
-router.delete('/2fa/disable', authenticate, async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { password } = req.body;
-    if (!password) throw new ValidationError('password required to disable 2FA');
-
-    const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
-    if (!user) throw new AppError('User not found', 404, 'NOT_FOUND');
-    if (!user.totp_enabled) throw new AppError('2FA is not enabled', 400, 'NOT_ENABLED');
-
-    const valid = await comparePassword(password, user.password_hash);
-    if (!valid) throw new UnauthorizedError('Incorrect password');
-
-    await prisma.user.update({ where: { id: user.id }, data: { totp_enabled: false, totp_secret: null } });
-    ok(res, { message: '2FA disabled' });
-  } catch (e) { next(e); }
-});
-
 // ─── GET /auth/sso/google ──────────────────────────────
-// Redirect to Google OAuth2 consent screen
-router.get('/sso/google', (req: Request, res: Response) => {
+router.get('/sso/google', (_req: Request, res: Response) => {
   const clientId    = process.env.GOOGLE_CLIENT_ID;
   const redirectUri = process.env.GOOGLE_REDIRECT_URI || `${process.env.APP_URL || 'http://localhost:4000'}/api/v1/auth/sso/google/callback`;
   if (!clientId) {
@@ -345,7 +459,6 @@ router.get('/sso/google', (req: Request, res: Response) => {
 });
 
 // ─── GET /auth/sso/google/callback ────────────────────
-// Exchange code for profile, upsert user, return tokens
 router.get('/sso/google/callback', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.query as { code?: string };
@@ -359,7 +472,6 @@ router.get('/sso/google/callback', async (req: Request, res: Response, next: Nex
 
     const axios = (await import('axios')).default;
 
-    // Exchange code for tokens
     const tokenRes = await axios.post('https://oauth2.googleapis.com/token', {
       code,
       client_id:     clientId,
@@ -368,11 +480,10 @@ router.get('/sso/google/callback', async (req: Request, res: Response, next: Nex
       grant_type:    'authorization_code',
     });
 
-    // Get user profile from Google
     const profileRes = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
       headers: { Authorization: `Bearer ${tokenRes.data.access_token}` },
     });
-    const { sub: googleId, email, name, picture } = profileRes.data as { sub: string; email: string; name: string; picture?: string };
+    const { sub: googleId, email, picture } = profileRes.data as { sub: string; email: string; name: string; picture?: string };
 
     let user = await prisma.user.findFirst({ where: { OR: [{ google_id: googleId }, { email }] } });
     if (!user) throw new AppError('No account linked to this Google account. Contact your admin.', 404, 'USER_NOT_FOUND');
@@ -385,8 +496,45 @@ router.get('/sso/google/callback', async (req: Request, res: Response, next: Nex
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
     const refreshToken = signRefreshToken(user.id);
 
+    // Store tokens in Redis with a 60-second one-time code
+    const onetimeCode = crypto.randomBytes(32).toString('hex');
+    try {
+      await redis.setex(`sso:${onetimeCode}`, 60, JSON.stringify({ access_token: accessToken, refresh_token: refreshToken }));
+    } catch (e) {
+      console.error('[SSO] Redis unavailable — falling back to query-string redirect:', e);
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      return res.redirect(`${frontendUrl}/sso/callback?access_token=${accessToken}&refresh_token=${refreshToken}`);
+    }
+
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
-    res.redirect(`${frontendUrl}/sso/callback?access_token=${accessToken}&refresh_token=${refreshToken}`);
+    res.redirect(`${frontendUrl}/sso/callback?code=${onetimeCode}`);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /auth/sso/exchange ──────────────────────────
+// Exchange one-time SSO code for access + refresh tokens
+router.post('/sso/exchange', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { code } = req.body as { code?: string };
+    if (!code) throw new ValidationError('code is required');
+
+    let tokens: { access_token: string; refresh_token: string } | null = null;
+    try {
+      const raw = await redis.get(`sso:${code}`);
+      if (raw) {
+        tokens = JSON.parse(raw);
+        await redis.del(`sso:${code}`);
+      }
+    } catch (e) {
+      console.error('[SSO] Redis error during exchange:', e);
+      throw new AppError('SSO exchange failed — please try again', 503, 'SERVICE_ERROR');
+    }
+
+    if (!tokens) {
+      throw new AppError('Invalid or expired SSO code', 400, 'INVALID_CODE');
+    }
+
+    ok(res, tokens);
   } catch (e) { next(e); }
 });
 

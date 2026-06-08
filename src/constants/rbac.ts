@@ -91,69 +91,6 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
 
 const allKeys = () => PERMISSION_CATALOG.map(p => p.key);
 
-const EMPLOYEE_PERMS: string[] = [];
-
-const MANAGER_PERMS = [
-  ...EMPLOYEE_PERMS,
-  'employees.view_team',
-  'attendance.view_team',
-  'attendance.override',
-  'attendance.late_notices.manage',
-  'leave.view_team',
-  'leave.approve',
-  'shifts.view',
-  'shifts.breaks.manage',
-  'shifts.swaps.approve',
-  'performance.view',
-  'performance.manage',
-  'analytics.view',
-  'remote.approve',
-];
-
-const HR_ADMIN_PERMS = [
-  ...MANAGER_PERMS,
-  'employees.view',
-  'employees.create',
-  'employees.update',
-  'employees.deactivate',
-  'employees.import',
-  'attendance.export',
-  'leave.view_all',
-  'leave.balance.manage',
-  'shifts.manage',
-  'shifts.assign',
-  'shifts.ai_schedule',
-  'payroll.view',
-  'payroll.manage',
-  'payroll.process',
-  'reports.view',
-  'reports.export',
-  'analytics.advanced',
-  'overtime.manage',
-  'whatsapp.test',
-  'whatsapp.logs.view',
-  'org.settings.view',
-  'org.qr.manage',
-];
-
-const SUPER_ADMIN_PERMS = [
-  ...HR_ADMIN_PERMS,
-  'org.settings.update',
-  'org.office.update',
-  'org.whatsapp.update',
-  'org.roles.manage',
-  'org.permissions.grant',
-  'employees.credentials.update',
-];
-
-/** Legacy role slug → permission keys (matches requireRole hierarchy today) */
-export const LEGACY_ROLE_PERMISSIONS: Record<string, readonly string[]> = {
-  employee: EMPLOYEE_PERMS,
-  manager: MANAGER_PERMS,
-  hr_admin: HR_ADMIN_PERMS,
-  super_admin: SUPER_ADMIN_PERMS,
-};
-
 export const SYSTEM_ORG_ROLE_SLUGS = ['employee', 'manager', 'hr_admin', 'super_admin'] as const;
 
 export const PLATFORM_ROLE_DEFS = [

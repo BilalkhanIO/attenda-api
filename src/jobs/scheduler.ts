@@ -4,10 +4,10 @@ import { toZonedTime } from 'date-fns-tz';
 import prisma from '../utils/prisma';
 import {
   notifyLateArrival, notifyAbsent, notifyCheckOut,
-  sendRemoteNudge, notifyShiftReminder, formatTime12h, notify
+  sendRemoteNudge, sendDailyRemoteNudge, notifyShiftReminder, formatTime12h, notify
 } from '../services/whatsapp';
 import {
-  minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow
+  minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow, shiftAutoCheckoutDue
 } from '../utils/shift';
 import { settleBreaks, netHoursWorked } from '../utils/attendance';
 
@@ -84,7 +84,8 @@ export function startLateArrivalDetector() {
             await prisma.attendanceRecord.upsert({
               where: { user_id_date: { user_id: user.id, date: orgToday } },
               update: { status: 'late' },
-              create: { user_id: user.id, org_id: org.id, date: orgToday, check_in_type: 'manual', status: 'late', shift_id: shift.id },
+              // 'system' = scheduler-created placeholder; employee has not actually checked in
+              create: { user_id: user.id, org_id: org.id, date: orgToday, check_in_type: 'system', status: 'late', shift_id: shift.id },
             });
           }
 
@@ -122,7 +123,7 @@ export function startLateArrivalDetector() {
 
             for (const admin of hrAdmins) {
               if (admin.phone) {
-                await notify({ orgId: org.id, event: 'shift_reminder', message: escalMsg, recipientType: 'individual', recipientId: admin.phone }).catch(() => {});
+                await notify({ orgId: org.id, event: 'late_arrival', message: escalMsg, recipientType: 'individual', recipientId: admin.phone }).catch(() => {});
               }
               const { createNotification } = await import('../services/notifications');
               createNotification({
@@ -134,7 +135,7 @@ export function startLateArrivalDetector() {
               }).catch(console.error);
             }
             if (user.manager?.phone) {
-              await notify({ orgId: org.id, event: 'shift_reminder', message: escalMsg, recipientType: 'individual', recipientId: user.manager.phone }).catch(() => {});
+              await notify({ orgId: org.id, event: 'late_arrival', message: escalMsg, recipientType: 'individual', recipientId: user.manager.phone }).catch(() => {});
             }
             await prisma.attendanceRecord.update({
               where: { user_id_date: { user_id: user.id, date: orgToday } },
@@ -200,7 +201,8 @@ export function startAbsentDetector() {
             await prisma.attendanceRecord.upsert({
               where: { user_id_date: { user_id: user.id, date: orgToday } },
               update: { status: 'absent' },
-              create: { user_id: user.id, org_id: org.id, date: orgToday, check_in_type: 'manual', status: 'absent' },
+              // 'system' = scheduler-created placeholder; employee has not actually checked in
+              create: { user_id: user.id, org_id: org.id, date: orgToday, check_in_type: 'system', status: 'absent' },
             });
 
             if (!alreadyAlerted) {
@@ -211,6 +213,16 @@ export function startAbsentDetector() {
 
               if (user.manager?.phone) {
                 await notifyAbsent(org.id, user.name, user.manager.phone);
+              }
+              // Also notify HR admins via WhatsApp (spec: absent alert to manager AND HR admin)
+              const hrAdminsAbsent = await prisma.user.findMany({
+                where: { org_id: org.id, role: { in: ['hr_admin', 'super_admin'] }, is_active: true },
+                select: { phone: true },
+              });
+              for (const admin of hrAdminsAbsent) {
+                if (admin.phone) {
+                  await notifyAbsent(org.id, user.name, admin.phone).catch(() => {});
+                }
               }
               if (user.manager_id) {
                 const { createNotification } = await import('../services/notifications');
@@ -255,7 +267,9 @@ export function startHeartbeatExpiryMonitor() {
         const checkOut = record.last_heartbeat_at!;
         const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
         const breaks = await settleBreaks(record.id, checkOut, tz);
-        const earlyMins = earlyOutMinutes(checkOut, record.shift, tz);
+        const rawEarlyMins = earlyOutMinutes(checkOut, record.shift, tz);
+        // Store tolerance-adjusted value: minutes beyond the early-checkout grace window
+        const earlyMins = Math.max(0, rawEarlyMins - (record.shift?.early_checkout_tolerance_mins ?? 0));
         const score = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
         const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, record.shift, tz);
         const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
@@ -381,7 +395,7 @@ export function startShiftReminderJob() {
 
 // ─── Job: Remote AI Nudges ────────────────────────────
 export function startRemoteNudgeJob() {
-  cron.schedule('* * * * *', async () => {
+  cron.schedule('0 * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
@@ -475,6 +489,72 @@ export function startPayrollAutoGenerate() {
   });
 }
 
+// ─── Job: Shift Auto-Checkout ─────────────────────────
+// Fires every minute. For employees whose shift has auto_checkout enabled, checks
+// whether scheduled shift end + buffer has passed and, if so, checks them out at
+// the scheduled end time. Separate from the heartbeat expiry job (which handles
+// WiFi dropout) — this handles deliberate in-office overtime cutoff.
+export function startShiftAutoCheckoutJob() {
+  cron.schedule('* * * * *', async () => {
+    const now = new Date();
+    try {
+      const openRecords = await prisma.attendanceRecord.findMany({
+        where: {
+          check_out_at: null,
+          check_in_at: { not: null },
+          status: { in: ['in', 'late', 'remote'] },
+          shift_id: { not: null },
+        },
+        include: { user: { include: { org: { select: { id: true, timezone: true } } } }, shift: true },
+      });
+
+      for (const record of openRecords) {
+        const tz = record.user?.org?.timezone || 'UTC';
+        // Only process records for the org's current local day
+        const orgToday = dateOnlyInTz(now, tz);
+        if (record.date.getTime() !== orgToday.getTime()) continue;
+
+        if (!shiftAutoCheckoutDue(record.shift, tz, now)) continue;
+
+        // Checkout at scheduled shift end, not at now (keeps payroll deterministic)
+        const { end: scheduledCheckOut } = scheduledWindow(record.shift!, tz, now);
+        const checkOut = scheduledCheckOut > record.check_in_at! ? scheduledCheckOut : now;
+
+        const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
+        const breaks = await settleBreaks(record.id, checkOut, tz);
+        const rawEarlyMins = earlyOutMinutes(checkOut, record.shift, tz);
+        const earlyMins = Math.max(0, rawEarlyMins - (record.shift?.early_checkout_tolerance_mins ?? 0));
+        const score = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
+        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, record.shift, tz);
+        const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
+        const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
+
+        await prisma.attendanceRecord.update({
+          where: { id: record.id },
+          data: {
+            check_out_at: checkOut,
+            hours_worked: parseFloat(hoursWorked.toFixed(2)),
+            status: 'out',
+            net_hours_worked: netHoursWorked(hoursWorked, breaks.unpaidMins),
+            overtime_hours: overtimeHours,
+            extra_office_minutes: autoCountOvertime ? 0 : extraOfficeMins,
+            break_minutes: breaks.totalMins,
+            paid_break_minutes: breaks.paidMins,
+            auto_checked_out: true,
+            early_out_minutes: earlyMins,
+            ...(score != null && { adherence_score: score }),
+            last_heartbeat_at: null,
+          },
+        });
+        await notifyCheckOut(record.user.org_id, record.user.name, formatTime12h(checkOut)).catch(() => {});
+      }
+    } catch (err) {
+      console.error('[JOB] Shift auto-checkout error:', err);
+    }
+  });
+  console.log('🕐 Shift auto-checkout job started');
+}
+
 // ─── Job: Shift Break Auto-Manager ────────────────────
 export function startShiftBreakAutoManager() {
   cron.schedule('* * * * *', async () => {
@@ -484,6 +564,8 @@ export function startShiftBreakAutoManager() {
       for (const org of orgs) {
         const tz = org.timezone || 'UTC';
         const orgToday = dateOnlyInTz(now, tz);
+        // Intentional: ShiftBreaks are children of Shifts. Employees checked in without
+        // a resolved shift have no break templates to auto-start. This is correct behavior.
         const openRecords = await prisma.attendanceRecord.findMany({
           where: { date: orgToday, check_out_at: null, status: { in: ['in', 'late', 'remote'] }, shift_id: { not: null } },
           include: { shift: { include: { breaks: true } }, break_records: true },
@@ -533,15 +615,31 @@ export function startTrialExpiryMonitor() {
   });
 }
 
-// ─── Job: Token Cleanup ───────────────────────────────
-export function startTokenCleanup() {
-  cron.schedule('0 2 * * *', async () => {
+// ─── Job: Daily Remote Nudge ──────────────────────────
+export function startDailyRemoteNudgeJob() {
+  cron.schedule('0 8 * * *', async () => {
+    const now = new Date();
     try {
-      await prisma.tokenBlacklist.deleteMany({ where: { expires_at: { lt: new Date() } } });
+      const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
+      for (const org of orgs) {
+        const tz = org.timezone || 'UTC';
+        const orgToday = dateOnlyInTz(now, tz);
+
+        const sessions = await prisma.remoteSession.findMany({
+          where: { status: 'approved', attendance: { date: orgToday, org_id: org.id } },
+          include: { user: { select: { id: true, name: true, phone: true } } },
+        });
+
+        for (const session of sessions) {
+          if (!session.user.phone) continue;
+          await sendDailyRemoteNudge(org.id, session.user.name, session.user.phone).catch(() => {});
+        }
+      }
     } catch (err) {
-      console.error('[Token cleanup] Error:', err);
+      console.error('[JOB] Daily remote nudge error:', err);
     }
   });
+  console.log('🏠 Daily remote nudge job started (08:00 UTC)');
 }
 
 export function startAllJobs() {
@@ -549,12 +647,13 @@ export function startAllJobs() {
   startLateArrivalDetector();
   startAbsentDetector();
   startHeartbeatExpiryMonitor();
+  startShiftAutoCheckoutJob();
   startStaleRecordSweep();
   startShiftReminderJob();
   startRemoteNudgeJob();
+  startDailyRemoteNudgeJob();
   startPayrollAutoGenerate();
   startShiftBreakAutoManager();
   startTrialExpiryMonitor();
-  startTokenCleanup();
   console.log('✅ All background jobs running\n');
 }

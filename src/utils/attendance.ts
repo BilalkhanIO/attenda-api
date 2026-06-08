@@ -78,12 +78,27 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
   if (attendance?.shift?.breaks && attendance.check_in_at) {
     const minutesSinceCheckIn = Math.round((at.getTime() - attendance.check_in_at.getTime()) / 60000);
     let missingUnpaid = 0;
-    
+
     for (const shiftBreak of (attendance.shift.breaks as any[])) {
       if (shiftBreak.break_kind === 'flexible') continue;
       const deductIfSkipped = (shiftBreak as any).deduct_if_skipped ?? true;
       if (!deductIfSkipped) continue;
-      if (shiftBreak.is_paid || minutesSinceCheckIn <= shiftBreak.after_minutes) continue;
+      if (shiftBreak.is_paid) continue;
+
+      // Gate: use the wall-clock break_end_time when available (same anchor as
+      // startShiftBreakAutoManager), so deduction and auto-start share one reference.
+      // Fall back to after_minutes when the break has no wall-clock window defined.
+      if (shiftBreak.break_end_time) {
+        const { fromZonedTime, toZonedTime } = require('date-fns-tz');
+        const [h, m] = (shiftBreak.break_end_time as string).split(':').map(Number);
+        const localAt = toZonedTime(at, orgTimezone);
+        const localEnd = new Date(localAt);
+        localEnd.setHours(h, m, 0, 0);
+        const breakEndUtc = fromZonedTime(localEnd, orgTimezone);
+        if (at <= breakEndUtc) continue; // break window hasn't passed yet — don't deduct
+      } else {
+        if (minutesSinceCheckIn <= shiftBreak.after_minutes) continue;
+      }
       const takenForTemplate = all
         .filter(b => b.shift_break_id === shiftBreak.id)
         .reduce((s, b) => s + (b.duration_mins || 0), 0);

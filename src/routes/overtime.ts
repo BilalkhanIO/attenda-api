@@ -79,7 +79,7 @@ router.put('/requests/:id/approve', requirePermission('overtime.manage'), async 
     const id = req.params.id as string;
     const request = await prisma.overtimeRequest.findFirst({
       where: { id, org_id: req.user!.org_id },
-      include: { attendance: true },
+      include: { attendance: true, user: { select: { name: true, phone: true } } },
     }) as any;
     if (!request) throw new NotFoundError('Overtime request');
     if (request.status !== 'pending') throw new ValidationError('Request is not pending');
@@ -101,6 +101,11 @@ router.put('/requests/:id/approve', requirePermission('overtime.manage'), async 
       });
     });
 
+    if (request.user?.phone) {
+      const { notifyOvertimeApproved } = await import('../services/whatsapp');
+      notifyOvertimeApproved(req.user!.org_id, request.user.name, request.requested_minutes, request.user.phone).catch(console.error);
+    }
+
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -113,6 +118,7 @@ router.put('/requests/:id/reject', requirePermission('overtime.manage'), async (
     if (!reason) throw new ValidationError('Rejection reason required');
     const request = await prisma.overtimeRequest.findFirst({
       where: { id, org_id: req.user!.org_id },
+      include: { user: { select: { name: true, phone: true } } },
     });
     if (!request) throw new NotFoundError('Overtime request');
     if (request.status !== 'pending') throw new ValidationError('Request is not pending');
@@ -121,6 +127,12 @@ router.put('/requests/:id/reject', requirePermission('overtime.manage'), async (
       where: { id: request.id },
       data: { status: 'rejected', reviewed_by: req.user!.sub, reviewed_at: new Date(), rejection_reason: reason },
     });
+
+    if (request.user?.phone) {
+      const { notifyOvertimeRejected } = await import('../services/whatsapp');
+      notifyOvertimeRejected(req.user!.org_id, request.user.name, reason, request.user.phone).catch(console.error);
+    }
+
     ok(res, updated);
   } catch (e) { next(e); }
 });

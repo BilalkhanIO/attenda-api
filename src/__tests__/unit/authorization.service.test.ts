@@ -1,4 +1,4 @@
-import { can, hasFeature, legacyRoleHasPermission } from '../../services/authorization';
+import { can, hasFeature } from '../../services/authorization';
 
 describe('authorization helpers', () => {
   it('can checks permission membership', () => {
@@ -11,13 +11,5 @@ describe('authorization helpers', () => {
     expect(hasFeature({ payroll: true, shifts: false }, 'payroll')).toBe(true);
     expect(hasFeature({ payroll: false }, 'payroll')).toBe(false);
     expect(hasFeature({}, 'payroll')).toBe(false);
-  });
-
-  it('legacyRoleHasPermission follows hierarchy matrix', () => {
-    expect(legacyRoleHasPermission('manager', 'leave.approve')).toBe(true);
-    expect(legacyRoleHasPermission('employee', 'leave.approve')).toBe(false);
-    expect(legacyRoleHasPermission('hr_admin', 'payroll.view')).toBe(true);
-    expect(legacyRoleHasPermission('super_admin', 'org.roles.manage')).toBe(true);
-    expect(legacyRoleHasPermission('manager', 'org.roles.manage')).toBe(false);
   });
 });

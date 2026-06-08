@@ -9,7 +9,11 @@ const APP_SECRET   = process.env.WHATSAPP_APP_SECRET   || '';
 
 // ─── Verify Meta HMAC signature ───────────────────────
 function verifySignature(rawBody: Buffer, signature: string): boolean {
-  if (!APP_SECRET) return true; // Skip in dev if not configured
+  if (!APP_SECRET) {
+    console.warn('[Webhook] WHATSAPP_APP_SECRET not set — rejecting all webhook requests');
+    return false;
+  }
+  if (!signature) return false;
   const expected = 'sha256=' + createHmac('sha256', APP_SECRET).update(rawBody).digest('hex');
   if (signature.length !== expected.length) return false;
   // Constant-time comparison to prevent timing attacks
@@ -39,11 +43,11 @@ router.post('/whatsapp', async (req: Request, res: Response) => {
   res.status(200).json({ status: 'received' });
 
   try {
-    // Verify HMAC signature from Meta
-    const signature = req.headers['x-hub-signature-256'] as string || '';
-    const rawBody   = (req as Request & { rawBody?: Buffer }).rawBody;
-    if (rawBody && signature && !verifySignature(rawBody, signature)) {
-      console.warn('[Webhook] Invalid WhatsApp signature — ignoring');
+    // Verify HMAC signature from Meta — always verify; reject if invalid or missing
+    const signature = (req.headers['x-hub-signature-256'] as string) || '';
+    const rawBody   = (req as Request & { rawBody?: Buffer }).rawBody || Buffer.alloc(0);
+    if (!verifySignature(rawBody, signature)) {
+      console.warn('[Webhook] Invalid or missing WhatsApp signature — ignoring');
       return;
     }
 

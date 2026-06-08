@@ -2,7 +2,6 @@ import prisma from '../utils/prisma';
 import {
   DEFAULT_PLAN_FEATURES,
   FEATURE_KEYS,
-  LEGACY_ROLE_PERMISSIONS,
   type PlanFeatures,
 } from '../constants/rbac';
 
@@ -40,7 +39,6 @@ export async function resolveOrgFeatures(orgId: string): Promise<PlanFeatures> {
       if (typeof raw[key] === 'boolean') base[key] = raw[key];
     }
   } else {
-    // Unknown plan (e.g. trial): enable all features until plan is assigned
     for (const key of FEATURE_KEYS) base[key] = true;
   }
 
@@ -52,7 +50,7 @@ export function hasFeature(features: PlanFeatures, featureKey: string): boolean 
   return features[featureKey] === true;
 }
 
-async function rolePermissionKeys(userId: string, legacyRole: string): Promise<Set<string>> {
+async function rolePermissionKeys(userId: string): Promise<Set<string>> {
   const assignment = await prisma.userOrgRole.findUnique({
     where: { user_id: userId },
     include: { org_role: { include: { permissions: true } } },
@@ -62,24 +60,21 @@ async function rolePermissionKeys(userId: string, legacyRole: string): Promise<S
     return new Set(assignment.org_role.permissions.map((p: { permission_key: string }) => p.permission_key));
   }
 
-  const legacy = LEGACY_ROLE_PERMISSIONS[legacyRole];
-  return new Set(legacy ?? []);
+  return new Set<string>();
 }
 
 /** Effective permissions = rolePermissions ∪ allows − denies */
 export async function resolveUserPermissions(
   userId: string,
   orgId: string,
-  legacyRole: string,
 ): Promise<Set<string>> {
   const user = await prisma.user.findFirst({
     where: { id: userId, org_id: orgId, deleted_at: null },
-    select: { role: true },
+    select: { id: true },
   });
   if (!user) return new Set();
 
-  const role = legacyRole || user.role;
-  const effective = await rolePermissionKeys(userId, role);
+  const effective = await rolePermissionKeys(userId);
 
   const grants = await prisma.userPermissionGrant.findMany({
     where: { user_id: userId, org_id: orgId },
@@ -123,7 +118,7 @@ export async function getUserCapabilities(
   legacyRole: string,
 ): Promise<UserCapabilities> {
   const [permissions, features, assignment, platformPerms] = await Promise.all([
-    resolveUserPermissions(userId, orgId, legacyRole),
+    resolveUserPermissions(userId, orgId),
     resolveOrgFeatures(orgId),
     prisma.userOrgRole.findUnique({
       where: { user_id: userId },
@@ -140,10 +135,4 @@ export async function getUserCapabilities(
     org_role: assignment?.org_role ?? null,
     platform_permissions: [...platformPerms].sort(),
   };
-}
-
-/** Legacy fallback when DB role assignment is missing */
-export function legacyRoleHasPermission(legacyRole: string, permissionKey: string): boolean {
-  const perms = LEGACY_ROLE_PERMISSIONS[legacyRole];
-  return perms?.includes(permissionKey) ?? false;
 }

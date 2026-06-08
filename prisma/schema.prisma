@@ -36,6 +36,7 @@ model Organisation {
   contact_name       String?  @db.VarChar(255)
   contact_email      String?  @db.VarChar(255)
   company_size       String?  @db.VarChar(50)
+  totp_required      Boolean  @default(false)
   created_at         DateTime @default(now())
 
   users               User[]
@@ -484,13 +485,6 @@ model WhatsappLog {
   @@map("whatsapp_notification_logs")
 }
 
-model TokenBlacklist {
-  jti        String   @id
-  expires_at DateTime
-  created_at DateTime @default(now())
-
-  @@map("token_blacklist")
-}
 
 model InAppNotification {
   id          String    @id @default(uuid())

@@ -509,11 +509,12 @@ orgRouter.get('/settings', async (req, res, next) => {
 // PUT /org/settings
 orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) => {
   try {
-    const { name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold } = req.body;
+    const { name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold, totp_required } = req.body;
     const data: Record<string, unknown> = {};
     if (name       !== undefined) data.name        = name;
     if (timezone   !== undefined) data.timezone    = timezone;
     if (currency   !== undefined) data.currency    = currency;
+    if (totp_required !== undefined) data.totp_required = Boolean(totp_required);
     if (payroll_day !== undefined) {
       const day = parseInt(payroll_day);
       if (day < 1 || day > 28) throw new ValidationError('payroll_day must be between 1 and 28');
@@ -611,7 +612,7 @@ orgRouter.put('/whatsapp', requireRole('super_admin'), requireOrgFeature('whatsa
 });
 
 // POST /org/whatsapp/test
-orgRouter.post('/whatsapp/test', requireRole('hr_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+orgRouter.post('/whatsapp/test', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     if (!org?.wa_phone_number_id || !org?.wa_access_token) {
@@ -630,7 +631,7 @@ orgRouter.post('/whatsapp/test', requireRole('hr_admin'), requireOrgFeature('wha
 });
 
 // GET /org/whatsapp/logs
-orgRouter.get('/whatsapp/logs', requireRole('hr_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+orgRouter.get('/whatsapp/logs', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const { page = '1', limit = '50', event_type, status } = req.query as Record<string, string>;
     const take = Math.min(parseInt(limit) || 50, 200);

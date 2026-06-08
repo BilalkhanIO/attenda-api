@@ -188,3 +188,20 @@ export async function sendDeactivationEmail(to: string, name: string, orgName: s
   `;
   await sendEmail({ to, subject: 'Your Attenda account has been deactivated', html: baseTemplate('Account Deactivated', body) });
 }
+
+export async function sendAccountLockedEmail(to: string, name: string, lockedEmail: string, attempts: number): Promise<void> {
+  const subject = attempts >= 10
+    ? `Security alert: account locked after ${attempts} failed attempts`
+    : `Security alert: account locked — ${lockedEmail}`;
+  const body = `
+    <h2 style="margin:0 0 8px;color:#0F172A;font-size:22px;font-weight:700;">Account locked</h2>
+    <p style="margin:0 0 24px;color:#64748B;font-size:15px;line-height:1.6;">
+      Hi ${name}, the account <strong>${lockedEmail}</strong> has been locked after
+      <strong>${attempts} failed login attempts</strong>. It will automatically unlock after 30 minutes.
+    </p>
+    <p style="color:#64748B;font-size:13px;">
+      If this was not a known user, please investigate immediately.
+    </p>
+  `;
+  await sendEmail({ to, subject, html: baseTemplate('Security Alert', body) });
+}

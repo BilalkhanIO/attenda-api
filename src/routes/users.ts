@@ -221,11 +221,37 @@ router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, ne
       select: USER_SELECT,
     });
 
+    // Seed UserOrgRole for the new user
+    const orgRoleForUser = await prisma.orgRole.findUnique({
+      where: { org_id_slug: { org_id: req.user!.org_id, slug: role } },
+    });
+    if (orgRoleForUser) {
+      await prisma.userOrgRole.upsert({
+        where: { user_id: user.id },
+        update: { org_role_id: orgRoleForUser.id },
+        create: { user_id: user.id, org_role_id: orgRoleForUser.id },
+      });
+    }
+
     // Send welcome email with setup link
     const { sendWelcomeEmail } = await import('../services/email');
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const setupLink   = `${frontendUrl}/setup-account?token=${inviteToken}`;
     await sendWelcomeEmail(email, name, org?.name || req.user!.org_id, setupLink).catch(console.error);
+
+    // WhatsApp invite if org has it enabled and user has a phone
+    if (org?.wa_enabled && phone) {
+      try {
+        const { notify } = await import('../services/whatsapp');
+        await notify({
+          orgId: req.user!.org_id,
+          event: 'invite',
+          message: `Welcome to ${org.name}! Set up your Attenda account: ${setupLink}`,
+          recipientType: 'individual',
+          recipientId: phone,
+        });
+      } catch { /* silent */ }
+    }
 
     // Create default leave balances
     const leaveTypes = ['annual', 'sick', 'wfh', 'unpaid'];
@@ -393,11 +419,38 @@ router.post('/import', requireRole('hr_admin'), async (req: Request, res: Respon
           skipDuplicates: true,
         });
 
+        // Seed UserOrgRole for imported user
+        const importedRole = u.role || 'employee';
+        const orgRoleForImport = await prisma.orgRole.findUnique({
+          where: { org_id_slug: { org_id: req.user!.org_id, slug: importedRole } },
+        });
+        if (orgRoleForImport) {
+          await prisma.userOrgRole.upsert({
+            where: { user_id: user.id },
+            update: { org_role_id: orgRoleForImport.id },
+            create: { user_id: user.id, org_role_id: orgRoleForImport.id },
+          });
+        }
+
         // Send welcome email
         const { sendWelcomeEmail } = await import('../services/email');
         const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
         const setupLink   = `${frontendUrl}/setup-account?token=${token}`;
         await sendWelcomeEmail(u.email, u.name, org?.name || req.user!.org_id, setupLink).catch(console.error);
+
+        // WhatsApp invite if org has it enabled and user has a phone
+        if (org?.wa_enabled && (u as any).phone) {
+          try {
+            const { notify } = await import('../services/whatsapp');
+            await notify({
+              orgId: req.user!.org_id,
+              event: 'invite',
+              message: `Welcome to ${org.name}! Set up your Attenda account: ${setupLink}`,
+              recipientType: 'individual',
+              recipientId: (u as any).phone,
+            });
+          } catch { /* silent */ }
+        }
 
         results.created++;
       } catch {
@@ -430,6 +483,19 @@ router.post('/:id/resend-invite', requireRole('hr_admin'), async (req: Request, 
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     const setupLink   = `${frontendUrl}/setup-account?token=${inviteToken}`;
     await sendWelcomeEmail(user.email, user.name, org?.name || req.user!.org_id, setupLink).catch(console.error);
+
+    if (org?.wa_enabled && user.phone) {
+      try {
+        const { notify } = await import('../services/whatsapp');
+        await notify({
+          orgId: req.user!.org_id,
+          event: 'invite',
+          message: `Welcome to ${org.name}! Set up your Attenda account: ${setupLink}`,
+          recipientType: 'individual',
+          recipientId: user.phone,
+        });
+      } catch { /* silent */ }
+    }
 
     ok(res, { message: 'Invite resent' });
   } catch (e) { next(e); }

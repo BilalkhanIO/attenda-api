@@ -380,8 +380,6 @@ router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next
     ok(res, session);
   } catch (e) { next(e); }
 });
-const PAID_BREAK_TYPES = new Set(['rest', 'short', 'prayer']);
-
 router.post('/break/start', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { break_type = 'rest', shift_break_id } = req.body;
@@ -405,9 +403,11 @@ router.post('/break/start', async (req: Request, res: Response, next: NextFuncti
       : record.break_records.filter(b => b.break_type === break_type).length;
     const allowedCount = policy?.allowed_count_per_shift ?? 1;
     const limitExceeded = !!policy && policy.break_kind === 'flexible' && takenCount >= allowedCount;
+    // Ad-hoc breaks (no shift policy) are always unpaid.
+    // Payability is only determined by the linked ShiftBreak policy.
     const isPaid = policy
       ? !!policy.is_paid && (limitExceeded ? !policy.deduct_extra_time : policy.paid_within_limit)
-      : PAID_BREAK_TYPES.has(break_type);
+      : false;
 
     const breakRecord = await prisma.breakRecord.create({
       data: {
@@ -509,36 +509,8 @@ router.post('/break/end', async (req: Request, res: Response, next: NextFunction
   } catch (e) { next(e); }
 });
 
-// ─── GET /attendance/break/status ─────────────────────
-router.get('/break/status', async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    const { today } = await orgTimeContext(req.user!.org_id);
-    const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      include: { break_records: { orderBy: { break_start: 'asc' } }, shift: { include: { breaks: { orderBy: { after_minutes: 'asc' } } } } },
-    });
-    const shift = record?.shift ?? await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, new Date(), true);
-    const availableBreaks = (shift?.breaks ?? []).filter(b => dayMatchesBreak(b, today));
-    if (!record) return ok(res, { on_break: false, breaks: [], available_breaks: availableBreaks });
-    const activeBreak = record.break_records.find(b => !b.break_end);
-    const history = record.break_records.map(b => ({
-      ...b,
-      started_at: b.break_start,
-      ended_at: b.break_end,
-      minutes: b.duration_mins,
-    }));
-    ok(res, {
-      on_break: !!activeBreak,
-      break_type: activeBreak?.break_type ?? null,
-      started_at: activeBreak?.break_start ?? null,
-      active_break: activeBreak ? { ...activeBreak, started_at: activeBreak.break_start } : null,
-      breaks: history,
-      total_break_mins: record.break_minutes,
-      total_break_minutes: record.break_minutes,
-      available_breaks: availableBreaks,
-    });
-  } catch (e) { next(e); }
-});
+// GET /attendance/break/status was removed — today-status is the single source of truth
+// for all break state (upcoming/imminent/active/overdue/done/no_schedule) and active break data.
 
 // ─── GET /attendance/late-notice/me ───────────────────
 router.get('/late-notice/me', async (req: Request, res: Response, next: NextFunction) => {
@@ -950,8 +922,10 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         const win = adjustedWindowForLeave(shift, orgTimezone, now, approvedLeave);
         scheduledStart = win.start;
         scheduledEnd = win.end;
-        lateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
-        if (lateMins > lateThresholdFor(shift, orgInfo)) status = 'late';
+        const rawLateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
+        if (rawLateMins > lateThresholdFor(shift, orgInfo)) status = 'late';
+        // Store tolerance-adjusted value: minutes past the grace window (not raw minutes from shift start)
+        lateMins = Math.max(0, rawLateMins - (shift.late_tolerance_mins ?? 0));
 
         if (scheduledStart && now < scheduledStart) {
           earlyCheckinMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
@@ -1128,9 +1102,11 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
     });
 
     // Shift-based compliance on checkout (timezone-aware)
-    const earlyMins = record.shift
+    const rawEarlyMins = record.shift
       ? Math.max(0, Math.round((adjustedWindowForLeave(record.shift, orgTimezone, now, approvedLeave).end.getTime() - now.getTime()) / 60000))
       : earlyOutMinutes(now, record.shift, orgTimezone);
+    // Store tolerance-adjusted value: minutes beyond the early-checkout grace window
+    const earlyMins = Math.max(0, rawEarlyMins - (record.shift?.early_checkout_tolerance_mins ?? 0));
     const score     = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
     const extraOfficeMins = await netExtraMinutesAfterShift(record.id, now, record.shift, orgTimezone);
     const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
@@ -1159,9 +1135,9 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
       notifyCheckOut(req.user!.org_id, updated.user.name, timeStr, updated.user.department ?? undefined).catch(console.error);
     }
 
-    // Notify manager when employee leaves before their shift ends
+    // Notify manager when employee leaves before their shift ends (compare raw minutes vs tolerance)
     const earlyTolerance = record.shift?.early_checkout_tolerance_mins ?? 15;
-    if (earlyMins > earlyTolerance) {
+    if (rawEarlyMins > earlyTolerance) {
       const orgId  = req.user!.org_id;
       const userId = req.user!.sub;
       prisma.user.findUnique({
@@ -1276,8 +1252,10 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const win = adjustedWindowForLeave(shift, org?.timezone ?? 'UTC', now, approvedLeave);
           scheduledStart = win.start;
           scheduledEnd   = win.end;
-          lateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
-          if (lateMins > lateThresholdFor(shift, org)) status = 'late';
+          const rawIpLateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
+          if (rawIpLateMins > lateThresholdFor(shift, org)) status = 'late';
+          // Store tolerance-adjusted value (minutes past the grace window)
+          lateMins = Math.max(0, rawIpLateMins - (shift.late_tolerance_mins ?? 0));
         }
 
         let earlyIpMins = 0;
