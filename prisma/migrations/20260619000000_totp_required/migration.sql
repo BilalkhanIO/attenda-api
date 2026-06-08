@@ -1,0 +1,1 @@
+ALTER TABLE organisations ADD COLUMN IF NOT EXISTS totp_required BOOLEAN NOT NULL DEFAULT false;
