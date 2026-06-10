@@ -130,6 +130,14 @@ router.post('/', requirePermission('platform.users.manage'), async (req: Request
 
     // Create user and assign roles
     const user = await prisma.$transaction(async (tx) => {
+      // user.org_id is a required FK — make sure the SYSTEM organisation exists
+      // even on deployments where db:seed was never run.
+      await tx.organisation.upsert({
+        where: { id: 'SYSTEM' },
+        update: {},
+        create: { id: 'SYSTEM', name: 'Attenda System', timezone: 'UTC', currency: 'USD', status: 'active', subscription_status: 'active' },
+      });
+
       // Create user assigned to the SYSTEM organization
       const u = await tx.user.create({
         data: {

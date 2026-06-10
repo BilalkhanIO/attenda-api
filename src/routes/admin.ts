@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../utils/prisma';
-import { authenticate } from '../middleware/auth';
+import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, ValidationError, NotFoundError, ForbiddenError } from '../utils/response';
 import { generateToken } from '../utils/auth';
 
@@ -10,6 +10,15 @@ router.use(authenticate, (req: Request, res: Response, next: NextFunction) => {
   if (req.user!.role !== 'platform_admin') throw new ForbiddenError();
   next();
 });
+
+// Per-route platform permissions: platform_admin holds all platform.* keys;
+// platform_assistant only gets orgs view + blog (see PLATFORM_ROLE_DEFS).
+const canViewOrgs    = requirePermission('platform.orgs.view', 'platform.orgs.manage');
+const canManageOrgs  = requirePermission('platform.orgs.manage');
+const canApproveOrgs = requirePermission('platform.orgs.approve');
+const canManagePlans = requirePermission('platform.plans.manage');
+const canViewPlans   = requirePermission('platform.plans.manage', 'platform.orgs.view');
+const canManageBlog  = requirePermission('platform.blog.manage');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -43,7 +52,7 @@ function mapOrg(org: any) {
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
-router.get('/stats', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/stats', canViewOrgs, async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const [orgCount, userCount, activeToday, pendingCount, trialingCount, inactiveCount] = await Promise.all([
       prisma.organisation.count({ where: { status: 'active', id: { not: 'SYSTEM' } } }),
@@ -59,7 +68,7 @@ router.get('/stats', async (_req: Request, res: Response, next: NextFunction) =>
 
 // ── Organisations ─────────────────────────────────────────────────────────────
 
-router.get('/orgs', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/orgs', canViewOrgs, async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const orgs = await prisma.organisation.findMany({
       where: { status: { not: 'pending' }, id: { not: 'SYSTEM' } },
@@ -70,7 +79,7 @@ router.get('/orgs', async (_req: Request, res: Response, next: NextFunction) => 
   } catch (e) { next(e); }
 });
 
-router.get('/orgs/pending', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/orgs/pending', canViewOrgs, async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const orgs = await prisma.organisation.findMany({
       where: { status: 'pending' },
@@ -94,7 +103,7 @@ function mapOrgDetail(org: any) {
   };
 }
 
-router.get('/orgs/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/orgs/:id', canViewOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUniqueOrThrow({
       where: { id: req.params.id as string },
@@ -114,7 +123,7 @@ router.get('/orgs/:id', async (req: Request, res: Response, next: NextFunction) 
 });
 
 // PATCH /admin/orgs/:id — org profile fields
-router.patch('/orgs/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/orgs/:id', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, timezone, contact_name, contact_email, company_size, billing_email } = req.body;
     const data: Record<string, unknown> = {};
@@ -147,7 +156,7 @@ router.patch('/orgs/:id', async (req: Request, res: Response, next: NextFunction
 });
 
 // PATCH /admin/orgs/:id/plan
-router.patch('/orgs/:id/plan', async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/orgs/:id/plan', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { plan } = req.body;
     if (!plan?.trim()) throw new ValidationError('plan is required');
@@ -157,7 +166,7 @@ router.patch('/orgs/:id/plan', async (req: Request, res: Response, next: NextFun
 });
 
 // PATCH /admin/orgs/:id/suspend
-router.patch('/orgs/:id/suspend', async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/orgs/:id/suspend', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
     if (!org) throw new NotFoundError('Organisation');
@@ -171,7 +180,7 @@ router.patch('/orgs/:id/suspend', async (req: Request, res: Response, next: Next
 });
 
 // PATCH /admin/orgs/:id/subscription — full subscription control for platform admin
-router.patch('/orgs/:id/subscription', async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/orgs/:id/subscription', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
       subscription_status, plan, seats_limit, features_override,
@@ -198,7 +207,7 @@ router.patch('/orgs/:id/subscription', async (req: Request, res: Response, next:
 });
 
 // POST /admin/orgs/:id/extend-trial — add N days to trial
-router.post('/orgs/:id/extend-trial', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs/:id/extend-trial', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const days = Number(req.body.days);
     if (!days || days < 1 || days > 365) throw new ValidationError('days must be between 1 and 365');
@@ -218,7 +227,7 @@ router.post('/orgs/:id/extend-trial', async (req: Request, res: Response, next: 
 });
 
 // POST /admin/orgs/:id/activate — manually activate a defaulted/inactive org
-router.post('/orgs/:id/activate', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs/:id/activate', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const updated = await prisma.organisation.update({
       where: { id: req.params.id as string },
@@ -229,7 +238,7 @@ router.post('/orgs/:id/activate', async (req: Request, res: Response, next: Next
 });
 
 // POST /admin/orgs/:id/approve
-router.post('/orgs/:id/approve', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs/:id/approve', canApproveOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
     if (!org) throw new NotFoundError('Organisation');
@@ -252,6 +261,9 @@ router.post('/orgs/:id/approve', async (req: Request, res: Response, next: NextF
       },
     });
 
+    const existingUser = await prisma.user.findUnique({ where: { email: org.contact_email } });
+    if (existingUser) throw new ValidationError('A user with the organisation contact email already exists');
+
     const inviteToken   = generateToken();
     const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
@@ -268,6 +280,12 @@ router.post('/orgs/:id/approve', async (req: Request, res: Response, next: NextF
       },
     });
 
+    // Without seeded org roles + a userOrgRole assignment the new super admin
+    // resolves to ZERO permissions (rolePermissionKeys has no legacy fallback).
+    const { seedOrgRbacForOrganisation, upsertUserOrgRole } = await import('../utils/rbac-seed');
+    await seedOrgRbacForOrganisation(org.id);
+    await upsertUserOrgRole(user.id, org.id, 'super_admin');
+
     const frontendUrl = process.env.FRONTEND_URL?.split(',')[0]?.trim() || 'http://localhost:3000';
     const setupUrl    = `${frontendUrl}/setup-account?token=${inviteToken}`;
 
@@ -276,7 +294,7 @@ router.post('/orgs/:id/approve', async (req: Request, res: Response, next: NextF
 });
 
 // POST /admin/orgs/:id/reject
-router.post('/orgs/:id/reject', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs/:id/reject', canApproveOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
     if (!org) throw new NotFoundError('Organisation');
@@ -287,19 +305,22 @@ router.post('/orgs/:id/reject', async (req: Request, res: Response, next: NextFu
 });
 
 // POST /admin/orgs — direct org creation
-router.post('/orgs', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, timezone = 'UTC', currency = 'USD', plan = 'starter' } = req.body;
     if (!name?.trim()) throw new ValidationError('name is required');
     const org = await prisma.organisation.create({
       data: { name: name.trim(), timezone, currency, plan, status: 'active', subscription_status: 'active' },
     });
+    // Seed system org roles so users added later resolve permissions correctly
+    const { seedOrgRbacForOrganisation } = await import('../utils/rbac-seed');
+    await seedOrgRbacForOrganisation(org.id);
     ok(res, mapOrg(org));
   } catch (e) { next(e); }
 });
 
 // GET /admin/orgs/:id/users
-router.get('/orgs/:id/users', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/orgs/:id/users', canViewOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
     if (!org) throw new NotFoundError('Organisation');
@@ -318,14 +339,14 @@ router.get('/orgs/:id/users', async (req: Request, res: Response, next: NextFunc
 
 // ── Plan Definitions ──────────────────────────────────────────────────────────
 
-router.get('/plans', async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/plans', canViewPlans, async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const plans = await prisma.planDefinition.findMany({ orderBy: { sort_order: 'asc' } });
     ok(res, plans);
   } catch (e) { next(e); }
 });
 
-router.post('/plans', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/plans', canManagePlans, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id, display_name, price_monthly, price_annual, max_employees, trial_days, features, description, highlight, is_active, sort_order } = req.body;
     if (!id?.trim()) throw new ValidationError('id is required');
@@ -349,7 +370,7 @@ router.post('/plans', async (req: Request, res: Response, next: NextFunction) =>
   } catch (e) { next(e); }
 });
 
-router.put('/plans/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.put('/plans/:id', canManagePlans, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { display_name, price_monthly, price_annual, max_employees, trial_days, features, description, highlight, is_active, sort_order } = req.body;
     const plan = await prisma.planDefinition.update({
@@ -371,7 +392,7 @@ router.put('/plans/:id', async (req: Request, res: Response, next: NextFunction)
   } catch (e) { next(e); }
 });
 
-router.delete('/plans/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/plans/:id', canManagePlans, async (req: Request, res: Response, next: NextFunction) => {
   try {
     await prisma.planDefinition.delete({ where: { id: req.params.id as string } });
     ok(res, { message: 'Plan deleted' });
@@ -380,7 +401,7 @@ router.delete('/plans/:id', async (req: Request, res: Response, next: NextFuncti
 
 // ── Blog ──────────────────────────────────────────────────────────────────────
 
-router.get('/blog', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/blog', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const page  = Math.max(1, Number(req.query.page)  || 1);
     const limit = Math.min(50, Number(req.query.limit) || 20);
@@ -395,7 +416,7 @@ router.get('/blog', async (req: Request, res: Response, next: NextFunction) => {
   } catch (e) { next(e); }
 });
 
-router.post('/blog', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/blog', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
       slug, title, excerpt, content, author_name, author_avatar, cover_image,
@@ -427,14 +448,14 @@ router.post('/blog', async (req: Request, res: Response, next: NextFunction) => 
   } catch (e) { next(e); }
 });
 
-router.get('/blog/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.get('/blog/:id', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const post = await prisma.blogPost.findUniqueOrThrow({ where: { id: req.params.id as string } });
     ok(res, post);
   } catch (e) { next(e); }
 });
 
-router.put('/blog/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.put('/blog/:id', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
       slug, title, excerpt, content, author_name, author_avatar, cover_image,
@@ -468,7 +489,7 @@ router.put('/blog/:id', async (req: Request, res: Response, next: NextFunction) 
   } catch (e) { next(e); }
 });
 
-router.delete('/blog/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/blog/:id', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
   try {
     await prisma.blogPost.delete({ where: { id: req.params.id as string } });
     ok(res, { message: 'Post deleted' });
@@ -476,7 +497,7 @@ router.delete('/blog/:id', async (req: Request, res: Response, next: NextFunctio
 });
 
 // PATCH /admin/blog/:id/publish — toggle publish status
-router.patch('/blog/:id/publish', async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/blog/:id/publish', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const existing = await prisma.blogPost.findUniqueOrThrow({ where: { id: req.params.id as string } });
     const post = await prisma.blogPost.update({
