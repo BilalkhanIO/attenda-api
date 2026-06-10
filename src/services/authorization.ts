@@ -110,6 +110,8 @@ export interface UserCapabilities {
   features: PlanFeatures;
   org_role: { id: string; slug: string; name: string } | null;
   platform_permissions: string[];
+  /** Org IANA timezone — the client renders all wall-clock times in this zone. */
+  timezone: string;
 }
 
 export async function getUserCapabilities(
@@ -117,7 +119,7 @@ export async function getUserCapabilities(
   orgId: string,
   legacyRole: string,
 ): Promise<UserCapabilities> {
-  const [permissions, features, assignment, platformPerms] = await Promise.all([
+  const [permissions, features, assignment, platformPerms, org] = await Promise.all([
     resolveUserPermissions(userId, orgId),
     resolveOrgFeatures(orgId),
     prisma.userOrgRole.findUnique({
@@ -127,6 +129,7 @@ export async function getUserCapabilities(
     legacyRole === 'platform_admin'
       ? resolvePlatformPermissions(userId)
       : Promise.resolve(new Set<string>()),
+    prisma.organisation.findUnique({ where: { id: orgId }, select: { timezone: true } }),
   ]);
 
   return {
@@ -134,5 +137,6 @@ export async function getUserCapabilities(
     features,
     org_role: assignment?.org_role ?? null,
     platform_permissions: [...platformPerms].sort(),
+    timezone: org?.timezone ?? 'UTC',
   };
 }

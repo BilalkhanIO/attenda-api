@@ -128,6 +128,34 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
 }
 
 /**
+ * Minutes worked PAST the scheduled shift end (>= 0), excluding any unpaid
+ * break time that fell after the shift end. `scheduledEnd` is the exact UTC
+ * instant the shift was due to end — pass the value persisted on the record
+ * (scheduled_end) so overnight shifts, whose checkout lands on the next
+ * org-local day, are measured against the correct day rather than a window
+ * recomputed from the checkout instant. Returns 0 when there is no schedule
+ * or the checkout was at/before the scheduled end.
+ */
+export async function netExtraMinutesAfterShift(
+  attendanceId: string,
+  checkOutAt: Date,
+  scheduledEnd: Date | null,
+): Promise<number> {
+  if (!scheduledEnd) return 0;
+  const end = scheduledEnd;
+  if (checkOutAt <= end) return 0;
+  const breaks = await prisma.breakRecord.findMany({
+    where: { attendance_id: attendanceId, is_paid: false, break_end: { not: null } },
+  });
+  const unpaidOverlap = breaks.reduce((sum, b) => {
+    const start = b.break_start > end ? b.break_start : end;
+    const stop = b.break_end && b.break_end < checkOutAt ? b.break_end : checkOutAt;
+    return stop > start ? sum + Math.round((stop.getTime() - start.getTime()) / 60000) : sum;
+  }, 0);
+  return Math.max(0, Math.round((checkOutAt.getTime() - end.getTime()) / 60000) - unpaidOverlap);
+}
+
+/**
  * Net hours actually worked = gross hours minus UNPAID break time.
  * Paid breaks count as work time, so they're not subtracted.
  */

@@ -4,7 +4,7 @@ import { authenticate, requireRole } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
-import { settleBreaks, netHoursWorked } from '../utils/attendance';
+import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift } from '../utils/attendance';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -47,7 +47,12 @@ async function effectiveShiftForUser(userId: string, orgId: string, date: Date, 
   });
   if (assignment?.shift) return assignment.shift;
 
-  const weekday = at.getDay();
+  // Weekday must be the ORG-LOCAL weekday (matches scheduler.ts and dayMatchesBreak),
+  // not the server-local one. `date` is the org-local day anchored at UTC midnight
+  // (dateOnlyInTz), so getUTCDay() yields the org-local weekday regardless of where
+  // the server runs. Using at.getDay() here resolved a different shift than the
+  // scheduler did whenever server tz ≠ org tz near a day boundary.
+  const weekday = date.getUTCDay();
   return await prisma.shift.findFirst({
     where: { org_id: orgId, is_org_wide: true, active_days: { has: weekday }, is_published: true },
     include,
@@ -55,21 +60,6 @@ async function effectiveShiftForUser(userId: string, orgId: string, date: Date, 
     where: { org_id: orgId, is_default: true, active_days: { has: weekday }, is_published: true },
     include,
   });
-}
-
-async function netExtraMinutesAfterShift(attendanceId: string, checkOutAt: Date, shift: any, tz: string): Promise<number> {
-  if (!shift) return 0;
-  const { end } = scheduledWindow(shift, tz, checkOutAt);
-  if (checkOutAt <= end) return 0;
-  const breaks = await prisma.breakRecord.findMany({
-    where: { attendance_id: attendanceId, is_paid: false, break_end: { not: null } },
-  });
-  const unpaidOverlap = breaks.reduce((sum, b) => {
-    const start = b.break_start > end ? b.break_start : end;
-    const stop = b.break_end && b.break_end < checkOutAt ? b.break_end : checkOutAt;
-    return stop > start ? sum + Math.round((stop.getTime() - start.getTime()) / 60000) : sum;
-  }, 0);
-  return Math.max(0, Math.round((checkOutAt.getTime() - end.getTime()) / 60000) - unpaidOverlap);
 }
 
 function minutesToDateOnShiftDay(minutes: number, base: Date, tz: string): Date {
@@ -923,9 +913,14 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         scheduledStart = win.start;
         scheduledEnd = win.end;
         const rawLateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
-        if (rawLateMins > lateThresholdFor(shift, orgInfo)) status = 'late';
-        // Store tolerance-adjusted value: minutes past the grace window (not raw minutes from shift start)
-        lateMins = Math.max(0, rawLateMins - (shift.late_tolerance_mins ?? 0));
+        // ONE threshold drives both the late flag and the stored minutes so they
+        // can never disagree (shift tolerance → org threshold → 15 default).
+        // Previously the flag used the org fallback while the stored value
+        // subtracted only the per-shift tolerance, so a within-grace arrival could
+        // be flagged on-time yet still carry late_minutes and lose adherence points.
+        const lateThreshold = lateThresholdFor(shift, orgInfo);
+        if (rawLateMins > lateThreshold) status = 'late';
+        lateMins = Math.max(0, rawLateMins - lateThreshold);
 
         if (scheduledStart && now < scheduledStart) {
           earlyCheckinMins = Math.round((scheduledStart.getTime() - now.getTime()) / 60000);
@@ -1101,14 +1096,21 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
       select: { is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
     });
 
-    // Shift-based compliance on checkout (timezone-aware)
-    const rawEarlyMins = record.shift
-      ? Math.max(0, Math.round((adjustedWindowForLeave(record.shift, orgTimezone, now, approvedLeave).end.getTime() - now.getTime()) / 60000))
-      : earlyOutMinutes(now, record.shift, orgTimezone);
-    // Store tolerance-adjusted value: minutes beyond the early-checkout grace window
-    const earlyMins = Math.max(0, rawEarlyMins - (record.shift?.early_checkout_tolerance_mins ?? 0));
+    // Shift-based compliance on checkout (timezone-aware).
+    // Prefer the schedule persisted at check-in: for overnight shifts the checkout
+    // instant falls on the next org-local day, so recomputing the window from `now`
+    // would anchor it to the wrong day and skew early-out / overtime. Fall back to a
+    // fresh computation only when no scheduled_end was stored (e.g. legacy records).
+    const scheduledEnd: Date | null = record.scheduled_end
+      ?? (record.shift ? adjustedWindowForLeave(record.shift, orgTimezone, now, approvedLeave).end : null);
+    const rawEarlyMins = scheduledEnd
+      ? Math.max(0, Math.round((scheduledEnd.getTime() - now.getTime()) / 60000))
+      : 0;
+    // One tolerance drives both the stored minutes and the early-leave alert below.
+    const earlyTolerance = record.shift?.early_checkout_tolerance_mins ?? 15;
+    const earlyMins = Math.max(0, rawEarlyMins - earlyTolerance);
     const score     = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
-    const extraOfficeMins = await netExtraMinutesAfterShift(record.id, now, record.shift, orgTimezone);
+    const extraOfficeMins = await netExtraMinutesAfterShift(record.id, now, scheduledEnd);
     const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
     const overtimeHours = autoCountOvertime
       ? parseFloat((extraOfficeMins / 60).toFixed(2))
@@ -1136,7 +1138,6 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
     }
 
     // Notify manager when employee leaves before their shift ends (compare raw minutes vs tolerance)
-    const earlyTolerance = record.shift?.early_checkout_tolerance_mins ?? 15;
     if (rawEarlyMins > earlyTolerance) {
       const orgId  = req.user!.org_id;
       const userId = req.user!.sub;
@@ -1253,9 +1254,10 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           scheduledStart = win.start;
           scheduledEnd   = win.end;
           const rawIpLateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
-          if (rawIpLateMins > lateThresholdFor(shift, org)) status = 'late';
-          // Store tolerance-adjusted value (minutes past the grace window)
-          lateMins = Math.max(0, rawIpLateMins - (shift.late_tolerance_mins ?? 0));
+          // One threshold for both the flag and stored minutes (see /checkin).
+          const lateThreshold = lateThresholdFor(shift, org);
+          if (rawIpLateMins > lateThreshold) status = 'late';
+          lateMins = Math.max(0, rawIpLateMins - lateThreshold);
         }
 
         let earlyIpMins = 0;

@@ -9,21 +9,14 @@ import {
 import {
   minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow, shiftAutoCheckoutDue
 } from '../utils/shift';
-import { settleBreaks, netHoursWorked } from '../utils/attendance';
+import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift } from '../utils/attendance';
 
-async function netExtraMinutesAfterShift(attendanceId: string, checkOutAt: Date, shift: any, tz: string): Promise<number> {
-  if (!shift) return 0;
-  const { end } = scheduledWindow(shift, tz, checkOutAt);
-  if (checkOutAt <= end) return 0;
-  const breaks = await prisma.breakRecord.findMany({
-    where: { attendance_id: attendanceId, is_paid: false, break_end: { not: null } },
-  });
-  const unpaidOverlap = breaks.reduce((sum, b) => {
-    const start = b.break_start > end ? b.break_start : end;
-    const stop = b.break_end && b.break_end < checkOutAt ? b.break_end : checkOutAt;
-    return stop > start ? sum + Math.round((stop.getTime() - start.getTime()) / 60000) : sum;
-  }, 0);
-  return Math.max(0, Math.round((checkOutAt.getTime() - end.getTime()) / 60000) - unpaidOverlap);
+// Resolve the shift-end instant for overtime math: prefer the value persisted at
+// check-in (correct for overnight shifts), else recompute the window from checkOut.
+function resolveScheduledEnd(record: any, tz: string, checkOut: Date): Date | null {
+  if (record.scheduled_end) return new Date(record.scheduled_end);
+  if (!record.shift) return null;
+  return scheduledWindow(record.shift, tz, checkOut).end;
 }
 
 // ─── Job: Late Arrival Detector ───────────────────────
@@ -271,7 +264,7 @@ export function startHeartbeatExpiryMonitor() {
         // Store tolerance-adjusted value: minutes beyond the early-checkout grace window
         const earlyMins = Math.max(0, rawEarlyMins - (record.shift?.early_checkout_tolerance_mins ?? 0));
         const score = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
-        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, record.shift, tz);
+        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, resolveScheduledEnd(record, tz, checkOut));
         const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
         const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
 
@@ -320,7 +313,7 @@ export function startStaleRecordSweep() {
         const effectiveOut = checkOut > record.check_in_at! ? checkOut : record.check_in_at!;
         const hoursWorked = (effectiveOut.getTime() - record.check_in_at!.getTime()) / 3600000;
         const breaks = await settleBreaks(record.id, effectiveOut, tz);
-        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, effectiveOut, record.shift, tz);
+        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, effectiveOut, resolveScheduledEnd(record, tz, effectiveOut));
         const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
         const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
 
@@ -525,7 +518,7 @@ export function startShiftAutoCheckoutJob() {
         const rawEarlyMins = earlyOutMinutes(checkOut, record.shift, tz);
         const earlyMins = Math.max(0, rawEarlyMins - (record.shift?.early_checkout_tolerance_mins ?? 0));
         const score = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
-        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, record.shift, tz);
+        const extraOfficeMins = await netExtraMinutesAfterShift(record.id, checkOut, resolveScheduledEnd(record, tz, checkOut));
         const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
         const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
 

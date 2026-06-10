@@ -99,23 +99,37 @@ router.post('/', requireOrgFeature('shifts'), requirePermission('shifts.manage')
   try {
     const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, overtime_enabled, overtime_requires_approval, extra_time_label, is_org_wide, is_default } = req.body;
     if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
-    const shift = await prisma.shift.create({
-      data: {
-        org_id: req.user!.org_id, name, start_time, end_time, color: color || '#f15153',
-        active_days: active_days ?? days_of_week ?? [],
-        created_by: req.user!.sub,
-        ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
-        ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
-        ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
-        ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
-        ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
-        ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
-        ...(overtime_enabled !== undefined && { overtime_enabled: !!overtime_enabled }),
-        ...(overtime_requires_approval !== undefined && { overtime_requires_approval: !!overtime_requires_approval }),
-        ...(extra_time_label !== undefined && { extra_time_label: String(extra_time_label || 'Extra office time') }),
-        ...(is_org_wide !== undefined && { is_org_wide: !!is_org_wide }),
-        ...(is_default !== undefined && { is_default: !!is_default }),
-      },
+
+    const orgWide   = !!is_org_wide;
+    const isDefault = !!is_default;
+    const orgId     = req.user!.org_id;
+
+    // org-wide / default shifts apply automatically (not via the weekly publish
+    // flow), so there must be at most one of each per org and they must be
+    // published immediately — otherwise effectiveShiftForUser's fallback, which
+    // filters on is_published, would never match them.
+    const shift = await prisma.$transaction(async (tx) => {
+      if (orgWide)   await tx.shift.updateMany({ where: { org_id: orgId, is_org_wide: true }, data: { is_org_wide: false } });
+      if (isDefault) await tx.shift.updateMany({ where: { org_id: orgId, is_default: true },  data: { is_default: false } });
+      return tx.shift.create({
+        data: {
+          org_id: orgId, name, start_time, end_time, color: color || '#f15153',
+          active_days: active_days ?? days_of_week ?? [],
+          created_by: req.user!.sub,
+          is_org_wide: orgWide,
+          is_default: isDefault,
+          ...((orgWide || isDefault) && { is_published: true }),
+          ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
+          ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
+          ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
+          ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
+          ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
+          ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
+          ...(overtime_enabled !== undefined && { overtime_enabled: !!overtime_enabled }),
+          ...(overtime_requires_approval !== undefined && { overtime_requires_approval: !!overtime_requires_approval }),
+          ...(extra_time_label !== undefined && { extra_time_label: String(extra_time_label || 'Extra office time') }),
+        },
+      });
     });
     created(res, shift);
   } catch (e) { next(e); }
@@ -174,27 +188,34 @@ router.put('/:id', requirePermission('shifts.manage'), async (req, res, next) =>
     if (!shift) throw new NotFoundError('Shift');
     const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, overtime_enabled, overtime_requires_approval, extra_time_label, is_org_wide, is_default } = req.body;
 
-    if (is_default && !shift.is_default) {
-      await prisma.shift.updateMany({ where: { org_id: req.user!.org_id }, data: { is_default: false } });
-    }
+    const orgId        = req.user!.org_id;
+    const turningOnDefault = is_default === true && !shift.is_default;
+    const turningOnOrgWide = is_org_wide === true && !shift.is_org_wide;
 
-    const updated = await prisma.shift.update({
-      where: { id },
-      data: {
-        name, start_time, end_time, color,
-        active_days: active_days ?? days_of_week,
-        is_org_wide: is_org_wide !== undefined ? !!is_org_wide : undefined,
-        is_default: is_default !== undefined ? !!is_default : undefined,
-        ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
-        ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
-        ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
-        ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
-        ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
-        ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
-        ...(overtime_enabled !== undefined && { overtime_enabled: !!overtime_enabled }),
-        ...(overtime_requires_approval !== undefined && { overtime_requires_approval: !!overtime_requires_approval }),
-        ...(extra_time_label !== undefined && { extra_time_label: String(extra_time_label || 'Extra office time') }),
-      },
+    const updated = await prisma.$transaction(async (tx) => {
+      // Keep at most one default / one org-wide shift per org (mirrors POST).
+      if (turningOnDefault) await tx.shift.updateMany({ where: { org_id: orgId, is_default: true },  data: { is_default: false } });
+      if (turningOnOrgWide) await tx.shift.updateMany({ where: { org_id: orgId, is_org_wide: true }, data: { is_org_wide: false } });
+      return tx.shift.update({
+        where: { id },
+        data: {
+          name, start_time, end_time, color,
+          active_days: active_days ?? days_of_week,
+          is_org_wide: is_org_wide !== undefined ? !!is_org_wide : undefined,
+          is_default: is_default !== undefined ? !!is_default : undefined,
+          // Auto-publish when promoting to org-wide/default so the fallback fires.
+          ...((turningOnOrgWide || turningOnDefault) && { is_published: true }),
+          ...(overtime_multiplier !== undefined && { overtime_multiplier: parseFloat(overtime_multiplier) }),
+          ...(min_rest_hours !== undefined && { min_rest_hours: parseFloat(min_rest_hours) }),
+          ...(late_tolerance_mins !== undefined && { late_tolerance_mins: +late_tolerance_mins }),
+          ...(early_checkout_tolerance_mins !== undefined && { early_checkout_tolerance_mins: +early_checkout_tolerance_mins }),
+          ...(auto_checkout !== undefined && { auto_checkout: !!auto_checkout }),
+          ...(auto_checkout_buffer_mins !== undefined && { auto_checkout_buffer_mins: +auto_checkout_buffer_mins }),
+          ...(overtime_enabled !== undefined && { overtime_enabled: !!overtime_enabled }),
+          ...(overtime_requires_approval !== undefined && { overtime_requires_approval: !!overtime_requires_approval }),
+          ...(extra_time_label !== undefined && { extra_time_label: String(extra_time_label || 'Extra office time') }),
+        },
+      });
     });
     ok(res, updated);
   } catch (e) { next(e); }
@@ -209,10 +230,35 @@ router.put('/:id/set-default', requirePermission('shifts.manage'), async (req, r
 
     await prisma.$transaction([
       prisma.shift.updateMany({ where: { org_id: req.user!.org_id }, data: { is_default: false } }),
-      prisma.shift.update({ where: { id }, data: { is_default: true } }),
+      // Publish too: a default shift applies via the (is_published) fallback.
+      prisma.shift.update({ where: { id }, data: { is_default: true, is_published: true } }),
     ]);
 
     ok(res, { message: 'Shift set as default for the organisation' });
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /shifts/:id/set-org-wide ─────────────────────
+// One-click "apply this shift to the whole organisation". Makes the shift the
+// single org-wide shift (everyone without a specific assignment follows it) and
+// publishes it so effectiveShiftForUser's org-wide fallback matches.
+router.put('/:id/set-org-wide', requirePermission('shifts.manage'), async (req, res, next) => {
+  try {
+    const id = req.params.id as string;
+    const { org_wide = true } = req.body as { org_wide?: boolean };
+    const shift = await prisma.shift.findFirst({ where: { id, org_id: req.user!.org_id } });
+    if (!shift) throw new NotFoundError('Shift');
+
+    if (org_wide) {
+      await prisma.$transaction([
+        prisma.shift.updateMany({ where: { org_id: req.user!.org_id, is_org_wide: true }, data: { is_org_wide: false } }),
+        prisma.shift.update({ where: { id }, data: { is_org_wide: true, is_published: true } }),
+      ]);
+      return ok(res, { message: 'Shift applied to the whole organisation' });
+    }
+
+    await prisma.shift.update({ where: { id }, data: { is_org_wide: false } });
+    ok(res, { message: 'Org-wide shift cleared' });
   } catch (e) { next(e); }
 });
 
@@ -290,8 +336,10 @@ router.post('/assignments', requirePermission('shifts.assign'), async (req, res,
     if (onLeave) console.warn(`[SHIFTS] Warning: ${user_id} has approved leave on ${date}`);
 
     // Active-day check: warn (don't block) if the date's weekday isn't in the
-    // shift's active_days. JS getDay() is 0=Sun..6=Sat — match that convention.
-    const weekday = assignDate.getDay();
+    // shift's active_days. active_days uses 0=Sun..6=Sat. assignDate is anchored
+    // at UTC midnight, so getUTCDay() gives the intended weekday; getDay() would
+    // be off by a day on any server not in UTC (e.g. behind-UTC zones).
+    const weekday = assignDate.getUTCDay();
     const offDay  = Array.isArray(shift.active_days) && shift.active_days.length > 0 && !shift.active_days.includes(weekday);
 
     const assignment = await prisma.shiftAssignment.create({
@@ -448,7 +496,7 @@ router.post('/assignments/bulk', requirePermission('shifts.assign'), async (req,
           new Date(l.start_date) <= assignDate &&
           new Date(l.end_date)   >= assignDate
         );
-        const weekday = assignDate.getDay();
+        const weekday = assignDate.getUTCDay(); // UTC-anchored date → use getUTCDay (see single-assign route above)
         const offDay  = Array.isArray(shift.active_days) && shift.active_days.length > 0 && !shift.active_days.includes(weekday);
 
         await prisma.shiftAssignment.create({ data: { shift_id, user_id: userId, date: assignDate } });
