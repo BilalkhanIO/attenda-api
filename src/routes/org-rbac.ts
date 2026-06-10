@@ -50,6 +50,12 @@ router.post('/roles', requirePermission('org.roles.manage'), async (req: Request
     const normalizedSlug = slug.trim().toLowerCase().replace(/\s+/g, '_');
     if (SYSTEM_SLUGS.has(normalizedSlug)) throw new ValidationError('Reserved role slug');
 
+    if (Array.isArray(permission_keys)) {
+      const valid = new Set(PERMISSION_CATALOG.map(p => p.key));
+      const unknown = permission_keys.filter(k => !valid.has(k));
+      if (unknown.length) throw new ValidationError(`Unknown permission keys: ${unknown.join(', ')}`);
+    }
+
     const role = await prisma.orgRole.create({
       data: {
         org_id: req.user!.org_id,
@@ -109,13 +115,18 @@ router.put('/roles/:id/permissions', requirePermission('org.roles.manage'), asyn
     const { permission_keys } = req.body as { permission_keys?: string[] };
     if (!Array.isArray(permission_keys)) throw new ValidationError('permission_keys must be an array');
 
-    await prisma.orgRolePermission.deleteMany({ where: { org_role_id: role.id } });
-    if (permission_keys.length) {
-      await prisma.orgRolePermission.createMany({
+    const valid = new Set(PERMISSION_CATALOG.map(p => p.key));
+    const unknown = permission_keys.filter(k => !valid.has(k));
+    if (unknown.length) throw new ValidationError(`Unknown permission keys: ${unknown.join(', ')}`);
+
+    // Transactional replace — a failed insert must not wipe existing permissions
+    await prisma.$transaction([
+      prisma.orgRolePermission.deleteMany({ where: { org_role_id: role.id } }),
+      ...(permission_keys.length ? [prisma.orgRolePermission.createMany({
         data: permission_keys.map(permission_key => ({ org_role_id: role.id, permission_key })),
         skipDuplicates: true,
-      });
-    }
+      })] : []),
+    ]);
 
     const updated = await prisma.orgRole.findUnique({
       where: { id: role.id },
