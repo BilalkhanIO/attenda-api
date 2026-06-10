@@ -64,7 +64,6 @@ async function seed() {
     { id: 'user-emp4',       name: 'David Park',     email: 'david@demo.attenda.app',   role: 'employee',    department: 'Sales',      job_title: 'Sales Rep',         manager_id: 'user-hradmin' },
   ];
 
-  const password = await hashPassword('Demo1234!');
   for (const u of users) {
     await prisma.user.upsert({
       where: { id: u.id },
