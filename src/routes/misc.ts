@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { Router } from 'express';
-import { authenticate, requireRole, requireOrgFeature, requirePermission } from '../middleware/auth';
+import { authenticate, requireOrgFeature, requirePermission } from '../middleware/auth';
+import { resolveUserPermissions } from '../services/authorization';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
@@ -24,14 +25,14 @@ performanceRouter.get('/reviews', requirePermission('performance.view'), async (
     }
 
     const where: Record<string, unknown> = { org_id: req.user!.org_id, period_month: m, period_year: y };
-    if (!['hr_admin', 'super_admin'].includes(req.user!.role)) {
+    if (!req.permissions?.has('employees.view')) {
       const team = await prisma.user.findMany({ where: { manager_id: req.user!.sub }, select: { id: true } });
       where.user_id = { in: team.map(u => u.id) };
     }
 
     // Ensure reviews exist for all active users
     const users = await prisma.user.findMany({
-      where: { org_id: req.user!.org_id, is_active: true, role: 'employee', deleted_at: null, ...(!['hr_admin', 'super_admin'].includes(req.user!.role) ? { manager_id: req.user!.sub } : {}) },
+      where: { org_id: req.user!.org_id, is_active: true, role: 'employee', deleted_at: null, ...(!req.permissions?.has('employees.view') ? { manager_id: req.user!.sub } : {}) },
       select: { id: true },
     });
 
@@ -136,7 +137,8 @@ performanceRouter.post('/reviews/:userId', requirePermission('performance.manage
 performanceRouter.get('/goals', async (req, res, next) => {
   try {
     const requestedUserId = req.query.user_id as string | undefined;
-    const isManager = ['manager', 'hr_admin', 'super_admin'].includes(req.user!.role);
+    const perms = await resolveUserPermissions(req.user!.sub, req.user!.org_id);
+    const isManager = perms.has('performance.view');
     let goalWhere: Record<string, unknown>;
     if (isManager && !requestedUserId) {
       // Manager with no filter — return all goals across the org
@@ -509,12 +511,21 @@ orgRouter.get('/settings', async (req, res, next) => {
 // PUT /org/settings
 orgRouter.put('/settings', requirePermission('org.settings.update'), async (req, res, next) => {
   try {
-    const { name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold, totp_required } = req.body;
+    const {
+      name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold, totp_required,
+      logo_url, address, phone, website, industry, registration_number,
+    } = req.body;
     const data: Record<string, unknown> = {};
     if (name       !== undefined) data.name        = name;
     if (timezone   !== undefined) data.timezone    = timezone;
     if (currency   !== undefined) data.currency    = currency;
     if (totp_required !== undefined) data.totp_required = Boolean(totp_required);
+    if (logo_url   !== undefined) data.logo_url    = logo_url || null;
+    if (address    !== undefined) data.address     = address || null;
+    if (phone      !== undefined) data.phone       = phone || null;
+    if (website    !== undefined) data.website     = website || null;
+    if (industry   !== undefined) data.industry    = industry || null;
+    if (registration_number !== undefined) data.registration_number = registration_number || null;
     if (payroll_day !== undefined) {
       const day = parseInt(payroll_day);
       if (day < 1 || day > 28) throw new ValidationError('payroll_day must be between 1 and 28');
@@ -534,6 +545,16 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), async (req,
       const mins = parseInt(late_threshold);
       if (mins < 0 || mins > 120) throw new ValidationError('late_threshold must be between 0 and 120 minutes');
       data.late_threshold = mins;
+    }
+    if (req.body.heartbeat_grace_mins !== undefined) {
+      const mins = parseInt(req.body.heartbeat_grace_mins);
+      if (mins < 10 || mins > 120) throw new ValidationError('heartbeat_grace_mins must be between 10 and 120');
+      data.heartbeat_grace_mins = mins;
+    }
+    if (req.body.gap_forgiveness_mins !== undefined) {
+      const mins = parseInt(req.body.gap_forgiveness_mins);
+      if (mins < 0 || mins > 90) throw new ValidationError('gap_forgiveness_mins must be between 0 and 90');
+      data.gap_forgiveness_mins = mins;
     }
     const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, updated);

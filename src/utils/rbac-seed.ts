@@ -56,6 +56,7 @@ const HR_ADMIN_PERMS = [
   'whatsapp.logs.view',
   'org.settings.view',
   'org.qr.manage',
+  'org.departments.manage',
 ];
 
 const SUPER_ADMIN_PERMS = [

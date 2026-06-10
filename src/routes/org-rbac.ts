@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, requireRole, requirePermission } from '../middleware/auth';
+import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, created, NotFoundError, ValidationError, ForbiddenError } from '../utils/response';
 import prisma from '../utils/prisma';
 import { PERMISSION_CATALOG } from '../constants/rbac';
@@ -156,7 +156,7 @@ router.delete('/roles/:id', requirePermission('org.roles.manage'), async (req: R
 // ─── PUT /org/users/:userId/role — assign org role ─────
 router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { org_role_id } = req.body as { org_role_id?: string };
+    const { org_role_id, sync_legacy_role } = req.body as { org_role_id?: string; sync_legacy_role?: boolean };
     if (!org_role_id) throw new ValidationError('org_role_id is required');
 
     const userId = String(req.params.userId);
@@ -175,6 +175,14 @@ router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (
       update: { org_role_id: orgRole.id },
       create: { user_id: target.id, org_role_id: orgRole.id },
     });
+
+    // The org-role assignment is the source of truth for permissions; the
+    // users.role column is kept only as a denormalised mirror (JWT claim,
+    // legacy displays). Sync it when assigning a system role unless the
+    // caller opts out. Custom roles leave the mirror untouched.
+    if (sync_legacy_role !== false && SYSTEM_SLUGS.has(orgRole.slug)) {
+      await prisma.user.update({ where: { id: target.id }, data: { role: orgRole.slug } });
+    }
 
     ok(res, { user_id: target.id, org_role_id: orgRole.id, slug: orgRole.slug });
   } catch (e) { next(e); }

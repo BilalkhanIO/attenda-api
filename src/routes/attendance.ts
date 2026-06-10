@@ -137,7 +137,7 @@ router.get('/today', requirePermission('attendance.view_team'), async (req: Requ
     const { today } = await orgTimeContext(req.user!.org_id);
     const date = rawDate ? parseDateOnly(rawDate) : today;
     const where: Record<string, unknown> = { org_id: req.user!.org_id, date };
-    if (!['hr_admin', 'super_admin'].includes(req.user!.role)) {
+    if (!req.permissions?.has('employees.view')) {
       const teamIds = await prisma.user.findMany({
         where: { manager_id: req.user!.sub, is_active: true },
         select: { id: true },
@@ -172,7 +172,7 @@ router.get('/remote/sessions', requirePermission('remote.approve'), async (req: 
   try {
     const { status } = req.query as { status?: string };
 
-    const teamIds = !['hr_admin', 'super_admin'].includes(req.user!.role)
+    const teamIds = !req.permissions?.has('employees.view')
       ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
       : null;
 
@@ -295,7 +295,7 @@ router.get('/remote/monitor', requirePermission('remote.approve'), async (req: R
     const today = startOfDay(new Date());
     const now   = new Date();
 
-    const isManager = !['hr_admin', 'super_admin'].includes(req.user!.role);
+    const isManager = !req.permissions?.has('employees.view');
     const teamIds = isManager
       ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
       : null;
@@ -574,7 +574,7 @@ router.get('/late-notices', requirePermission('attendance.late_notices.manage'),
     const { today } = await orgTimeContext(req.user!.org_id);
     const { status } = req.query as { status?: string };
 
-    const isManager = !['hr_admin', 'super_admin'].includes(req.user!.role);
+    const isManager = !req.permissions?.has('employees.view');
     const teamIds = isManager
       ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
       : null;
@@ -833,6 +833,29 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     // unpaid 'away' break and reopen the record so the rest of the day continues.
     if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
       const reentryTime = new Date();
+      const reopenedStatus = (existing.late_minutes ?? 0) > 0 ? 'late' : 'in';
+      const gapSinceCheckout = Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000);
+
+      // Doze-gap forgiveness — see /ip-event re-entry for rationale.
+      const forgivenessMins = orgInfo?.gap_forgiveness_mins ?? 15;
+      if (gapSinceCheckout <= forgivenessMins) {
+        const stitched = await prisma.attendanceRecord.update({
+          where: { id: existing.id },
+          data: {
+            check_out_at:      null,
+            hours_worked:      null,
+            net_hours_worked:  null,
+            early_out_minutes: 0,
+            adherence_score:   null,
+            auto_checked_out:  false,
+            status:            reopenedStatus,
+            last_heartbeat_at: null,
+          },
+          include: RECORD_INCLUDE,
+        });
+        return ok(res, { ...stitched, action: 're_entered', gap_mins: gapSinceCheckout, forgiven: true, warning: null });
+      }
+
       const { gapMins, limitExceeded } = await createAwayGapBreak(existing, reentryTime, {
         countAsBreak: !!count_away_as_break,
         shiftBreakId: away_shift_break_id,
@@ -846,7 +869,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
           early_out_minutes: 0,
           adherence_score:   null,
           auto_checked_out:  false,
-          status:            'in',
+          status:            reopenedStatus,
           break_minutes:     (existing.break_minutes || 0) + gapMins,
           last_heartbeat_at: null,
         },
@@ -1201,7 +1224,11 @@ router.post('/heartbeat', async (req: Request, res: Response, next: NextFunction
       where: { id: record.id },
       data: { last_heartbeat_at: new Date(), last_heartbeat_ssid: ssid ?? null },
     });
-    return ok(res, { action: 'heartbeat_accepted' });
+    const hbOrg = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: { heartbeat_grace_mins: true },
+    });
+    return ok(res, { action: 'heartbeat_accepted', grace_mins: hbOrg?.heartbeat_grace_mins ?? 20 });
   } catch (e) { next(e); }
 });
 
@@ -1346,6 +1373,33 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
       // Re-entry after WiFi dropout: employee was auto-checked out and has reconnected.
       if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
         const reentryTime = new Date();
+        const reopenedStatus = (existing.late_minutes ?? 0) > 0 ? 'late' : 'in';
+        const gapSinceCheckout = Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000);
+
+        // Doze-gap forgiveness: the device is back on a registered office
+        // network after a short gap — almost always a phone with its screen
+        // off (Android Doze suppressed heartbeats), not a real departure.
+        // Stitch the record as if the checkout never happened: no away
+        // break, no break-minute deduction.
+        const forgivenessMins = org?.gap_forgiveness_mins ?? 15;
+        if (gapSinceCheckout <= forgivenessMins) {
+          await prisma.attendanceRecord.update({
+            where: { id: existing.id },
+            data: {
+              check_out_at:      null,
+              hours_worked:      null,
+              net_hours_worked:  null,
+              early_out_minutes: 0,
+              adherence_score:   null,
+              auto_checked_out:  false,
+              status:            reopenedStatus,
+              last_heartbeat_at: reentryTime,
+              last_heartbeat_ssid: ssid ?? null,
+            },
+          });
+          return ok(res, { action: 're_entered', gap_mins: gapSinceCheckout, forgiven: true, warning: null });
+        }
+
         const { gapMins, limitExceeded } = await createAwayGapBreak(existing, reentryTime, {
           countAsBreak: !!count_away_as_break,
           shiftBreakId: away_shift_break_id,
@@ -1359,7 +1413,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
             early_out_minutes: 0,
             adherence_score:   null,
             auto_checked_out:  false,
-            status:            'in',
+            status:            reopenedStatus,
             break_minutes:     (existing.break_minutes || 0) + gapMins,
             last_heartbeat_at: reentryTime,
             last_heartbeat_ssid: ssid ?? null,
@@ -1370,7 +1424,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
           notifyCheckIn(req.user!.org_id, reu.name, formatTime12h(reentryTime)).catch(console.error);
         }
-        return ok(res, { action: 're_entered', gap_mins: gapMins, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
+        return ok(res, { action: 're_entered', gap_mins: gapMins, forgiven: false, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
       }
 
       return ok(res, { action: 'already_in' });

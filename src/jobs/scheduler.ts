@@ -243,19 +243,27 @@ export function startHeartbeatExpiryMonitor() {
   cron.schedule('*/5 * * * *', async () => {
     const now = new Date();
     try {
+      // Query at the minimum possible staleness, then apply each org's
+      // configurable grace window. Android Doze rate-limits background work
+      // to ~1 wake per 9 minutes with the screen off, so anything under
+      // ~20 minutes produces phantom checkouts for users sitting at their desk.
       const expired = await prisma.attendanceRecord.findMany({
         where: {
           check_out_at: null,
           status: { in: ['in', 'late'] },
           last_heartbeat_at: { not: null, lte: new Date(now.getTime() - 10 * 60 * 1000) },
         },
-        include: { user: { include: { org: { select: { id: true, timezone: true } } } }, shift: true },
+        include: { user: { include: { org: { select: { id: true, timezone: true, heartbeat_grace_mins: true } } } }, shift: true },
       });
 
       for (const record of expired) {
         const tz = record.user.org?.timezone || 'UTC';
         const orgToday = dateOnlyInTz(now, tz);
         if (record.date.getTime() !== orgToday.getTime()) continue;
+
+        const graceMins = record.user.org?.heartbeat_grace_mins ?? 20;
+        const staleMins = (now.getTime() - record.last_heartbeat_at!.getTime()) / 60_000;
+        if (staleMins < graceMins) continue;
 
         const checkOut = record.last_heartbeat_at!;
         const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;

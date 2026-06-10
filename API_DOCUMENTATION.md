@@ -109,6 +109,22 @@ Directory and profile management.
 | `PATCH` | `/users/:id/deactivate` | Deactivate an employee account. |
 | `POST` | `/users/import` | Bulk import employees via CSV. |
 
+### 2.5b Departments (`/org/departments`)
+
+Structured departments with one level of sub-departments. The flat GET stays
+backward-compatible with the old string list.
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/org/departments` | Flat name list (departments table merged with legacy user strings). |
+| `GET` | `/org/departments/tree` | Hierarchy with member counts. |
+| `POST` | `/org/departments` | Create department or sub-department (`name`, `parent_id?`). Permission: `org.departments.manage`. |
+| `PUT` | `/org/departments/:id` | Rename / re-parent. Renames sync users' legacy department strings. |
+| `DELETE` | `/org/departments/:id` | Blocked while members or sub-departments exist. |
+
+Users accept `department_id` on create/update; the legacy `department` string
+is kept in sync from the department name.
+
 ### 2.6 Payroll (`/payroll`)
 Generation and viewing of monthly payslips.
 
