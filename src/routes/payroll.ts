@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { authenticate, requireRole, requireOrgFeature } from '../middleware/auth';
+import { authenticate, requirePermission, requireOrgFeature } from '../middleware/auth';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfMonth, endOfMonth } from '../utils/auth';
 import prisma from '../utils/prisma';
@@ -14,7 +14,7 @@ const RECORD_INCLUDE = {
 };
 
 // ─── GET /payroll ──────────────────────────────────────
-router.get('/', requireRole('hr_admin'), async (req, res, next) => {
+router.get('/', requirePermission('payroll.view'), async (req, res, next) => {
   try {
     const { month, year } = req.query as { month?: string; year?: string };
     const where: Record<string, unknown> = { org_id: req.user!.org_id };
@@ -42,7 +42,7 @@ router.get('/', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // ─── POST /payroll/generate ────────────────────────────
-router.post('/generate', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/generate', requirePermission('payroll.manage'), async (req, res, next) => {
   try {
     const { month, year } = req.body;
     const m = month || new Date().getMonth() + 1;
@@ -126,7 +126,7 @@ router.get('/me', async (req, res, next) => {
 });
 
 // ─── GET /payroll/:id ──────────────────────────────────
-router.get('/:id', requireRole('hr_admin'), async (req, res, next) => {
+router.get('/:id', requirePermission('payroll.view'), async (req, res, next) => {
   try {
     const record = await prisma.payrollRecord.findFirst({
       where: { id: req.params.id as string, org_id: req.user!.org_id },
@@ -138,7 +138,7 @@ router.get('/:id', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // ─── PUT /payroll/:id/adjust ───────────────────────────
-router.put('/:id/adjust', requireRole('hr_admin'), async (req, res, next) => {
+router.put('/:id/adjust', requirePermission('payroll.manage'), async (req, res, next) => {
   try {
     const { field, value, reason } = req.body;
     if (!field || value === undefined || !reason) throw new ValidationError('field, value and reason required');
@@ -202,7 +202,7 @@ router.get('/payslips/:id', async (req, res, next) => {
 
 // ─── POST /payroll/process-with-payslips ──────────────
 // Full process: generate PDFs, upload to S3, email employees
-router.post('/process-full', requireRole('hr_admin'), async (req, res, next) => {
+router.post('/process-full', requirePermission('payroll.process'), async (req, res, next) => {
   try {
     const { month, year } = req.body;
     const m = month || new Date().getMonth() + 1;

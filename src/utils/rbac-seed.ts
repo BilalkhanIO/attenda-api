@@ -68,7 +68,7 @@ const SUPER_ADMIN_PERMS = [
   'employees.credentials.update',
 ];
 
-const SYSTEM_ROLE_PERMISSIONS: Record<string, readonly string[]> = {
+export const SYSTEM_ROLE_PERMISSIONS: Record<string, readonly string[]> = {
   employee:    EMPLOYEE_PERMS,
   manager:     MANAGER_PERMS,
   hr_admin:    HR_ADMIN_PERMS,

@@ -181,7 +181,7 @@ router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (
 });
 
 // Ensure system roles exist (lazy init for orgs created before RBAC)
-router.post('/roles/ensure-system', requireRole('super_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/roles/ensure-system', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     await seedRbacCatalog();
     await seedOrgRbacForOrganisation(req.user!.org_id);

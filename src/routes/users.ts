@@ -157,7 +157,7 @@ router.get('/meta/departments', async (req: Request, res: Response, next: NextFu
 });
 
 // ─── GET /users ────────────────────────────────────────
-router.get('/', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/', requirePermission('employees.view', 'employees.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { page = '1', limit = '50', department, role, status, search } = req.query as Record<string, string>;
     const pg = Math.max(1, parseInt(page));
@@ -175,8 +175,9 @@ router.get('/', requireRole('manager'), async (req: Request, res: Response, next
       { email: { contains: search, mode: 'insensitive' } },
     ];
 
-    // Managers only see their team
-    if (req.user!.role === 'manager') {
+    // Org-wide list needs employees.view; team-level viewers (managers or
+    // custom roles with only employees.view_team) see their direct reports.
+    if (!req.permissions?.has('employees.view')) {
       where.manager_id = req.user!.sub;
     }
 
@@ -190,7 +191,7 @@ router.get('/', requireRole('manager'), async (req: Request, res: Response, next
 });
 
 // ─── POST /users ───────────────────────────────────────
-router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('employees.create'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, email, role, department, job_title, phone, hourly_rate, manager_id } = req.body;
     if (!name || !email || !role) throw new ValidationError('name, email and role are required');
@@ -292,7 +293,7 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ─── PUT /users/:id ────────────────────────────────────
-router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', requirePermission('employees.update'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     const { name, role, department, job_title, phone, hourly_rate, manager_id, email, password } = req.body as {
@@ -360,7 +361,7 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
 });
 
 // ─── PATCH /users/:id/deactivate ───────────────────────
-router.patch('/:id/deactivate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/:id/deactivate', requirePermission('employees.deactivate'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     if (id === req.user!.sub) throw new ValidationError('Cannot deactivate yourself');
@@ -380,7 +381,7 @@ router.patch('/:id/deactivate', requireRole('hr_admin'), async (req: Request, re
 });
 
 // ─── PATCH /users/:id/activate ─────────────────────────
-router.patch('/:id/activate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/:id/activate', requirePermission('employees.deactivate'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
 
@@ -394,7 +395,7 @@ router.patch('/:id/activate', requireRole('hr_admin'), async (req: Request, res:
 });
 
 // ─── POST /users/import ────────────────────────────────
-router.post('/import', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/import', requirePermission('employees.import'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { users } = req.body as { users: Array<{ name: string; email: string; role: string; department?: string }> };
     if (!Array.isArray(users) || users.length === 0) throw new ValidationError('No users provided');
@@ -468,7 +469,7 @@ router.post('/import', requireRole('hr_admin'), async (req: Request, res: Respon
 });
 
 // ─── POST /users/:id/resend-invite ─────────────────────
-router.post('/:id/resend-invite', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/:id/resend-invite', requirePermission('employees.create'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });

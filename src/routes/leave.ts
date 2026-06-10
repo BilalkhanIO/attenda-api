@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { Router } from 'express';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
 import { calculateWorkingDays } from '../utils/auth';
 import prisma from '../utils/prisma';
@@ -26,7 +26,7 @@ router.get('/requests/me', async (req, res, next) => {
 });
 
 // ─── GET /leave/requests/team ──────────────────────────
-router.get('/requests/team', requireRole('manager'), async (req, res, next) => {
+router.get('/requests/team', requirePermission('leave.view_team', 'leave.approve'), async (req, res, next) => {
   try {
     const team = await prisma.user.findMany({
       where: { manager_id: req.user!.sub, is_active: true, org_id: req.user!.org_id },
@@ -42,7 +42,7 @@ router.get('/requests/team', requireRole('manager'), async (req, res, next) => {
 });
 
 // ─── GET /leave/requests ───────────────────────────────
-router.get('/requests', requireRole('hr_admin'), async (req, res, next) => {
+router.get('/requests', requirePermission('leave.view_all'), async (req, res, next) => {
   try {
     const { status, department } = req.query as Record<string, string>;
     const where: Record<string, unknown> = { org_id: req.user!.org_id };
@@ -181,14 +181,15 @@ router.delete('/requests/:id', async (req, res, next) => {
 });
 
 // ─── PUT /leave/requests/:id/approve ──────────────────
-router.put('/requests/:id/approve', requireRole('manager'), async (req, res, next) => {
+router.put('/requests/:id/approve', requirePermission('leave.approve'), async (req, res, next) => {
   try {
     const request = await prisma.leaveRequest.findFirst({
       where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
     });
     if (!request) throw new NotFoundError('Leave request');
 
-    if (req.user!.role === 'manager') {
+    // Approvers without org-wide leave access may only review their direct reports
+    if (!req.permissions?.has('leave.view_all')) {
       const requester = await prisma.user.findFirst({
         where: { id: request.user_id, org_id: req.user!.org_id, manager_id: req.user!.sub },
         select: { id: true },
@@ -271,7 +272,7 @@ router.put('/requests/:id/approve', requireRole('manager'), async (req, res, nex
 });
 
 // ─── PUT /leave/requests/:id/reject ───────────────────
-router.put('/requests/:id/reject', requireRole('manager'), async (req, res, next) => {
+router.put('/requests/:id/reject', requirePermission('leave.approve'), async (req, res, next) => {
   try {
     const { reason } = req.body;
     if (!reason) throw new ValidationError('Rejection reason required');
@@ -281,7 +282,8 @@ router.put('/requests/:id/reject', requireRole('manager'), async (req, res, next
     });
     if (!request) throw new NotFoundError('Leave request');
 
-    if (req.user!.role === 'manager') {
+    // Approvers without org-wide leave access may only review their direct reports
+    if (!req.permissions?.has('leave.view_all')) {
       const requester = await prisma.user.findFirst({
         where: { id: request.user_id, org_id: req.user!.org_id, manager_id: req.user!.sub },
         select: { id: true },
@@ -334,7 +336,7 @@ router.get('/balance/me', async (req, res, next) => {
 });
 
 // ─── GET /leave/balance/:userId ────────────────────────
-router.get('/balance/:userId', requireRole('manager'), async (req, res, next) => {
+router.get('/balance/:userId', requirePermission('leave.view_team', 'leave.balance.manage'), async (req, res, next) => {
   try {
     const year = parseInt((req.query.year as string) || String(new Date().getFullYear()));
     const targetUser = await prisma.user.findFirst({
@@ -349,7 +351,7 @@ router.get('/balance/:userId', requireRole('manager'), async (req, res, next) =>
 });
 
 // ─── PUT /leave/balance/:userId ────────────────────────
-router.put('/balance/:userId', requireRole('hr_admin'), async (req, res, next) => {
+router.put('/balance/:userId', requirePermission('leave.balance.manage'), async (req, res, next) => {
   try {
     const { leave_type, adjustment, reason } = req.body;
     if (!leave_type || adjustment === undefined || !reason) throw new ValidationError('leave_type, adjustment and reason required');
@@ -369,7 +371,7 @@ router.put('/balance/:userId', requireRole('hr_admin'), async (req, res, next) =
 });
 
 // ─── GET /leave/calendar ──────────────────────────────
-router.get('/calendar', requireRole('manager'), async (req, res, next) => {
+router.get('/calendar', requirePermission('leave.view_team', 'leave.view_all'), async (req, res, next) => {
   try {
     const { month, year } = req.query as { month?: string; year?: string };
     const m = parseInt(month || String(new Date().getMonth() + 1));

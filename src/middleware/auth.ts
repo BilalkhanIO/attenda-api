@@ -16,6 +16,8 @@ declare global {
   namespace Express {
     interface Request {
       user?: JwtPayload;
+      /** Effective permission set, populated by requirePermission for handler-level scoping. */
+      permissions?: Set<string>;
     }
   }
 }
@@ -90,12 +92,18 @@ export function requirePermission(...permissionKeys: string[]) {
 
       if (req.user.role === 'platform_admin') {
         const platformPerms = await resolvePlatformPermissions(req.user.sub);
-        if (permissionKeys.some(k => can(platformPerms, k))) return next();
+        if (permissionKeys.some(k => can(platformPerms, k))) {
+          req.permissions = platformPerms;
+          return next();
+        }
         return next(new ForbiddenError());
       }
 
       const perms = await resolveUserPermissions(req.user.sub, req.user.org_id);
-      if (permissionKeys.some(k => can(perms, k))) return next();
+      if (permissionKeys.some(k => can(perms, k))) {
+        req.permissions = perms;
+        return next();
+      }
 
       return next(new ForbiddenError());
     } catch (e) {

@@ -10,7 +10,7 @@ export const performanceRouter = Router();
 performanceRouter.use(authenticate);
 
 // GET /performance/reviews
-performanceRouter.get('/reviews', requireRole('manager'), async (req, res, next) => {
+performanceRouter.get('/reviews', requirePermission('performance.view'), async (req, res, next) => {
   try {
     const { month, year, department } = req.query as Record<string, string>;
     let m: number, y: number;
@@ -24,14 +24,14 @@ performanceRouter.get('/reviews', requireRole('manager'), async (req, res, next)
     }
 
     const where: Record<string, unknown> = { org_id: req.user!.org_id, period_month: m, period_year: y };
-    if (req.user!.role === 'manager') {
+    if (!['hr_admin', 'super_admin'].includes(req.user!.role)) {
       const team = await prisma.user.findMany({ where: { manager_id: req.user!.sub }, select: { id: true } });
       where.user_id = { in: team.map(u => u.id) };
     }
 
     // Ensure reviews exist for all active users
     const users = await prisma.user.findMany({
-      where: { org_id: req.user!.org_id, is_active: true, role: 'employee', deleted_at: null, ...(req.user!.role === 'manager' ? { manager_id: req.user!.sub } : {}) },
+      where: { org_id: req.user!.org_id, is_active: true, role: 'employee', deleted_at: null, ...(!['hr_admin', 'super_admin'].includes(req.user!.role) ? { manager_id: req.user!.sub } : {}) },
       select: { id: true },
     });
 
@@ -76,7 +76,7 @@ performanceRouter.get('/reviews/me', async (req, res, next) => {
 });
 
 // POST /performance/reviews/:userId
-performanceRouter.post('/reviews/:userId', requireRole('manager'), async (req, res, next) => {
+performanceRouter.post('/reviews/:userId', requirePermission('performance.manage'), async (req, res, next) => {
   try {
     const { score, comments, month, year } = req.body;
     if (!score || !comments || !month) throw new ValidationError('score, comments and month required');
@@ -159,7 +159,7 @@ performanceRouter.get('/goals', async (req, res, next) => {
 });
 
 // POST /performance/goals
-performanceRouter.post('/goals', requireRole('manager'), async (req, res, next) => {
+performanceRouter.post('/goals', requirePermission('performance.manage'), async (req, res, next) => {
   try {
     const { user_id, review_id, title, description, weight, target_date } = req.body;
     if (!user_id || !review_id || !title || !weight) throw new ValidationError('Missing required fields');
@@ -183,7 +183,7 @@ performanceRouter.post('/goals', requireRole('manager'), async (req, res, next) 
 });
 
 // PUT /performance/goals/:id
-performanceRouter.put('/goals/:id', requireRole('manager'), async (req, res, next) => {
+performanceRouter.put('/goals/:id', requirePermission('performance.manage'), async (req, res, next) => {
   try {
     const { title, description, weight, target_date, completion } = req.body;
     const data: Record<string, unknown> = {};
@@ -198,7 +198,7 @@ performanceRouter.put('/goals/:id', requireRole('manager'), async (req, res, nex
 });
 
 // ─── AI: GET /performance/reviews/:userId/insights ────
-performanceRouter.get('/reviews/:userId/insights', requireRole('manager'), async (req, res, next) => {
+performanceRouter.get('/reviews/:userId/insights', requirePermission('performance.view'), async (req, res, next) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
@@ -266,7 +266,7 @@ async function calcAttendanceScore(userId: string, month: number, year: number):
 
 // ─── ANALYTICS ────────────────────────────────────────
 export const analyticsRouter = Router();
-analyticsRouter.use(authenticate, requireRole('manager'));
+analyticsRouter.use(authenticate, requirePermission('analytics.view'));
 
 // GET /analytics/overview
 analyticsRouter.get('/overview', async (req, res, next) => {
@@ -331,7 +331,7 @@ analyticsRouter.get('/late-arrivals', async (req, res, next) => {
 });
 
 // GET /analytics/payroll-cost
-analyticsRouter.get('/payroll-cost', requireRole('hr_admin'), async (req, res, next) => {
+analyticsRouter.get('/payroll-cost', requirePermission('analytics.advanced'), async (req, res, next) => {
   try {
     const data = [];
     for (let i = 5; i >= 0; i--) {
@@ -347,7 +347,7 @@ analyticsRouter.get('/payroll-cost', requireRole('hr_admin'), async (req, res, n
 
 
 // ─── AI: GET /analytics/anomalies ─────────────────────
-analyticsRouter.get('/anomalies', requireRole('hr_admin'), async (req, res, next) => {
+analyticsRouter.get('/anomalies', requirePermission('analytics.advanced'), async (req, res, next) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
@@ -393,7 +393,7 @@ analyticsRouter.get('/anomalies', requireRole('hr_admin'), async (req, res, next
 });
 
 // ─── AI: GET /analytics/payroll-anomalies ─────────────
-analyticsRouter.get('/payroll-anomalies', requireRole('hr_admin'), async (req, res, next) => {
+analyticsRouter.get('/payroll-anomalies', requirePermission('analytics.advanced'), async (req, res, next) => {
   try {
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
@@ -507,7 +507,7 @@ orgRouter.get('/settings', async (req, res, next) => {
 });
 
 // PUT /org/settings
-orgRouter.put('/settings', requireRole('super_admin'), async (req, res, next) => {
+orgRouter.put('/settings', requirePermission('org.settings.update'), async (req, res, next) => {
   try {
     const { name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold, totp_required } = req.body;
     const data: Record<string, unknown> = {};
@@ -550,7 +550,7 @@ orgRouter.get('/my-ip', authenticate, async (req, res, _next) => {
 });
 
 // GET /org/office-ips
-orgRouter.get('/office-ips', requireRole('super_admin'), async (req, res, next) => {
+orgRouter.get('/office-ips', requirePermission('org.office.update'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     ok(res, { ips: org?.office_ips || [], ssids: org?.office_ssids || [] });
@@ -558,7 +558,7 @@ orgRouter.get('/office-ips', requireRole('super_admin'), async (req, res, next) 
 });
 
 // PUT /org/office-ips
-orgRouter.put('/office-ips', requireRole('super_admin'), async (req, res, next) => {
+orgRouter.put('/office-ips', requirePermission('org.office.update'), async (req, res, next) => {
   try {
     const { ips } = req.body;
     if (!Array.isArray(ips)) throw new ValidationError('ips must be an array');
@@ -569,7 +569,7 @@ orgRouter.put('/office-ips', requireRole('super_admin'), async (req, res, next) 
 });
 
 // PUT /org/office-ssids
-orgRouter.put('/office-ssids', requireRole('super_admin'), async (req, res, next) => {
+orgRouter.put('/office-ssids', requirePermission('org.office.update'), async (req, res, next) => {
   try {
     const { ssids } = req.body;
     if (!Array.isArray(ssids)) throw new ValidationError('ssids must be an array');
@@ -581,7 +581,7 @@ orgRouter.put('/office-ssids', requireRole('super_admin'), async (req, res, next
 });
 
 // GET /org/whatsapp
-orgRouter.get('/whatsapp', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+orgRouter.get('/whatsapp', requirePermission('org.whatsapp.update'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     ok(res, {
@@ -596,7 +596,7 @@ orgRouter.get('/whatsapp', requireRole('super_admin'), requireOrgFeature('whatsa
 });
 
 // PUT /org/whatsapp
-orgRouter.put('/whatsapp', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+orgRouter.put('/whatsapp', requirePermission('org.whatsapp.update'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const { enabled, phone_number_id, access_token, groups, events, dept_groups } = req.body;
     const data: Record<string, unknown> = {};
@@ -612,7 +612,7 @@ orgRouter.put('/whatsapp', requireRole('super_admin'), requireOrgFeature('whatsa
 });
 
 // POST /org/whatsapp/test
-orgRouter.post('/whatsapp/test', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+orgRouter.post('/whatsapp/test', requirePermission('whatsapp.test'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     if (!org?.wa_phone_number_id || !org?.wa_access_token) {
@@ -631,7 +631,7 @@ orgRouter.post('/whatsapp/test', requireRole('super_admin'), requireOrgFeature('
 });
 
 // GET /org/whatsapp/logs
-orgRouter.get('/whatsapp/logs', requireRole('super_admin'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+orgRouter.get('/whatsapp/logs', requirePermission('whatsapp.logs.view'), requireOrgFeature('whatsapp'), async (req, res, next) => {
   try {
     const { page = '1', limit = '50', event_type, status } = req.query as Record<string, string>;
     const take = Math.min(parseInt(limit) || 50, 200);
@@ -659,7 +659,7 @@ orgRouter.get('/departments', async (req, res, next) => {
 });
 
 // GET /org/qr-code
-orgRouter.get('/qr-code', requireRole('hr_admin'), async (req, res, next) => {
+orgRouter.get('/qr-code', requirePermission('org.qr.manage'), async (req, res, next) => {
   try {
     const { generateOrgQrCode } = await import('../services/qrcode');
     const result = await generateOrgQrCode(req.user!.org_id);
@@ -668,7 +668,7 @@ orgRouter.get('/qr-code', requireRole('hr_admin'), async (req, res, next) => {
 });
 
 // POST /org/qr-code/regenerate
-orgRouter.post('/qr-code/regenerate', requireRole('hr_admin'), async (req, res, next) => {
+orgRouter.post('/qr-code/regenerate', requirePermission('org.qr.manage'), async (req, res, next) => {
   try {
     const { generateOrgQrCode } = await import('../services/qrcode');
     const result = await generateOrgQrCode(req.user!.org_id);
