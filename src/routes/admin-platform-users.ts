@@ -130,14 +130,14 @@ router.post('/', requirePermission('platform.users.manage'), async (req: Request
 
     // Create user and assign roles
     const user = await prisma.$transaction(async (tx) => {
-      // Create user without an org_id (platform users don't belong to a specific org)
+      // Create user assigned to the SYSTEM organization
       const u = await tx.user.create({
         data: {
           name,
           email,
           password_hash: hashedPassword,
           role: 'platform_admin', // Default legacy role for backwards compatibility
-          org_id: 'SYSTEM', // Assign to a dummy system org or leave null if schema allows (assuming SYSTEM for now to satisfy foreign key if it's required, or it needs to be an existing admin org)
+          org_id: 'SYSTEM', // Official system organization ID for platform admins
         }
       });
 

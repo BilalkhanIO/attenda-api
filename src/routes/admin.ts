@@ -46,12 +46,12 @@ function mapOrg(org: any) {
 router.get('/stats', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const [orgCount, userCount, activeToday, pendingCount, trialingCount, inactiveCount] = await Promise.all([
-      prisma.organisation.count({ where: { status: 'active' } }),
-      prisma.user.count({ where: { deleted_at: null } }),
-      prisma.attendanceRecord.count({ where: { date: new Date(new Date().setHours(0, 0, 0, 0)) } }),
-      prisma.organisation.count({ where: { status: 'pending' } }),
-      prisma.organisation.count({ where: { subscription_status: 'trialing' } }),
-      prisma.organisation.count({ where: { subscription_status: 'inactive' } }),
+      prisma.organisation.count({ where: { status: 'active', id: { not: 'SYSTEM' } } }),
+      prisma.user.count({ where: { deleted_at: null, org_id: { not: 'SYSTEM' } } }),
+      prisma.attendanceRecord.count({ where: { date: new Date(new Date().setHours(0, 0, 0, 0)), org_id: { not: 'SYSTEM' } } }),
+      prisma.organisation.count({ where: { status: 'pending', id: { not: 'SYSTEM' } } }),
+      prisma.organisation.count({ where: { subscription_status: 'trialing', id: { not: 'SYSTEM' } } }),
+      prisma.organisation.count({ where: { subscription_status: 'inactive', id: { not: 'SYSTEM' } } }),
     ]);
     ok(res, { org_count: orgCount, user_count: userCount, active_today: activeToday, pending_count: pendingCount, trialing_count: trialingCount, inactive_count: inactiveCount });
   } catch (e) { next(e); }
@@ -62,7 +62,7 @@ router.get('/stats', async (_req: Request, res: Response, next: NextFunction) =>
 router.get('/orgs', async (_req: Request, res: Response, next: NextFunction) => {
   try {
     const orgs = await prisma.organisation.findMany({
-      where: { status: { not: 'pending' } },
+      where: { status: { not: 'pending' }, id: { not: 'SYSTEM' } },
       orderBy: { created_at: 'desc' },
       include: { _count: { select: { users: { where: { deleted_at: null, is_active: true } } } } },
     });

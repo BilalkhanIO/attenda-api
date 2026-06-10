@@ -6,6 +6,20 @@ async function seed() {
   console.log('🌱 Seeding database...');
 
   // ─── Organisation ──────────────────────────────────
+  const systemOrg = await prisma.organisation.upsert({
+    where: { id: 'SYSTEM' },
+    update: {},
+    create: {
+      id: 'SYSTEM',
+      name: 'Attenda System',
+      timezone: 'UTC',
+      currency: 'USD',
+      status: 'active',
+      subscription_status: 'active',
+    },
+  });
+  console.log(`✅ System Organisation created`);
+
   const org = await prisma.organisation.upsert({
     where: { id: 'demo-org-001' },
     update: {},
@@ -21,6 +35,25 @@ async function seed() {
   console.log(`✅ Organisation: ${org.name}`);
 
   // ─── Users ─────────────────────────────────────────
+  const password = await hashPassword('Demo1234!');
+  
+  // Platform Admin
+  await prisma.user.upsert({
+    where: { id: 'user-platform-admin' },
+    update: {},
+    create: {
+      id: 'user-platform-admin',
+      org_id: 'SYSTEM',
+      name: 'Platform Admin',
+      email: 'platform@attenda.app',
+      password_hash: password,
+      role: 'platform_admin',
+      is_active: true,
+      setup_complete: true,
+    },
+  });
+  console.log(`✅ Platform Admin created`);
+
   const users = [
     { id: 'user-superadmin', name: 'Super Admin',   email: 'admin@demo.attenda.app',   role: 'super_admin', department: 'Management', job_title: 'CEO' },
     { id: 'user-hradmin',    name: 'Sarah HR',       email: 'hr@demo.attenda.app',      role: 'hr_admin',    department: 'HR',         job_title: 'HR Manager' },
