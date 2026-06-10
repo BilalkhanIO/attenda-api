@@ -3,6 +3,7 @@ import { authenticate, requireRole, requirePermission } from '../middleware/auth
 import { getUserCapabilities, resolveUserPermissions, can } from '../services/authorization';
 import { hashPassword, generateToken } from '../utils/auth';
 import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
+import { PERMISSION_CATALOG } from '../constants/rbac';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -109,26 +110,30 @@ router.put('/:id/permissions', requirePermission('org.permissions.grant'), async
     });
     if (!user) throw new NotFoundError('User');
 
+    const validKeys = new Set(PERMISSION_CATALOG.map(p => p.key));
     for (const g of grants) {
       if (!g.permission_key || !['allow', 'deny'].includes(g.effect)) {
         throw new ValidationError('Each grant needs permission_key and effect (allow|deny)');
       }
+      if (!validKeys.has(g.permission_key)) {
+        throw new ValidationError(`Unknown permission key: ${g.permission_key}`);
+      }
     }
 
-    await prisma.userPermissionGrant.deleteMany({
-      where: { user_id: user.id, org_id: req.user!.org_id },
-    });
-
-    if (grants.length) {
-      await prisma.userPermissionGrant.createMany({
+    // Transactional replace — a failed insert must not wipe existing grants
+    await prisma.$transaction([
+      prisma.userPermissionGrant.deleteMany({
+        where: { user_id: user.id, org_id: req.user!.org_id },
+      }),
+      ...(grants.length ? [prisma.userPermissionGrant.createMany({
         data: grants.map(g => ({
           user_id: user.id,
           org_id: req.user!.org_id,
           permission_key: g.permission_key,
           effect: g.effect,
         })),
-      });
-    }
+      })] : []),
+    ]);
 
     const saved = await prisma.userPermissionGrant.findMany({
       where: { user_id: user.id, org_id: req.user!.org_id },

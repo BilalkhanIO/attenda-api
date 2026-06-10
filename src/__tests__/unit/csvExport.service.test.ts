@@ -7,13 +7,17 @@ jest.mock('../../services/s3', () => ({
 }));
 
 import { generateAttendanceCsv, generatePayrollCsv, generateLeaveCsv, generatePerformanceCsv } from '../../services/csvExport';
-import fs from 'fs';
+
+// Without S3 the service returns a base64 data URI the browser downloads directly.
+const DATA_URI_PREFIX = 'data:text/csv;charset=utf-8;base64,';
+const decodeCsv = (uri: string) =>
+  Buffer.from(uri.slice(DATA_URI_PREFIX.length), 'base64').toString('utf-8');
 
 describe('CSV Export Service', () => {
   const orgId = 'org-test';
 
   describe('generateAttendanceCsv', () => {
-    it('returns a local file path in dev mode', async () => {
+    it('returns a CSV data URI with record values in dev mode', async () => {
       const records = [
         {
           date: new Date('2025-06-01'),
@@ -28,13 +32,17 @@ describe('CSV Export Service', () => {
         },
       ];
       const result = await generateAttendanceCsv(orgId, records);
-      expect(typeof result).toBe('string');
-      expect(result).toMatch(/attendance/i);
+      expect(result.startsWith(DATA_URI_PREFIX)).toBe(true);
+      const csv = decodeCsv(result);
+      expect(csv).toContain('"Date","Employee","Department"');
+      expect(csv).toContain('Alice');
+      expect(csv).toContain('2025-06-01');
+      expect(csv).toContain('auto_ip');
     });
   });
 
   describe('generatePayrollCsv', () => {
-    it('returns a local file path in dev mode', async () => {
+    it('returns a CSV data URI with payroll figures in dev mode', async () => {
       const records = [
         {
           user: { name: 'Bob', department: 'HR' },
@@ -50,13 +58,16 @@ describe('CSV Export Service', () => {
         },
       ];
       const result = await generatePayrollCsv(orgId, records, 6, 2025);
-      expect(typeof result).toBe('string');
-      expect(result).toMatch(/payroll/i);
+      expect(result.startsWith(DATA_URI_PREFIX)).toBe(true);
+      const csv = decodeCsv(result);
+      expect(csv).toContain('Bob');
+      expect(csv).toContain('4375.00');
+      expect(csv).toContain('draft');
     });
   });
 
   describe('generateLeaveCsv', () => {
-    it('returns a local file path in dev mode', async () => {
+    it('returns a CSV data URI with leave details in dev mode', async () => {
       const requests = [
         {
           user:             { name: 'Chloe', department: 'Marketing' },
@@ -71,13 +82,16 @@ describe('CSV Export Service', () => {
         },
       ];
       const result = await generateLeaveCsv(orgId, requests);
-      expect(typeof result).toBe('string');
-      expect(result).toMatch(/leave/i);
+      expect(result.startsWith(DATA_URI_PREFIX)).toBe(true);
+      const csv = decodeCsv(result);
+      expect(csv).toContain('Chloe');
+      expect(csv).toContain('annual');
+      expect(csv).toContain('Sarah HR');
     });
   });
 
   describe('generatePerformanceCsv', () => {
-    it('returns a local file path in dev mode', async () => {
+    it('returns a CSV data URI with review scores in dev mode', async () => {
       const reviews = [
         {
           user:             { name: 'David', department: 'Sales' },
@@ -89,8 +103,11 @@ describe('CSV Export Service', () => {
         },
       ];
       const result = await generatePerformanceCsv(orgId, reviews, 6, 2025);
-      expect(typeof result).toBe('string');
-      expect(result).toMatch(/performance/i);
+      expect(result.startsWith(DATA_URI_PREFIX)).toBe(true);
+      const csv = decodeCsv(result);
+      expect(csv).toContain('David');
+      expect(csv).toContain('6/2025');
+      expect(csv).toContain('95.0');
     });
   });
 });
