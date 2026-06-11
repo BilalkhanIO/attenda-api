@@ -1,5 +1,5 @@
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, requireRole, requirePermission } from '../middleware/auth';
+import { authenticate, requirePermission } from '../middleware/auth';
 import { getUserCapabilities, resolveUserPermissions, can } from '../services/authorization';
 import { hashPassword, generateToken } from '../utils/auth';
 import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
@@ -11,10 +11,14 @@ router.use(authenticate);
 
 const USER_SELECT = {
   id: true, org_id: true, name: true, email: true, role: true,
-  department: true, job_title: true, phone: true, manager_id: true,
+  department: true, department_id: true, job_title: true, phone: true, manager_id: true,
   hourly_rate: true, avatar_url: true, is_active: true, setup_complete: true,
   created_at: true, totp_enabled: true, notification_prefs: true,
+  date_of_birth: true, gender: true, address: true, city: true, country: true,
+  emergency_contact_name: true, emergency_contact_phone: true,
+  employment_type: true, joined_at: true, national_id: true,
   manager: { select: { id: true, name: true } },
+  department_ref: { select: { id: true, name: true, parent_id: true } },
 };
 
 // ─── GET /users/me/capabilities ────────────────────────
@@ -37,11 +41,23 @@ router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
 // ─── PUT /users/me ─────────────────────────────────────
 router.put('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { name, phone, avatar_url } = req.body;
+    const {
+      name, phone, avatar_url, date_of_birth, gender, address, city, country,
+      emergency_contact_name, emergency_contact_phone,
+    } = req.body;
     const update: Record<string, unknown> = {};
     if (name !== undefined)       update.name       = name;
     if (phone !== undefined)      update.phone      = phone;
     if (avatar_url !== undefined) update.avatar_url = avatar_url;
+    if (gender !== undefined)     update.gender     = gender || null;
+    if (address !== undefined)    update.address    = address || null;
+    if (city !== undefined)       update.city       = city || null;
+    if (country !== undefined)    update.country    = country || null;
+    if (emergency_contact_name !== undefined)  update.emergency_contact_name  = emergency_contact_name || null;
+    if (emergency_contact_phone !== undefined) update.emergency_contact_phone = emergency_contact_phone || null;
+    if (date_of_birth !== undefined) {
+      update.date_of_birth = date_of_birth ? new Date(date_of_birth) : null;
+    }
 
     const user = await prisma.user.update({
       where: { id: req.user!.sub },
@@ -157,7 +173,7 @@ router.get('/meta/departments', async (req: Request, res: Response, next: NextFu
 });
 
 // ─── GET /users ────────────────────────────────────────
-router.get('/', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/', requirePermission('employees.view', 'employees.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { page = '1', limit = '50', department, role, status, search } = req.query as Record<string, string>;
     const pg = Math.max(1, parseInt(page));
@@ -175,8 +191,9 @@ router.get('/', requireRole('manager'), async (req: Request, res: Response, next
       { email: { contains: search, mode: 'insensitive' } },
     ];
 
-    // Managers only see their team
-    if (req.user!.role === 'manager') {
+    // Org-wide list needs employees.view; team-level viewers (managers or
+    // custom roles with only employees.view_team) see their direct reports.
+    if (!req.permissions?.has('employees.view')) {
       where.manager_id = req.user!.sub;
     }
 
@@ -190,13 +207,18 @@ router.get('/', requireRole('manager'), async (req: Request, res: Response, next
 });
 
 // ─── POST /users ───────────────────────────────────────
-router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('employees.create'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { name, email, role, department, job_title, phone, hourly_rate, manager_id } = req.body;
+    const {
+      name, email, role, department, department_id, job_title, phone, hourly_rate,
+      manager_id, employment_type, joined_at, national_id,
+    } = req.body;
     if (!name || !email || !role) throw new ValidationError('name, email and role are required');
     const VALID_ROLES = ['employee', 'manager', 'hr_admin', 'super_admin'];
     if (!VALID_ROLES.includes(role)) throw new ValidationError('Invalid role');
-    if (req.user!.role === 'hr_admin' && !['employee', 'manager'].includes(role)) {
+    // Assigning admin-tier roles requires role-management rights (prevents
+    // HR-level users from escalating privileges)
+    if (!req.permissions?.has('org.roles.manage') && !['employee', 'manager'].includes(role)) {
       throw new ForbiddenError();
     }
 
@@ -213,13 +235,27 @@ router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, ne
 
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
 
+    // Structured department wins; sync the legacy free-text column from it
+    let departmentName = department ?? null;
+    if (department_id) {
+      const dept = await prisma.department.findFirst({
+        where: { id: department_id, org_id: req.user!.org_id },
+      });
+      if (!dept) throw new ValidationError('Department not found');
+      departmentName = dept.name;
+    }
+
     const user = await prisma.user.create({
       data: {
         org_id: req.user!.org_id, name, email,
         password_hash: await hashPassword(inviteToken),
-        role, department, job_title, phone,
+        role, department: departmentName, department_id: department_id || null,
+        job_title, phone,
         hourly_rate: hourly_rate || 0,
         manager_id: manager_id || null,
+        employment_type: employment_type || null,
+        joined_at: joined_at ? new Date(joined_at) : null,
+        national_id: national_id || null,
         invite_token: inviteToken,
         invite_expires: inviteExpires,
       },
@@ -278,9 +314,12 @@ router.post('/', requireRole('hr_admin'), async (req: Request, res: Response, ne
 router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    // Users can see their own profile; managers/admins can see others in same org
-    if (id !== req.user!.sub && !['manager', 'hr_admin', 'super_admin'].includes(req.user!.role)) {
-      throw new ForbiddenError();
+    // Users can see their own profile; viewing others needs a team/org view permission
+    if (id !== req.user!.sub) {
+      const perms = await resolveUserPermissions(req.user!.sub, req.user!.org_id);
+      if (!can(perms, 'employees.view') && !can(perms, 'employees.view_team')) {
+        throw new ForbiddenError();
+      }
     }
     const user = await prisma.user.findFirst({
       where: { id, org_id: req.user!.org_id, deleted_at: null },
@@ -292,19 +331,23 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ─── PUT /users/:id ────────────────────────────────────
-router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', requirePermission('employees.update'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
-    const { name, role, department, job_title, phone, hourly_rate, manager_id, email, password } = req.body as {
-      name?: string; role?: string; department?: string; job_title?: string;
-      phone?: string; hourly_rate?: number; manager_id?: string | null;
-      email?: string; password?: string;
+    const {
+      name, role, department, department_id, job_title, phone, hourly_rate,
+      manager_id, email, password, employment_type, joined_at, national_id,
+    } = req.body as {
+      name?: string; role?: string; department?: string; department_id?: string | null;
+      job_title?: string; phone?: string; hourly_rate?: number; manager_id?: string | null;
+      email?: string; password?: string; employment_type?: string | null;
+      joined_at?: string | null; national_id?: string | null;
     };
 
     if (role !== undefined) {
       const VALID_ROLES = ['employee', 'manager', 'hr_admin', 'super_admin'];
       if (!VALID_ROLES.includes(role)) throw new ValidationError('Invalid role');
-      if (req.user!.role === 'hr_admin' && !['employee', 'manager'].includes(role)) {
+      if (!req.permissions?.has('org.roles.manage') && !['employee', 'manager'].includes(role)) {
         throw new ForbiddenError();
       }
     }
@@ -320,14 +363,9 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
     // ─── Credentials update: email / password ──────────
     const credentialFields: Record<string, unknown> = {};
     if (email !== undefined || password !== undefined) {
-      // Requires credentials.update permission OR super_admin role
-      const isSuperAdmin = req.user!.role === 'super_admin';
-      let canUpdateCreds = isSuperAdmin;
-      if (!canUpdateCreds) {
-        const perms = await resolveUserPermissions(req.user!.sub, req.user!.org_id);
-        canUpdateCreds = can(perms, 'employees.credentials.update');
+      if (!req.permissions?.has('employees.credentials.update')) {
+        throw new ForbiddenError('employees.credentials.update permission required');
       }
-      if (!canUpdateCreds) throw new ForbiddenError('employees.credentials.update permission required');
 
       if (email !== undefined) {
         if (!email.includes('@')) throw new ValidationError('Invalid email address');
@@ -341,26 +379,53 @@ router.put('/:id', requireRole('hr_admin'), async (req: Request, res: Response, 
       }
     }
 
+    // Structured department wins; keep the legacy free-text column in sync
+    let departmentFields: Record<string, unknown> = {};
+    if (department_id !== undefined) {
+      if (department_id) {
+        const dept = await prisma.department.findFirst({
+          where: { id: department_id, org_id: req.user!.org_id },
+        });
+        if (!dept) throw new ValidationError('Department not found');
+        departmentFields = { department_id, department: dept.name };
+      } else {
+        departmentFields = { department_id: null, ...(department !== undefined && { department }) };
+      }
+    } else if (department !== undefined) {
+      departmentFields = { department };
+    }
+
     const updated = await prisma.user.update({
       where: { id },
       data: {
         ...(name !== undefined       && { name }),
         ...(role !== undefined       && { role }),
-        ...(department !== undefined && { department }),
+        ...departmentFields,
         ...(job_title !== undefined  && { job_title }),
         ...(phone !== undefined      && { phone }),
         ...(hourly_rate !== undefined && { hourly_rate }),
+        ...(employment_type !== undefined && { employment_type: employment_type || null }),
+        ...(joined_at !== undefined  && { joined_at: joined_at ? new Date(joined_at) : null }),
+        ...(national_id !== undefined && { national_id: national_id || null }),
         manager_id: manager_id !== undefined ? (manager_id || null) : user.manager_id,
         ...credentialFields,
       },
       select: USER_SELECT,
     });
+
+    // Keep the dynamic org-role assignment in sync — it is the source of
+    // truth for permissions, so a stale assignment would keep old access.
+    if (role !== undefined && role !== user.role) {
+      const { upsertUserOrgRole } = await import('../utils/rbac-seed');
+      await upsertUserOrgRole(id, req.user!.org_id, role);
+    }
+
     ok(res, updated);
   } catch (e) { next(e); }
 });
 
 // ─── PATCH /users/:id/deactivate ───────────────────────
-router.patch('/:id/deactivate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/:id/deactivate', requirePermission('employees.deactivate'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     if (id === req.user!.sub) throw new ValidationError('Cannot deactivate yourself');
@@ -380,7 +445,7 @@ router.patch('/:id/deactivate', requireRole('hr_admin'), async (req: Request, re
 });
 
 // ─── PATCH /users/:id/activate ─────────────────────────
-router.patch('/:id/activate', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/:id/activate', requirePermission('employees.deactivate'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
 
@@ -394,7 +459,7 @@ router.patch('/:id/activate', requireRole('hr_admin'), async (req: Request, res:
 });
 
 // ─── POST /users/import ────────────────────────────────
-router.post('/import', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/import', requirePermission('employees.import'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { users } = req.body as { users: Array<{ name: string; email: string; role: string; department?: string }> };
     if (!Array.isArray(users) || users.length === 0) throw new ValidationError('No users provided');
@@ -468,7 +533,7 @@ router.post('/import', requireRole('hr_admin'), async (req: Request, res: Respon
 });
 
 // ─── POST /users/:id/resend-invite ─────────────────────
-router.post('/:id/resend-invite', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/:id/resend-invite', requirePermission('employees.create'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });

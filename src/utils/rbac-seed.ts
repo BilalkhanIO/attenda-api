@@ -56,6 +56,7 @@ const HR_ADMIN_PERMS = [
   'whatsapp.logs.view',
   'org.settings.view',
   'org.qr.manage',
+  'org.departments.manage',
 ];
 
 const SUPER_ADMIN_PERMS = [
@@ -68,7 +69,7 @@ const SUPER_ADMIN_PERMS = [
   'employees.credentials.update',
 ];
 
-const SYSTEM_ROLE_PERMISSIONS: Record<string, readonly string[]> = {
+export const SYSTEM_ROLE_PERMISSIONS: Record<string, readonly string[]> = {
   employee:    EMPLOYEE_PERMS,
   manager:     MANAGER_PERMS,
   hr_admin:    HR_ADMIN_PERMS,

@@ -24,6 +24,8 @@ model Organisation {
   tax_rate           Float    @default(0)
   pension_rate       Float    @default(0)
   late_threshold     Int      @default(15)
+  heartbeat_grace_mins Int    @default(20)
+  gap_forgiveness_mins Int    @default(15)
   plan               String   @db.VarChar(50) @default("trial")
   status             String   @db.VarChar(20) @default("active")
   subscription_status String  @db.VarChar(30) @default("active")
@@ -37,6 +39,11 @@ model Organisation {
   contact_email      String?  @db.VarChar(255)
   company_size       String?  @db.VarChar(50)
   totp_required      Boolean  @default(false)
+  address            String?  @db.Text
+  phone              String?  @db.VarChar(50)
+  website            String?  @db.VarChar(255)
+  industry           String?  @db.VarChar(100)
+  registration_number String? @db.VarChar(100)
   created_at         DateTime @default(now())
 
   users               User[]
@@ -53,6 +60,7 @@ model Organisation {
   late_arrival_notices LateArrivalNotice[]
   org_roles             OrgRole[]
   user_permission_grants UserPermissionGrant[]
+  departments           Department[]
 
   @@map("organisations")
 }
@@ -65,6 +73,7 @@ model User {
   password_hash  String
   role           String    @db.VarChar(50)
   department     String?   @db.VarChar(100)
+  department_id  String?
   job_title      String?   @db.VarChar(100)
   phone          String?   @db.VarChar(30)
   manager_id     String?
@@ -82,10 +91,21 @@ model User {
   totp_enabled         Boolean   @default(false)
   notification_prefs   Json      @default("{\"check_in\":true,\"leave_updates\":true,\"shift_reminders\":true,\"payroll\":true,\"announcements\":true,\"late_alerts\":true}")
   google_id            String?   @unique
+  date_of_birth        DateTime? @db.Date
+  gender               String?   @db.VarChar(20)
+  address              String?   @db.Text
+  city                 String?   @db.VarChar(100)
+  country              String?   @db.VarChar(100)
+  emergency_contact_name  String? @db.VarChar(255)
+  emergency_contact_phone String? @db.VarChar(50)
+  employment_type      String?   @db.VarChar(30)
+  joined_at            DateTime? @db.Date
+  national_id          String?   @db.VarChar(100)
   created_at     DateTime  @default(now())
   deleted_at     DateTime?
 
   org                     Organisation        @relation(fields: [org_id], references: [id])
+  department_ref          Department?         @relation(fields: [department_id], references: [id], onDelete: SetNull)
   manager                 User?               @relation("UserManager", fields: [manager_id], references: [id])
   direct_reports          User[]              @relation("UserManager")
   attendance_records      AttendanceRecord[]
@@ -109,6 +129,23 @@ model User {
   platform_role_assignments PlatformUserRole[]
 
   @@map("users")
+}
+
+model Department {
+  id         String   @id @default(uuid())
+  org_id     String
+  name       String   @db.VarChar(100)
+  parent_id  String?
+  created_at DateTime @default(now())
+
+  org      Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  parent   Department?  @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: Cascade)
+  children Department[] @relation("DepartmentParent")
+  users    User[]
+
+  @@unique([org_id, name, parent_id])
+  @@index([org_id])
+  @@map("departments")
 }
 
 model AttendanceRecord {

@@ -50,7 +50,7 @@ export function hasFeature(features: PlanFeatures, featureKey: string): boolean 
   return features[featureKey] === true;
 }
 
-async function rolePermissionKeys(userId: string): Promise<Set<string>> {
+async function rolePermissionKeys(userId: string, legacyRole?: string): Promise<Set<string>> {
   const assignment = await prisma.userOrgRole.findUnique({
     where: { user_id: userId },
     include: { org_role: { include: { permissions: true } } },
@@ -58,6 +58,15 @@ async function rolePermissionKeys(userId: string): Promise<Set<string>> {
 
   if (assignment?.org_role.permissions.length) {
     return new Set(assignment.org_role.permissions.map((p: { permission_key: string }) => p.permission_key));
+  }
+
+  // Fallback: users with no org-role assignment (orgs created before RBAC
+  // seeding, or never backfilled) resolve from their legacy role column so
+  // permission-gated routes don't lock them out.
+  if (legacyRole) {
+    const { SYSTEM_ROLE_PERMISSIONS } = await import('../utils/rbac-seed');
+    const legacy = SYSTEM_ROLE_PERMISSIONS[legacyRole];
+    if (legacy) return new Set(legacy);
   }
 
   return new Set<string>();
@@ -70,11 +79,11 @@ export async function resolveUserPermissions(
 ): Promise<Set<string>> {
   const user = await prisma.user.findFirst({
     where: { id: userId, org_id: orgId, deleted_at: null },
-    select: { id: true },
+    select: { id: true, role: true },
   });
   if (!user) return new Set();
 
-  const effective = await rolePermissionKeys(userId);
+  const effective = await rolePermissionKeys(userId, user.role);
 
   const grants = await prisma.userPermissionGrant.findMany({
     where: { user_id: userId, org_id: orgId },

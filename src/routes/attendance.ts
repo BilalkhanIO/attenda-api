@@ -1,6 +1,6 @@
 // @ts-nocheck
 import { Router, Request, Response, NextFunction } from 'express';
-import { authenticate, requireRole } from '../middleware/auth';
+import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
@@ -131,13 +131,13 @@ async function createAwayGapBreak(record: any, reentryTime: Date, opts: { countA
 }
 
 // ─── GET /attendance/today ─────────────────────────────
-router.get('/today', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/today', requirePermission('attendance.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawDate = req.query.date as string | undefined;
     const { today } = await orgTimeContext(req.user!.org_id);
     const date = rawDate ? parseDateOnly(rawDate) : today;
     const where: Record<string, unknown> = { org_id: req.user!.org_id, date };
-    if (req.user!.role === 'manager') {
+    if (!req.permissions?.has('employees.view')) {
       const teamIds = await prisma.user.findMany({
         where: { manager_id: req.user!.sub, is_active: true },
         select: { id: true },
@@ -168,11 +168,11 @@ router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
 
 // ─── GET /attendance/remote/sessions ──────────────────
 // Manager sees remote session requests for approval
-router.get('/remote/sessions', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/remote/sessions', requirePermission('remote.approve'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { status } = req.query as { status?: string };
 
-    const teamIds = req.user!.role === 'manager'
+    const teamIds = !req.permissions?.has('employees.view')
       ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
       : null;
 
@@ -194,7 +194,7 @@ router.get('/remote/sessions', requireRole('manager'), async (req: Request, res:
 });
 
 // ─── PUT /attendance/remote/sessions/:id/approve ──────
-router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, res, next) => {
+router.put('/remote/sessions/:id/approve', requirePermission('remote.approve'), async (req, res, next) => {
   try {
     const session = await prisma.remoteSession.findUnique({
       where: { id: req.params.id },
@@ -227,7 +227,7 @@ router.put('/remote/sessions/:id/approve', requireRole('manager'), async (req, r
 });
 
 // ─── PUT /attendance/remote/sessions/:id/reject ───────
-router.put('/remote/sessions/:id/reject', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/remote/sessions/:id/reject', requirePermission('remote.approve'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const session = await prisma.remoteSession.findFirst({ where: { id: req.params.id, user: { org_id: req.user!.org_id } } });
     if (!session) throw new NotFoundError('Remote session');
@@ -290,12 +290,12 @@ router.get('/remote/sessions/me', async (req: Request, res: Response, next: Next
 
 // ─── GET /attendance/remote/monitor ───────────────────
 // Live dashboard: today's sessions with nudge logs & computed online status
-router.get('/remote/monitor', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/remote/monitor', requirePermission('remote.approve'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const today = startOfDay(new Date());
     const now   = new Date();
 
-    const isManager = req.user!.role === 'manager';
+    const isManager = !req.permissions?.has('employees.view');
     const teamIds = isManager
       ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
       : null;
@@ -569,12 +569,12 @@ router.post('/late-notice', async (req: Request, res: Response, next: NextFuncti
 
 // ─── GET /attendance/late-notices ─────────────────────
 // Manager/HR: view pending late notices for the org (today + future)
-router.get('/late-notices', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/late-notices', requirePermission('attendance.late_notices.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { today } = await orgTimeContext(req.user!.org_id);
     const { status } = req.query as { status?: string };
 
-    const isManager = req.user!.role === 'manager';
+    const isManager = !req.permissions?.has('employees.view');
     const teamIds = isManager
       ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
       : null;
@@ -593,7 +593,7 @@ router.get('/late-notices', requireRole('manager'), async (req: Request, res: Re
 });
 
 // ─── PUT /attendance/late-notice/:id/acknowledge ──────
-router.put('/late-notice/:id/acknowledge', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/late-notice/:id/acknowledge', requirePermission('attendance.late_notices.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const notice = await prisma.lateArrivalNotice.findFirst({
       where: { id: req.params.id, org_id: req.user!.org_id },
@@ -833,6 +833,29 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
     // unpaid 'away' break and reopen the record so the rest of the day continues.
     if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
       const reentryTime = new Date();
+      const reopenedStatus = (existing.late_minutes ?? 0) > 0 ? 'late' : 'in';
+      const gapSinceCheckout = Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000);
+
+      // Doze-gap forgiveness — see /ip-event re-entry for rationale.
+      const forgivenessMins = orgInfo?.gap_forgiveness_mins ?? 15;
+      if (gapSinceCheckout <= forgivenessMins) {
+        const stitched = await prisma.attendanceRecord.update({
+          where: { id: existing.id },
+          data: {
+            check_out_at:      null,
+            hours_worked:      null,
+            net_hours_worked:  null,
+            early_out_minutes: 0,
+            adherence_score:   null,
+            auto_checked_out:  false,
+            status:            reopenedStatus,
+            last_heartbeat_at: null,
+          },
+          include: RECORD_INCLUDE,
+        });
+        return ok(res, { ...stitched, action: 're_entered', gap_mins: gapSinceCheckout, forgiven: true, warning: null });
+      }
+
       const { gapMins, limitExceeded } = await createAwayGapBreak(existing, reentryTime, {
         countAsBreak: !!count_away_as_break,
         shiftBreakId: away_shift_break_id,
@@ -846,7 +869,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
           early_out_minutes: 0,
           adherence_score:   null,
           auto_checked_out:  false,
-          status:            'in',
+          status:            reopenedStatus,
           break_minutes:     (existing.break_minutes || 0) + gapMins,
           last_heartbeat_at: null,
         },
@@ -1201,7 +1224,11 @@ router.post('/heartbeat', async (req: Request, res: Response, next: NextFunction
       where: { id: record.id },
       data: { last_heartbeat_at: new Date(), last_heartbeat_ssid: ssid ?? null },
     });
-    return ok(res, { action: 'heartbeat_accepted' });
+    const hbOrg = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: { heartbeat_grace_mins: true },
+    });
+    return ok(res, { action: 'heartbeat_accepted', grace_mins: hbOrg?.heartbeat_grace_mins ?? 20 });
   } catch (e) { next(e); }
 });
 
@@ -1346,6 +1373,33 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
       // Re-entry after WiFi dropout: employee was auto-checked out and has reconnected.
       if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
         const reentryTime = new Date();
+        const reopenedStatus = (existing.late_minutes ?? 0) > 0 ? 'late' : 'in';
+        const gapSinceCheckout = Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000);
+
+        // Doze-gap forgiveness: the device is back on a registered office
+        // network after a short gap — almost always a phone with its screen
+        // off (Android Doze suppressed heartbeats), not a real departure.
+        // Stitch the record as if the checkout never happened: no away
+        // break, no break-minute deduction.
+        const forgivenessMins = org?.gap_forgiveness_mins ?? 15;
+        if (gapSinceCheckout <= forgivenessMins) {
+          await prisma.attendanceRecord.update({
+            where: { id: existing.id },
+            data: {
+              check_out_at:      null,
+              hours_worked:      null,
+              net_hours_worked:  null,
+              early_out_minutes: 0,
+              adherence_score:   null,
+              auto_checked_out:  false,
+              status:            reopenedStatus,
+              last_heartbeat_at: reentryTime,
+              last_heartbeat_ssid: ssid ?? null,
+            },
+          });
+          return ok(res, { action: 're_entered', gap_mins: gapSinceCheckout, forgiven: true, warning: null });
+        }
+
         const { gapMins, limitExceeded } = await createAwayGapBreak(existing, reentryTime, {
           countAsBreak: !!count_away_as_break,
           shiftBreakId: away_shift_break_id,
@@ -1359,7 +1413,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
             early_out_minutes: 0,
             adherence_score:   null,
             auto_checked_out:  false,
-            status:            'in',
+            status:            reopenedStatus,
             break_minutes:     (existing.break_minutes || 0) + gapMins,
             last_heartbeat_at: reentryTime,
             last_heartbeat_ssid: ssid ?? null,
@@ -1370,7 +1424,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
           notifyCheckIn(req.user!.org_id, reu.name, formatTime12h(reentryTime)).catch(console.error);
         }
-        return ok(res, { action: 're_entered', gap_mins: gapMins, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
+        return ok(res, { action: 're_entered', gap_mins: gapMins, forgiven: false, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
       }
 
       return ok(res, { action: 'already_in' });
@@ -1381,7 +1435,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
 });
 
 // ─── PUT /attendance/:id/override ─────────────────────
-router.put('/:id/override', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id/override', requirePermission('attendance.override'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const { check_in_at, check_out_at, reason } = req.body;
@@ -1419,7 +1473,7 @@ router.put('/:id/override', requireRole('manager'), async (req: Request, res: Re
 });
 
 // ─── GET /attendance/report/export ────────────────────
-router.get('/report/export', requireRole('hr_admin'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/report/export', requirePermission('attendance.export'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { start_date, end_date, department } = req.query as Record<string, string>;
     if (!start_date || !end_date) throw new ValidationError('start_date and end_date required');
@@ -1446,7 +1500,7 @@ router.get('/report/export', requireRole('hr_admin'), async (req: Request, res: 
 // NOTE: This parameterised route MUST stay last among GET routes so that
 // fixed-path routes like /leave-check, /late-notices, /me, etc. are matched
 // before Express falls through to the wildcard segment.
-router.get('/:userId', requireRole('manager'), async (req: Request, res: Response, next: NextFunction) => {
+router.get('/:userId', requirePermission('attendance.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { userId } = req.params;
     const { start, end } = req.query as { start?: string; end?: string };

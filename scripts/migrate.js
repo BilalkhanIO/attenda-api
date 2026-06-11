@@ -175,6 +175,8 @@ async function run() {
       'prisma/migrations/20260617000000_break_late_return/migration.sql',
       'prisma/migrations/20260618000000_shift_break_auto_start/migration.sql',
       'prisma/migrations/20260619000000_totp_required/migration.sql',
+      'prisma/migrations/20260620000000_departments_user_org_details/migration.sql',
+      'prisma/migrations/20260621000000_heartbeat_grace/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {

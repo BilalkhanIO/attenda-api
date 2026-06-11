@@ -63,6 +63,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'org.office.update', module: 'org', description: 'Manage office IPs and SSIDs' },
   { key: 'org.whatsapp.update', module: 'org', description: 'Configure WhatsApp integration' },
   { key: 'org.qr.manage', module: 'org', description: 'Manage check-in QR codes' },
+  { key: 'org.departments.manage', module: 'org', description: 'Manage departments and sub-departments' },
   { key: 'org.roles.manage', module: 'org', description: 'Manage custom org roles' },
   { key: 'org.permissions.grant', module: 'org', description: 'Grant per-user permission overrides' },
   // Analytics & reports
