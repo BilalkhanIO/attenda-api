@@ -1,9 +1,13 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import morgan from 'morgan';
 import { rateLimit } from 'express-rate-limit';
+import { RedisStore } from 'rate-limit-redis';
 import cookieParser from 'cookie-parser';
+import { randomUUID } from 'node:crypto';
+import { pinoHttp } from 'pino-http';
+import { logger, requestContext } from './utils/logger';
+import redis from './utils/redis';
 
 import authRouter       from './routes/auth';
 import usersRouter      from './routes/users';
@@ -58,21 +62,37 @@ app.use('/api/v1/webhooks', express.json({
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
-app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
+// ─── Structured logging + request correlation ─────────
+app.use((req, res, next) => {
+  const requestId = (req.headers['x-request-id'] as string) || randomUUID();
+  res.setHeader('x-request-id', requestId);
+  requestContext.run({ requestId }, next);
+});
+app.use(pinoHttp({
+  logger,
+  genReqId: (_req, res) => res.getHeader('x-request-id') as string,
+  autoLogging: { ignore: req => req.url === '/health' },
+  customLogLevel: (_req, res, err) =>
+    err || res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info',
+}));
 
 // ─── Rate limiting ────────────────────────────────────
+// Counters live in Redis so limits hold across instances/restarts
+// (the default memory store resets per process and double-counts nothing).
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: 100,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, error: 'Too many requests', code: 'RATE_LIMITED' },
+  store: new RedisStore({ sendCommand: (command: string, ...args: string[]) => redis.call(command, ...args) as never, prefix: 'rl:global:' }),
 });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 20,
   message: { success: false, error: 'Too many auth attempts', code: 'RATE_LIMITED' },
+  store: new RedisStore({ sendCommand: (command: string, ...args: string[]) => redis.call(command, ...args) as never, prefix: 'rl:auth:' }),
 });
 
 app.use(globalLimiter);
