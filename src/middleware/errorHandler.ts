@@ -8,10 +8,12 @@ export function errorHandler(
   _next: NextFunction
 ) {
   if (err instanceof AppError) {
+    const issues = (err as { issues?: Array<{ path: string; message: string }> }).issues;
     return res.status(err.statusCode).json({
       success: false,
       error: err.message,
       code: err.code,
+      ...(issues ? { details: issues } : {}),
     });
   }
 

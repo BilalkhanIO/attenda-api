@@ -1,6 +1,8 @@
 // @ts-nocheck
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { validate } from '../middleware/validate';
+import { leaveRequestSchema } from '../schemas';
 import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
 import { calculateWorkingDays } from '../utils/auth';
 import prisma from '../utils/prisma';
@@ -60,7 +62,7 @@ router.get('/requests', requirePermission('leave.view_all'), async (req, res, ne
 // Supports both full-day and half-day leave:
 //   is_half_day: true + half_day_period: 'morning'|'afternoon'
 //   → start_date = end_date (single day), working_days = 0.5
-router.post('/requests', async (req, res, next) => {
+router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res, next) => {
   try {
     const { leave_type, start_date, end_date, reason, is_half_day, half_day_period, leave_start_time, leave_end_time } = req.body;
     if (!leave_type || !start_date || !end_date) throw new ValidationError('leave_type, start_date and end_date required');

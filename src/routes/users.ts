@@ -1,5 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { validate } from '../middleware/validate';
+import { createUserSchema, updateUserSchema } from '../schemas';
 import { getUserCapabilities, resolveUserPermissions, can } from '../services/authorization';
 import { hashPassword, generateToken } from '../utils/auth';
 import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
@@ -207,7 +209,7 @@ router.get('/', requirePermission('employees.view', 'employees.view_team'), asyn
 });
 
 // ─── POST /users ───────────────────────────────────────
-router.post('/', requirePermission('employees.create'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('employees.create'), validate({ body: createUserSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
       name, email, role, department, department_id, job_title, phone, hourly_rate,
@@ -331,7 +333,7 @@ router.get('/:id', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ─── PUT /users/:id ────────────────────────────────────
-router.put('/:id', requirePermission('employees.update'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', requirePermission('employees.update'), validate({ body: updateUserSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     const {
