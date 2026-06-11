@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate } from '../middleware/auth';
+import { issueRefreshToken, rotateRefreshToken, revokeAllForUser } from '../services/refreshTokens';
 import { validate } from '../middleware/validate';
 import {
   loginSchema, registerSchema, refreshSchema, forgotPasswordSchema,
@@ -7,8 +8,7 @@ import {
   totpVerifySchema, totpAuthenticateSchema,
 } from '../schemas';
 import {
-  hashPassword, comparePassword, signAccessToken, signRefreshToken,
-  verifyRefreshToken, generateToken
+  hashPassword, comparePassword, signAccessToken, generateToken
 } from '../utils/auth';
 import { ok, AppError, UnauthorizedError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
@@ -98,7 +98,7 @@ router.post('/register', validate({ body: registerSchema }), async (req: Request
     }
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: org.id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
 
     ok(res, { access_token: accessToken, refresh_token: refreshToken, user: { id: user.id, name, email, role: user.role, org_id: org.id } }, 201);
   } catch (e) { next(e); }
@@ -212,7 +212,7 @@ router.post('/login', validate({ body: loginSchema }), async (req: Request, res:
     await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
 
     ok(res, {
       access_token: accessToken,
@@ -228,6 +228,7 @@ router.post('/logout', authenticate, async (req: Request, res: Response, next: N
     const jti = req.user!.jti;
     const exp = (req.user as unknown as { exp: number }).exp;
     await blacklistToken(jti, exp as unknown as number);
+    await revokeAllForUser(req.user!.sub);
     ok(res, { message: 'Logged out successfully' });
   } catch (e) { next(e); }
 });
@@ -238,12 +239,14 @@ router.post('/refresh', validate({ body: refreshSchema }), async (req: Request, 
     const { refresh_token } = req.body;
     if (!refresh_token) throw new ValidationError('Refresh token required');
 
-    const payload = verifyRefreshToken(refresh_token);
-    const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+    // Rotation: the presented token is consumed and a successor is returned.
+    // Reusing a consumed token revokes its whole family (leak detection).
+    const { userId, refreshToken } = await rotateRefreshToken(refresh_token);
+    const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user || !user.is_active) throw new UnauthorizedError('User not found');
 
     const accessToken = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    ok(res, { access_token: accessToken });
+    ok(res, { access_token: accessToken, refresh_token: refreshToken });
   } catch (e) { next(e); }
 });
 
@@ -306,7 +309,7 @@ router.post('/setup-account', validate({ body: setupAccountSchema }), async (req
     });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
     ok(res, { access_token: accessToken, refresh_token: refreshToken });
   } catch (e) { next(e); }
 });
@@ -388,7 +391,7 @@ router.post('/2fa/authenticate', validate({ body: totpAuthenticateSchema }), asy
     await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
     ok(res, {
       access_token: accessToken,
       refresh_token: refreshToken,
@@ -500,7 +503,7 @@ router.get('/sso/google/callback', async (req: Request, res: Response, next: Nex
     if (!user.is_active) throw new AppError('Account is deactivated', 403, 'ACCOUNT_INACTIVE');
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
 
     // Store tokens in Redis with a 60-second one-time code
     const onetimeCode = crypto.randomBytes(32).toString('hex');

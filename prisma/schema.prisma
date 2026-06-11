@@ -126,6 +126,7 @@ model User {
   overtime_requests       OvertimeRequest[]
   org_role_assignment     UserOrgRole?
   permission_grants       UserPermissionGrant[]
+  refresh_tokens          RefreshToken[]
   platform_role_assignments PlatformUserRole[]
 
   @@map("users")
@@ -146,6 +147,22 @@ model Department {
   @@unique([org_id, name, parent_id])
   @@index([org_id])
   @@map("departments")
+}
+
+model RefreshToken {
+  id          String    @id            // jti embedded in the JWT
+  user_id     String
+  family_id   String
+  expires_at  DateTime
+  revoked_at  DateTime?
+  replaced_by String?
+  created_at  DateTime  @default(now())
+
+  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([user_id])
+  @@index([family_id])
+  @@map("refresh_tokens")
 }
 
 model AttendanceRecord {
