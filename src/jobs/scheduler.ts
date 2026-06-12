@@ -1,5 +1,7 @@
 // @ts-nocheck
 import cron from 'node-cron';
+import redis from '../utils/redis';
+import { jobLogger } from '../utils/logger';
 import { toZonedTime } from 'date-fns-tz';
 import prisma from '../utils/prisma';
 import {
@@ -20,8 +22,34 @@ function resolveScheduledEnd(record: any, tz: string, checkOut: Date): Date | nu
 }
 
 // ─── Job: Late Arrival Detector ───────────────────────
+
+// ─── Multi-instance safety ────────────────────────────
+// Every job tick races for a Redis lock keyed by job name + minute bucket,
+// so running 2+ API instances cannot double-fire a job. If Redis is down we
+// run anyway: handlers are idempotent-ish and a duplicate beats a no-show.
+async function acquireTickLock(name: string): Promise<boolean> {
+  const bucket = new Date().toISOString().slice(0, 16); // minute resolution
+  try {
+    const res = await redis.set(`cronlock:${name}:${bucket}`, '1', 'EX', 3600, 'NX');
+    return res === 'OK';
+  } catch {
+    return true;
+  }
+}
+
+function scheduledJob(name: string, pattern: string, handler: () => Promise<void>) {
+  cron.schedule(pattern, async () => {
+    if (!(await acquireTickLock(name))) return;
+    try {
+      await handler();
+    } catch (err) {
+      jobLogger.error({ err, job: name }, 'scheduled job failed');
+    }
+  });
+}
+
 export function startLateArrivalDetector() {
-  cron.schedule('* * * * *', async () => {
+  scheduledJob('startLateArrivalDetector', '* * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true, late_threshold: true } });
@@ -146,7 +174,7 @@ export function startLateArrivalDetector() {
 
 // ─── Job: Absent Detector ─────────────────────────────
 export function startAbsentDetector() {
-  cron.schedule('0 * * * *', async () => {
+  scheduledJob('startAbsentDetector', '0 * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
@@ -240,7 +268,7 @@ export function startAbsentDetector() {
 
 // ─── Job: Heartbeat Expiry Monitor ────────────────────
 export function startHeartbeatExpiryMonitor() {
-  cron.schedule('*/5 * * * *', async () => {
+  scheduledJob('startHeartbeatExpiryMonitor', '*/5 * * * *', async () => {
     const now = new Date();
     try {
       // Query at the minimum possible staleness, then apply each org's
@@ -304,7 +332,7 @@ export function startHeartbeatExpiryMonitor() {
 
 // ─── Job: Stale Record Sweep ──────────────────────────
 export function startStaleRecordSweep() {
-  cron.schedule('0 6 * * *', async () => {
+  scheduledJob('startStaleRecordSweep', '0 6 * * *', async () => {
     const yesterday = new Date();
     yesterday.setDate(yesterday.getDate() - 1);
     yesterday.setHours(0, 0, 0, 0);
@@ -351,7 +379,7 @@ export function startStaleRecordSweep() {
 // ─── Job: Shift Reminders ─────────────────────────────
 const _shiftReminderSent = new Set<string>();
 export function startShiftReminderJob() {
-  cron.schedule('* * * * *', async () => {
+  scheduledJob('startShiftReminderJob', '* * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
@@ -396,7 +424,7 @@ export function startShiftReminderJob() {
 
 // ─── Job: Remote AI Nudges ────────────────────────────
 export function startRemoteNudgeJob() {
-  cron.schedule('0 * * * *', async () => {
+  scheduledJob('startRemoteNudgeJob', '0 * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
@@ -443,7 +471,7 @@ export function startRemoteNudgeJob() {
 
 // ─── Job: Payroll Auto-Generate ───────────────────────
 export function startPayrollAutoGenerate() {
-  cron.schedule('0 8 * * *', async () => {
+  scheduledJob('startPayrollAutoGenerate', '0 8 * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany();
@@ -496,7 +524,7 @@ export function startPayrollAutoGenerate() {
 // the scheduled end time. Separate from the heartbeat expiry job (which handles
 // WiFi dropout) — this handles deliberate in-office overtime cutoff.
 export function startShiftAutoCheckoutJob() {
-  cron.schedule('* * * * *', async () => {
+  scheduledJob('startShiftAutoCheckoutJob', '* * * * *', async () => {
     const now = new Date();
     try {
       const openRecords = await prisma.attendanceRecord.findMany({
@@ -558,7 +586,7 @@ export function startShiftAutoCheckoutJob() {
 
 // ─── Job: Shift Break Auto-Manager ────────────────────
 export function startShiftBreakAutoManager() {
-  cron.schedule('* * * * *', async () => {
+  scheduledJob('startShiftBreakAutoManager', '* * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
@@ -604,7 +632,7 @@ export function startShiftBreakAutoManager() {
 
 // ─── Job: Trial Expiry Monitor ────────────────────────
 export function startTrialExpiryMonitor() {
-  cron.schedule('0 6 * * *', async () => {
+  scheduledJob('startTrialExpiryMonitor', '0 6 * * *', async () => {
     try {
       await prisma.organisation.updateMany({
         where: { subscription_status: 'trialing', trial_ends_at: { lt: new Date() } },
@@ -618,7 +646,7 @@ export function startTrialExpiryMonitor() {
 
 // ─── Job: Daily Remote Nudge ──────────────────────────
 export function startDailyRemoteNudgeJob() {
-  cron.schedule('0 8 * * *', async () => {
+  scheduledJob('startDailyRemoteNudgeJob', '0 8 * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });

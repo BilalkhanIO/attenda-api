@@ -3,6 +3,7 @@ import { authenticate, requirePermission, requireOrgFeature } from '../middlewar
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfMonth, endOfMonth } from '../utils/auth';
 import prisma from '../utils/prisma';
+import { recordAudit } from '../services/audit';
 
 const router = Router();
 router.use(authenticate);
@@ -184,6 +185,13 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), async (req, res, 
       data: updateData,
       include: RECORD_INCLUDE,
     });
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'payroll.adjust', entityType: 'payroll_record', entityId: record.id,
+      before: { field, value: record[field === 'adjustments' ? 'manual_adjustment' : field as 'regular_hours' | 'overtime_hours'], gross_pay: record.gross_pay, net_pay: record.net_pay },
+      after: { field, value, gross_pay: updated.gross_pay, net_pay: updated.net_pay },
+      reason,
+    });
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -280,6 +288,11 @@ router.post('/process-full', requirePermission('payroll.process'), async (req, r
       }
     }
 
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'payroll.process', entityType: 'payroll_run', entityId: `${y}-${String(m).padStart(2, '0')}`,
+      after: { processed, failed: errors },
+    });
     ok(res, { processed, errors, month: m, year: y, message: `Payroll processed for ${processed} employees. ${errors.length} failed.` });
   } catch (e) { next(e); }
 });

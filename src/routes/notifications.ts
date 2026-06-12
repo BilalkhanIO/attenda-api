@@ -8,11 +8,14 @@ import prisma from '../utils/prisma';
 const router = Router();
 
 // ─── GET /notifications/stream ────────────────────────
-// SSE endpoint — token passed as query param because EventSource can't set headers.
-// Must be registered BEFORE router.use(authenticate) since EventSource cannot
-// send an Authorization header; the token is validated inline from the query string.
+// SSE endpoint. Preferred auth: Authorization header (fetch-based SSE clients
+// can set headers). The ?token= query param remains supported for native
+// EventSource clients, but it leaks tokens into access logs — avoid it.
 router.get('/stream', async (req: Request, res: Response) => {
-  const token = req.query.token as string | undefined;
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith('Bearer ')
+    ? authHeader.slice(7)
+    : (req.query.token as string | undefined);
   if (!token) { res.status(401).json({ error: 'No token provided' }); return; }
 
   let userId: string;

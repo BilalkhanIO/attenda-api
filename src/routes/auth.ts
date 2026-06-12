@@ -1,8 +1,14 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate } from '../middleware/auth';
+import { issueRefreshToken, rotateRefreshToken, revokeAllForUser } from '../services/refreshTokens';
+import { validate } from '../middleware/validate';
 import {
-  hashPassword, comparePassword, signAccessToken, signRefreshToken,
-  verifyRefreshToken, generateToken
+  loginSchema, registerSchema, refreshSchema, forgotPasswordSchema,
+  resetPasswordSchema, setupAccountSchema, changePasswordSchema,
+  totpVerifySchema, totpAuthenticateSchema,
+} from '../schemas';
+import {
+  hashPassword, comparePassword, signAccessToken, generateToken
 } from '../utils/auth';
 import { ok, AppError, UnauthorizedError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
@@ -39,7 +45,7 @@ async function blacklistToken(jti: string, expUnix: number): Promise<void> {
 }
 
 // ─── POST /auth/register ───────────────────────────────
-router.post('/register', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/register', validate({ body: registerSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { org_name, timezone, currency, name, email, password } = req.body;
     if (!org_name || !name || !email || !password) throw new ValidationError('Missing required fields');
@@ -92,14 +98,14 @@ router.post('/register', async (req: Request, res: Response, next: NextFunction)
     }
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: org.id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
 
     ok(res, { access_token: accessToken, refresh_token: refreshToken, user: { id: user.id, name, email, role: user.role, org_id: org.id } }, 201);
   } catch (e) { next(e); }
 });
 
 // ─── POST /auth/login ──────────────────────────────────
-router.post('/login', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/login', validate({ body: loginSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) throw new ValidationError('Email and password required');
@@ -206,7 +212,7 @@ router.post('/login', async (req: Request, res: Response, next: NextFunction) =>
     await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
 
     ok(res, {
       access_token: accessToken,
@@ -222,27 +228,30 @@ router.post('/logout', authenticate, async (req: Request, res: Response, next: N
     const jti = req.user!.jti;
     const exp = (req.user as unknown as { exp: number }).exp;
     await blacklistToken(jti, exp as unknown as number);
+    await revokeAllForUser(req.user!.sub);
     ok(res, { message: 'Logged out successfully' });
   } catch (e) { next(e); }
 });
 
 // ─── POST /auth/refresh ────────────────────────────────
-router.post('/refresh', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/refresh', validate({ body: refreshSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { refresh_token } = req.body;
     if (!refresh_token) throw new ValidationError('Refresh token required');
 
-    const payload = verifyRefreshToken(refresh_token);
-    const user = await prisma.user.findUnique({ where: { id: payload.sub } });
+    // Rotation: the presented token is consumed and a successor is returned.
+    // Reusing a consumed token revokes its whole family (leak detection).
+    const { userId, refreshToken } = await rotateRefreshToken(refresh_token);
+    const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user || !user.is_active) throw new UnauthorizedError('User not found');
 
     const accessToken = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    ok(res, { access_token: accessToken });
+    ok(res, { access_token: accessToken, refresh_token: refreshToken });
   } catch (e) { next(e); }
 });
 
 // ─── POST /auth/forgot-password ────────────────────────
-router.post('/forgot-password', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/forgot-password', validate({ body: forgotPasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email } = req.body;
     if (!email) throw new ValidationError('Email required');
@@ -262,7 +271,7 @@ router.post('/forgot-password', async (req: Request, res: Response, next: NextFu
 });
 
 // ─── POST /auth/reset-password ─────────────────────────
-router.post('/reset-password', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/reset-password', validate({ body: resetPasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { token, password } = req.body;
     if (!token || !password) throw new ValidationError('Token and password required');
@@ -283,7 +292,7 @@ router.post('/reset-password', async (req: Request, res: Response, next: NextFun
 });
 
 // ─── POST /auth/setup-account ──────────────────────────
-router.post('/setup-account', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/setup-account', validate({ body: setupAccountSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { token, password } = req.body;
     if (!token || !password) throw new ValidationError('Token and password required');
@@ -300,13 +309,13 @@ router.post('/setup-account', async (req: Request, res: Response, next: NextFunc
     });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
     ok(res, { access_token: accessToken, refresh_token: refreshToken });
   } catch (e) { next(e); }
 });
 
 // ─── PUT /auth/change-password ─────────────────────────
-router.put('/change-password', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.put('/change-password', authenticate, validate({ body: changePasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) throw new ValidationError('current_password and new_password required');
@@ -333,7 +342,7 @@ router.put('/change-password', authenticate, async (req: Request, res: Response,
 });
 
 // ─── POST /auth/2fa/authenticate ───────────────────────
-router.post('/2fa/authenticate', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/authenticate', validate({ body: totpAuthenticateSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { partial_token, code } = req.body;
     if (!partial_token || !code) throw new ValidationError('partial_token and code required');
@@ -382,7 +391,7 @@ router.post('/2fa/authenticate', async (req: Request, res: Response, next: NextF
     await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
     ok(res, {
       access_token: accessToken,
       refresh_token: refreshToken,
@@ -409,7 +418,7 @@ router.post('/2fa/setup', authenticate, async (req: Request, res: Response, next
 });
 
 // ─── POST /auth/2fa/verify ─────────────────────────────
-router.post('/2fa/verify', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/verify', authenticate, validate({ body: totpVerifySchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.body;
     if (!code) throw new ValidationError('code required');
@@ -427,7 +436,7 @@ router.post('/2fa/verify', authenticate, async (req: Request, res: Response, nex
 });
 
 // ─── DELETE /auth/2fa (disable 2FA — requires TOTP code) ─
-router.delete('/2fa', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/2fa', authenticate, validate({ body: totpVerifySchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.body as { code: string };
     if (!code) throw new AppError('Verification code required', 400, 'VALIDATION_ERROR');
@@ -494,7 +503,7 @@ router.get('/sso/google/callback', async (req: Request, res: Response, next: Nex
     if (!user.is_active) throw new AppError('Account is deactivated', 403, 'ACCOUNT_INACTIVE');
 
     const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = signRefreshToken(user.id);
+    const refreshToken = await issueRefreshToken(user.id);
 
     // Store tokens in Redis with a 60-second one-time code
     const onetimeCode = crypto.randomBytes(32).toString('hex');
