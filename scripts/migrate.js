@@ -510,6 +510,56 @@ Schedule a demo or start your free trial to see Attenda's shift management in ac
       console.log('[seed] Blog posts already present — skipping');
     }
 
+    // ── 7. Platform RBAC core (idempotent) ────────────────────────────────
+    // Production never runs the demo seed, so without this the platform
+    // roles/permissions tables stay empty and every permission-gated /admin
+    // route 403s for legitimate platform admins. The API also self-heals at
+    // boot; this covers the window between migrate and first boot.
+    console.log('[seed] Ensuring platform RBAC core …');
+    const platformPerms = [
+      ['platform.orgs.view',    'View organisations'],
+      ['platform.orgs.manage',  'Manage organisation subscriptions'],
+      ['platform.orgs.approve', 'Approve pending organisations'],
+      ['platform.plans.manage', 'Manage plan definitions'],
+      ['platform.blog.manage',  'Manage blog posts'],
+      ['platform.users.manage', 'Manage platform admin users'],
+    ];
+    for (const [key, description] of platformPerms) {
+      await client.query(
+        `INSERT INTO permissions (key, module, description) VALUES ($1, 'platform', $2)
+         ON CONFLICT (key) DO NOTHING`,
+        [key, description]
+      );
+    }
+    await client.query(
+      `INSERT INTO platform_roles (slug, name, description) VALUES
+         ('platform_admin', 'Platform Admin', 'Full platform SaaS console access'),
+         ('platform_assistant', 'Platform Assistant', 'Limited platform access (orgs view, blog)')
+       ON CONFLICT (slug) DO NOTHING`
+    );
+    for (const [key] of platformPerms) {
+      await client.query(
+        `INSERT INTO platform_role_permissions (platform_role_slug, permission_key)
+         VALUES ('platform_admin', $1) ON CONFLICT DO NOTHING`,
+        [key]
+      );
+    }
+    for (const key of ['platform.orgs.view', 'platform.blog.manage']) {
+      await client.query(
+        `INSERT INTO platform_role_permissions (platform_role_slug, permission_key)
+         VALUES ('platform_assistant', $1) ON CONFLICT DO NOTHING`,
+        [key]
+      );
+    }
+    // Link every legacy platform admin (role column) to the platform_admin role
+    await client.query(
+      `INSERT INTO platform_user_roles (user_id, platform_role_slug)
+       SELECT u.id, 'platform_admin' FROM users u
+       WHERE u.role = 'platform_admin' AND u.deleted_at IS NULL
+       ON CONFLICT DO NOTHING`
+    );
+    console.log('[seed] Platform RBAC core ensured');
+
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
     console.error('[migrate] Fatal error:', err.message);

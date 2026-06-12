@@ -107,6 +107,24 @@ export async function resolvePlatformPermissions(userId: string): Promise<Set<st
   for (const a of assignments) {
     for (const p of a.platform_role.permissions) keys.add(p.permission_key);
   }
+
+  // Legacy fallback: platform admins created before platform RBAC was seeded
+  // (production runs migrations only — the seed never ran there) have no
+  // assignment rows at all. Their role column is still the source of truth,
+  // so resolve the full platform permission set from the catalog. Assistants
+  // always have assignment rows, so this never widens THEIR access.
+  if (keys.size === 0 && assignments.length === 0) {
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { role: true },
+    });
+    if (user?.role === 'platform_admin') {
+      const { PERMISSION_CATALOG } = await import('../constants/rbac');
+      for (const p of PERMISSION_CATALOG) {
+        if (p.key.startsWith('platform.')) keys.add(p.key);
+      }
+    }
+  }
   return keys;
 }
 

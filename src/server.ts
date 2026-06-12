@@ -2,6 +2,7 @@ import 'dotenv/config';
 import app from './app';
 import prisma from './utils/prisma';
 import { startAllJobs } from './jobs/scheduler';
+import { logger } from './utils/logger';
 
 const PORT = parseInt(process.env.PORT || '5000');
 
@@ -20,6 +21,18 @@ async function main() {
     // Start background jobs
     if (process.env.NODE_ENV !== 'test') {
       startAllJobs();
+
+      // Self-heal RBAC seed data. Production deployments run SQL migrations
+      // only (scripts/migrate.js) and never the demo seed, so the permission
+      // catalog, platform roles, and platform-admin role assignments can be
+      // missing — which makes every permission-gated /admin route 403 for
+      // legitimate platform admins. All three seeders are idempotent upserts.
+      (async () => {
+        const { seedRbacCatalog, seedPlatformUserRoles } = await import('./utils/rbac-seed');
+        await seedRbacCatalog();
+        await seedPlatformUserRoles();
+        logger.info('RBAC catalog + platform role assignments verified');
+      })().catch(err => logger.error({ err }, 'RBAC self-heal failed'));
     }
 
     // ─── Graceful shutdown ─────────────────────────────
