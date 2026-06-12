@@ -2,8 +2,10 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
-# Install dependencies
-COPY package*.json ./
+# Install dependencies. The postinstall hook runs `prisma generate`, which
+# needs the schema and prisma.config.ts present BEFORE npm ci.
+COPY package*.json prisma.config.ts ./
+COPY prisma ./prisma
 RUN npm ci --only=production=false
 
 # Copy source and build
