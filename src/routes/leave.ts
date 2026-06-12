@@ -6,6 +6,7 @@ import { leaveRequestSchema } from '../schemas';
 import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
 import { calculateWorkingDays } from '../utils/auth';
 import prisma from '../utils/prisma';
+import { recordAudit } from '../services/audit';
 
 const router = Router();
 router.use(authenticate);
@@ -367,6 +368,13 @@ router.put('/balance/:userId', requirePermission('leave.balance.manage'), async 
     const updated = await prisma.leaveBalance.update({
       where: { id: balance.id },
       data: { total_days: balance.total_days + adjustment },
+    });
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'leave.balance.update', entityType: 'leave_balance', entityId: balance.id,
+      before: { total_days: balance.total_days },
+      after: { total_days: updated.total_days, adjustment },
+      reason,
     });
     ok(res, updated);
   } catch (e) { next(e); }

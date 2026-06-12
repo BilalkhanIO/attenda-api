@@ -6,6 +6,7 @@ import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
 import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift } from '../utils/attendance';
 import prisma from '../utils/prisma';
+import { recordAudit } from '../services/audit';
 
 const router = Router();
 router.use(authenticate);
@@ -1467,6 +1468,13 @@ router.put('/:id/override', requirePermission('attendance.override'), async (req
       where: { id },
       data: updateData,
       include: RECORD_INCLUDE,
+    });
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'attendance.override', entityType: 'attendance_record', entityId: record.id,
+      before: { check_in_at: record.check_in_at, check_out_at: record.check_out_at, hours_worked: record.hours_worked },
+      after: { check_in_at: updated.check_in_at, check_out_at: updated.check_out_at, hours_worked: updated.hours_worked },
+      reason,
     });
     ok(res, updated);
   } catch (e) { next(e); }

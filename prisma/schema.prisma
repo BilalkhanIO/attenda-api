@@ -165,6 +165,23 @@ model RefreshToken {
   @@map("refresh_tokens")
 }
 
+model AuditLog {
+  id          String   @id @default(uuid())
+  org_id      String
+  actor_id    String
+  action      String   @db.VarChar(60)
+  entity_type String   @db.VarChar(40)
+  entity_id   String
+  before      Json?
+  after       Json?
+  reason      String?  @db.Text
+  created_at  DateTime @default(now())
+
+  @@index([org_id, created_at])
+  @@index([entity_type, entity_id])
+  @@map("audit_logs")
+}
+
 model AttendanceRecord {
   id              String    @id @default(uuid())
   user_id         String

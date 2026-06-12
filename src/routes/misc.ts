@@ -561,6 +561,36 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), async (req,
   } catch (e) { next(e); }
 });
 
+// GET /org/audit-logs — append-only trail of pay-affecting mutations
+orgRouter.get('/audit-logs', requirePermission('org.settings.update'), async (req, res, next) => {
+  try {
+    const page  = Math.max(1, parseInt(String(req.query.page  ?? '1')));
+    const limit = Math.min(100, parseInt(String(req.query.limit ?? '50')));
+    const where: Record<string, unknown> = { org_id: req.user!.org_id };
+    if (req.query.action)      where.action = String(req.query.action);
+    if (req.query.entity_type) where.entity_type = String(req.query.entity_type);
+
+    const [items, total] = await Promise.all([
+      prisma.auditLog.findMany({
+        where, orderBy: { created_at: 'desc' },
+        skip: (page - 1) * limit, take: limit,
+      }),
+      prisma.auditLog.count({ where }),
+    ]);
+
+    // Resolve actor names in one query
+    const actorIds = [...new Set(items.map(i => i.actor_id))];
+    const actors = await prisma.user.findMany({
+      where: { id: { in: actorIds } }, select: { id: true, name: true },
+    });
+    const nameById = new Map(actors.map(a => [a.id, a.name]));
+    ok(res, {
+      items: items.map(i => ({ ...i, actor_name: nameById.get(i.actor_id) ?? 'Unknown' })),
+      total, page, limit,
+    });
+  } catch (e) { next(e); }
+});
+
 // GET /org/my-ip — returns the client IP as seen by the server (useful for network auto-detection)
 orgRouter.get('/my-ip', authenticate, async (req, res, _next) => {
   const fwd = req.headers['x-forwarded-for'];
