@@ -10,6 +10,32 @@ import prisma from '../utils/prisma';
 export const performanceRouter = Router();
 performanceRouter.use(authenticate);
 
+// ─── ANNOUNCEMENTS ────────────────────────────────────
+performanceRouter.post('/announcements', requirePermission('org.announcements.send'), async (req, res, next) => {
+  try {
+    const { title, body, target_dept_id } = req.body;
+    if (!title?.trim() || !body?.trim()) throw new ValidationError('title and body are required');
+
+    const orgId = req.user!.org_id;
+    const where: any = { org_id: orgId, is_active: true, deleted_at: null };
+    if (target_dept_id) where.department_id = String(target_dept_id);
+
+    const users = await prisma.user.findMany({ where, select: { id: true } });
+    
+    await prisma.inAppNotification.createMany({
+      data: users.map(u => ({
+        user_id: u.id,
+        org_id: orgId,
+        type: 'announcement',
+        title: title.trim(),
+        body: body.trim(),
+      }))
+    });
+
+    ok(res, { count: users.length, message: 'Announcement sent' });
+  } catch (e) { next(e); }
+});
+
 // GET /performance/reviews
 performanceRouter.get('/reviews', requirePermission('performance.view'), async (req, res, next) => {
   try {

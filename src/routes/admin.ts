@@ -19,6 +19,7 @@ const canApproveOrgs = requirePermission('platform.orgs.approve');
 const canManagePlans = requirePermission('platform.plans.manage');
 const canViewPlans   = requirePermission('platform.plans.manage', 'platform.orgs.view');
 const canManageBlog  = requirePermission('platform.blog.manage');
+const canViewLogs    = requirePermission('platform.audit.view', 'platform.orgs.manage');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -508,6 +509,73 @@ router.patch('/blog/:id/publish', canManageBlog, async (req: Request, res: Respo
       },
     });
     ok(res, post);
+  } catch (e) { next(e); }
+});
+
+// ── Broadcast ──────────────────────────────────────────────────────────────
+
+router.post('/broadcast', requirePermission('platform.broadcast.send', 'platform.orgs.manage'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { title, body, target = 'all' } = req.body;
+    if (!title?.trim() || !body?.trim()) throw new ValidationError('title and body are required');
+
+    // Only broadcast to active users in non-SYSTEM orgs
+    const where: any = { 
+      is_active: true, 
+      deleted_at: null,
+      org_id: { not: 'SYSTEM' }
+    };
+    
+    if (target === 'super_admins') {
+      where.role = 'super_admin';
+    }
+
+    const users = await prisma.user.findMany({
+      where,
+      select: { id: true, org_id: true }
+    });
+
+    // Bulk create notifications
+    await prisma.inAppNotification.createMany({
+      data: users.map(u => ({
+        user_id: u.id,
+        org_id: u.org_id,
+        type: 'announcement',
+        title: title.trim(),
+        body: body.trim(),
+      }))
+    });
+
+    ok(res, { count: users.length, message: `Broadcast sent to ${users.length} users` });
+  } catch (e) { next(e); }
+});
+
+// ── Audit Logs ──────────────────────────────────────────────────────────────
+
+router.get('/audit-logs', canViewLogs, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const page  = Math.max(1, Number(req.query.page)  || 1);
+    const limit = Math.min(100, Number(req.query.limit) || 50);
+    const { org_id, actor_id, action, entity_type } = req.query;
+
+    const where: any = {};
+    if (org_id)      where.org_id      = String(org_id);
+    if (actor_id)    where.actor_id    = String(actor_id);
+    if (action)      where.action      = String(action);
+    if (entity_type) where.entity_type = String(entity_type);
+
+    const [logs, total] = await Promise.all([
+      prisma.auditLog.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { created_at: 'desc' },
+      }),
+      prisma.auditLog.count({ where }),
+    ]);
+
+    // Optional: decorate logs with actor names if needed, or do it on frontend
+    ok(res, { logs, total, page, pages: Math.ceil(total / limit) });
   } catch (e) { next(e); }
 });
 

@@ -547,6 +547,7 @@ model WhatsappLog {
   recipient_id   String    @db.VarChar(255)
   message_body   String    @db.Text
   status         String    @default("pending")
+  error_message  String?   @db.Text
   attempts       Int       @default(0)
   sent_at        DateTime?
   created_at     DateTime  @default(now())
