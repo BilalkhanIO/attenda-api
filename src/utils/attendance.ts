@@ -9,6 +9,33 @@ export interface BreakSettlement {
   totalMins: number;
 }
 
+export async function calculateBreakTotals(attendanceId: string): Promise<BreakSettlement> {
+  const all = await prisma.breakRecord.findMany({
+    where: { attendance_id: attendanceId, break_end: { not: null } },
+  });
+
+  const paidMins = all
+    .filter(b => b.is_paid)
+    .reduce((sum, b) => sum + (b.duration_mins || 0), 0);
+  const unpaidMins = all
+    .filter(b => !b.is_paid)
+    .reduce((sum, b) => sum + (b.duration_mins || 0), 0);
+
+  return { paidMins, unpaidMins, totalMins: paidMins + unpaidMins };
+}
+
+export async function updateAttendanceBreakSummary(attendanceId: string): Promise<BreakSettlement> {
+  const totals = await calculateBreakTotals(attendanceId);
+  await prisma.attendanceRecord.update({
+    where: { id: attendanceId },
+    data: {
+      break_minutes: totals.totalMins,
+      paid_break_minutes: totals.paidMins,
+    },
+  });
+  return totals;
+}
+
 /**
  * Compute how many minutes late an employee returned from a break.
  * Returns null when there is no linked policy (ad-hoc break) or the
@@ -65,8 +92,8 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
   const all = await prisma.breakRecord.findMany({
     where: { attendance_id: attendanceId, break_end: { not: null } },
   });
-  
-  const paidMins   = all.filter(b => b.is_paid).reduce((s, b) => s + (b.duration_mins || 0), 0);
+
+  const paidMins = all.filter(b => b.is_paid).reduce((s, b) => s + (b.duration_mins || 0), 0);
   let unpaidMins = all.filter(b => !b.is_paid).reduce((s, b) => s + (b.duration_mins || 0), 0);
 
   // Auto-deduct any mandatory flexible shift breaks that the employee missed taking.

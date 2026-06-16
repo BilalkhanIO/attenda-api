@@ -9,9 +9,9 @@ import {
   sendRemoteNudge, sendDailyRemoteNudge, notifyShiftReminder, formatTime12h, notify
 } from '../services/whatsapp';
 import {
-  minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow, shiftAutoCheckoutDue
+  minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow, scheduledInstant, shiftAutoCheckoutDue
 } from '../utils/shift';
-import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift } from '../utils/attendance';
+import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, updateAttendanceBreakSummary } from '../utils/attendance';
 
 // Resolve the shift-end instant for overtime math: prefer the value persisted at
 // check-in (correct for overnight shifts), else recompute the window from checkOut.
@@ -19,6 +19,28 @@ function resolveScheduledEnd(record: any, tz: string, checkOut: Date): Date | nu
   if (record.scheduled_end) return new Date(record.scheduled_end);
   if (!record.shift) return null;
   return scheduledWindow(record.shift, tz, checkOut).end;
+}
+
+function activeBreakDueAt(record: any, tz: string): Date | null {
+  const active = record.break_records?.find((b: any) => !b.break_end);
+  if (!active) return null;
+
+  const policy = active.shift_break;
+  if (policy?.break_kind === 'fixed' && policy.break_end_time) {
+    const dateStr = record.date.toISOString().split('T')[0];
+    let dueAt = scheduledInstant(dateStr, policy.break_end_time, tz);
+    if (policy.break_start_time &&
+        hhmmToMins(policy.break_end_time) <= hhmmToMins(policy.break_start_time)) {
+      dueAt = new Date(dueAt.getTime() + 24 * 60 * 60 * 1000);
+    }
+    return dueAt;
+  }
+
+  if (policy?.break_kind === 'flexible' && policy.break_minutes) {
+    return new Date(active.break_start.getTime() + policy.break_minutes * 60_000);
+  }
+
+  return null;
 }
 
 // ─── Job: Late Arrival Detector ───────────────────────
@@ -281,7 +303,14 @@ export function startHeartbeatExpiryMonitor() {
           status: { in: ['in', 'late'] },
           last_heartbeat_at: { not: null, lte: new Date(now.getTime() - 10 * 60 * 1000) },
         },
-        include: { user: { include: { org: { select: { id: true, timezone: true, heartbeat_grace_mins: true } } } }, shift: true },
+        include: {
+          user: { include: { org: { select: { id: true, timezone: true, heartbeat_grace_mins: true } } } },
+          shift: true,
+          break_records: {
+            where: { break_end: null },
+            include: { shift_break: true },
+          },
+        },
       });
 
       for (const record of expired) {
@@ -293,7 +322,15 @@ export function startHeartbeatExpiryMonitor() {
         const staleMins = (now.getTime() - record.last_heartbeat_at!.getTime()) / 60_000;
         if (staleMins < graceMins) continue;
 
-        const checkOut = record.last_heartbeat_at!;
+        const breakDueAt = activeBreakDueAt(record, tz);
+        if (breakDueAt) {
+          const breakGraceDue = new Date(breakDueAt.getTime() + graceMins * 60_000);
+          if (now < breakGraceDue) continue;
+        }
+
+        const checkOut = breakDueAt && breakDueAt > record.last_heartbeat_at!
+          ? breakDueAt
+          : record.last_heartbeat_at!;
         const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
         const breaks = await settleBreaks(record.id, checkOut, tz);
         const rawEarlyMins = earlyOutMinutes(checkOut, record.shift, tz);
@@ -620,6 +657,7 @@ export function startShiftBreakAutoManager() {
                 where: { id: existing.id },
                 data: { break_end: now, duration_mins: Math.max(0, Math.round((now.getTime() - existing.break_start.getTime()) / 60000)), auto_ended: true },
               });
+              await updateAttendanceBreakSummary(record.id);
             }
           }
         }

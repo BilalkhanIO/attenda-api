@@ -4,7 +4,7 @@ import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
-import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift } from '../utils/attendance';
+import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, calculateBreakTotals } from '../utils/attendance';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
 
@@ -14,6 +14,7 @@ router.use(authenticate);
 const RECORD_INCLUDE = {
   user:  { select: { id: true, name: true, avatar_url: true, department: true, job_title: true } },
   shift: { select: { id: true, name: true, start_time: true, end_time: true, color: true, overtime_enabled: true, overtime_requires_approval: true, extra_time_label: true } },
+  break_records: { orderBy: { break_start: 'asc' } },
 };
 
 async function orgTimeContext(orgId: string) {
@@ -477,12 +478,9 @@ router.post('/break/end', async (req: Request, res: Response, next: NextFunction
       },
     });
 
-    // Recalculate net_hours_worked on the parent attendance record
-    const allBreaks = await prisma.breakRecord.findMany({
-      where: { attendance_id: record.id, break_end: { not: null } },
-    });
-    const unpaidBreakMins = allBreaks.filter(b => !b.is_paid).reduce((s, b) => s + (b.duration_mins ?? 0), 0);
-    const paidBreakMins   = allBreaks.filter(b =>  b.is_paid).reduce((s, b) => s + (b.duration_mins ?? 0), 0);
+    // Recalculate net_hours_worked on the parent attendance record from the
+    // actual break rows, so total/paid/unpaid cannot drift.
+    const breakTotals = await calculateBreakTotals(record.id);
     const totalMins       = record.check_in_at
       ? Math.round((now.getTime() - record.check_in_at.getTime()) / 60000)
       : 0;
@@ -490,9 +488,9 @@ router.post('/break/end', async (req: Request, res: Response, next: NextFunction
     await prisma.attendanceRecord.update({
       where: { id: record.id },
       data: {
-        break_minutes:    unpaidBreakMins + paidBreakMins,
-        paid_break_minutes: paidBreakMins,
-        net_hours_worked: parseFloat(((totalMins - unpaidBreakMins) / 60).toFixed(2)),
+        break_minutes: breakTotals.totalMins,
+        paid_break_minutes: breakTotals.paidMins,
+        net_hours_worked: parseFloat(((totalMins - breakTotals.unpaidMins) / 60).toFixed(2)),
       },
     });
 
@@ -669,6 +667,7 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
     };
 
     const activeBreak = record?.break_records.find(b => !b.break_end) ?? null;
+    const breakTotals = record ? await calculateBreakTotals(record.id) : null;
 
     const enrichedBreaks = (shift?.breaks ?? []).filter(sb => dayMatchesBreak(sb, today)).map(sb => {
       // Determine break window in UTC
@@ -769,20 +768,27 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
       } : null,
       attendance: record ? {
         id:           record.id,
+        date:         record.date,
         status:       record.status,
         check_in_at:  record.check_in_at,
         check_out_at: record.check_out_at,
+        check_in_type: record.check_in_type,
+        hours_worked: record.hours_worked,
         late_minutes: record.late_minutes,
         early_out_minutes: record.early_out_minutes,
         early_checkin_minutes: record.early_checkin_minutes,
         net_hours_worked: record.net_hours_worked,
         overtime_hours: record.overtime_hours,
         extra_office_minutes: record.extra_office_minutes,
-        break_minutes: record.break_minutes,
-        paid_break_minutes: record.paid_break_minutes,
+        break_minutes: breakTotals?.totalMins ?? record.break_minutes,
+        paid_break_minutes: breakTotals?.paidMins ?? record.paid_break_minutes,
+        auto_checked_out: record.auto_checked_out,
+        late_notice_id: record.late_notice_id,
+        last_heartbeat_at: record.last_heartbeat_at,
         break_records: record.break_records,
       } : null,
       active_break: activeBreak,
+      date: today.toISOString().split('T')[0],
       pre_checkin_late_minutes,
       server_time: now.toISOString(),
     });
@@ -861,6 +867,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
         countAsBreak: !!count_away_as_break,
         shiftBreakId: away_shift_break_id,
       });
+      const breakTotals = await calculateBreakTotals(existing.id);
       const reopened = await prisma.attendanceRecord.update({
         where: { id: existing.id },
         data: {
@@ -871,7 +878,8 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
           adherence_score:   null,
           auto_checked_out:  false,
           status:            reopenedStatus,
-          break_minutes:     (existing.break_minutes || 0) + gapMins,
+          break_minutes:     breakTotals.totalMins,
+          paid_break_minutes: breakTotals.paidMins,
           last_heartbeat_at: null,
         },
         include: RECORD_INCLUDE,
@@ -1300,6 +1308,8 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           shift_id:        shiftId        ?? undefined,
           scheduled_start: scheduledStart ?? undefined,
           scheduled_end:   scheduledEnd   ?? undefined,
+          last_heartbeat_at: now,
+          last_heartbeat_ssid: ssid ?? null,
         };
         const record = existing
           ? await prisma.attendanceRecord.update({ where: { id: existing.id }, data: checkInData })
@@ -1405,6 +1415,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           countAsBreak: !!count_away_as_break,
           shiftBreakId: away_shift_break_id,
         });
+        const breakTotals = await calculateBreakTotals(existing.id);
         await prisma.attendanceRecord.update({
           where: { id: existing.id },
           data: {
@@ -1415,7 +1426,8 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
             adherence_score:   null,
             auto_checked_out:  false,
             status:            reopenedStatus,
-            break_minutes:     (existing.break_minutes || 0) + gapMins,
+            break_minutes:     breakTotals.totalMins,
+            paid_break_minutes: breakTotals.paidMins,
             last_heartbeat_at: reentryTime,
             last_heartbeat_ssid: ssid ?? null,
           },
@@ -1428,7 +1440,14 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
         return ok(res, { action: 're_entered', gap_mins: gapMins, forgiven: false, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
       }
 
-      return ok(res, { action: 'already_in' });
+      await prisma.attendanceRecord.update({
+        where: { id: existing.id },
+        data: {
+          last_heartbeat_at: new Date(),
+          last_heartbeat_ssid: ssid ?? null,
+        },
+      });
+      return ok(res, { action: 'already_in', grace_mins: org?.heartbeat_grace_mins ?? 20 });
     }
 
     ok(res, { action: 'none' });
