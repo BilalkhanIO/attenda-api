@@ -7,6 +7,7 @@ import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/res
 import { calculateWorkingDays } from '../utils/auth';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
+import { emitOrgEvent } from '../services/notifications';
 
 const router = Router();
 router.use(authenticate);
@@ -166,6 +167,7 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
       }
     }
 
+    emitOrgEvent(req.user!.org_id, 'leave_changed');
     ok(res, request, 201);
   } catch (e) { next(e); }
 });
@@ -270,6 +272,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
         actionType: 'leave_request', actionId: updated.id,
       }).catch(console.error);
     }
+    emitOrgEvent(req.user!.org_id, 'leave_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -323,6 +326,7 @@ router.put('/requests/:id/reject', requirePermission('leave.approve'), async (re
       }).catch(console.error);
     }
 
+    emitOrgEvent(req.user!.org_id, 'leave_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });

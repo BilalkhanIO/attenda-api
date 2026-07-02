@@ -1,4 +1,44 @@
+import { EventEmitter } from 'events';
 import prisma from '../utils/prisma';
+
+// ─── Org event bus (SSE invalidation) ─────────────────
+// Lightweight in-process pub/sub: mutation handlers emit a coarse "something
+// in <scope> changed for <org>" signal and every SSE connection of that org
+// forwards it as {type:'invalidate', scope} so clients can refetch.
+//
+// LIMITATION: in-process only — with 2+ API instances a client connected to
+// instance A misses events emitted on instance B (it still has the 15s count
+// poll as a fallback). The multi-instance upgrade is Redis pub/sub: publish
+// in emitOrgEvent, subscribe per instance, fan out to local connections.
+
+export type OrgEventType =
+  | 'attendance_changed'
+  | 'leave_changed'
+  | 'overtime_changed'
+  | 'remote_changed'
+  | 'swap_changed';
+
+const orgEvents = new EventEmitter();
+orgEvents.setMaxListeners(0); // one listener per SSE connection — unbounded
+
+/** Fire-and-forget: never throws, so a failed emit cannot break a handler. */
+export function emitOrgEvent(orgId: string, type: OrgEventType): void {
+  try {
+    orgEvents.emit(`org:${orgId}`, type);
+  } catch (e) {
+    console.error('[Notifications] emitOrgEvent failed:', e);
+  }
+}
+
+/** Subscribe an SSE connection to its org's events. Returns an unsubscribe fn. */
+export function subscribeOrgEvents(
+  orgId: string,
+  listener: (type: OrgEventType) => void,
+): () => void {
+  const key = `org:${orgId}`;
+  orgEvents.on(key, listener);
+  return () => orgEvents.off(key, listener);
+}
 
 export type NotifType =
   | 'attendance_checkin' | 'attendance_checkout' | 'attendance_late' | 'attendance_absent'

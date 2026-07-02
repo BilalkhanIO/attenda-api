@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { authenticate, requireOrgFeature, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, NotFoundError, ValidationError } from '../utils/response';
+import { emitOrgEvent } from '../services/notifications';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -649,6 +650,7 @@ router.post('/swaps', async (req, res, next) => {
     const swap = await prisma.shiftSwap.create({
       data: { requester_id: req.user!.sub, target_id, requester_assign_id, target_assign_id, reason },
     });
+    emitOrgEvent(req.user!.org_id, 'swap_changed');
     ok(res, swap, 201);
   } catch (e) { next(e); }
 });
@@ -669,6 +671,7 @@ router.put('/swaps/:id/approve', requirePermission('shifts.swaps.approve'), asyn
       await tx.shiftAssignment.update({ where: { id: swap.target_assign_id },    data: { shift_id: swap.requester_assignment.shift_id } });
       await tx.shiftSwap.update({ where: { id: swap.id }, data: { status: 'approved', manager_id: req.user!.sub } });
     });
+    emitOrgEvent(req.user!.org_id, 'swap_changed');
     ok(res, { message: 'Swap approved and schedules updated' });
   } catch (e) { next(e); }
 });
@@ -684,6 +687,7 @@ router.put('/swaps/:id/reject', requirePermission('shifts.swaps.approve'), async
     });
     if (!swap) throw new NotFoundError('Swap request');
     await prisma.shiftSwap.update({ where: { id: swap.id }, data: { status: 'rejected', manager_id: req.user!.sub, rejection_reason: reason } });
+    emitOrgEvent(req.user!.org_id, 'swap_changed');
     ok(res, { message: 'Swap rejected' });
   } catch (e) { next(e); }
 });

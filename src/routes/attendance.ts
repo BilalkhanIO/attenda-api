@@ -7,6 +7,7 @@ import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, sch
 import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, calculateBreakTotals } from '../utils/attendance';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
+import { emitOrgEvent } from '../services/notifications';
 
 const router = Router();
 router.use(authenticate);
@@ -224,6 +225,7 @@ router.put('/remote/sessions/:id/approve', requirePermission('remote.approve'), 
       actionType: 'remote_session', actionId: session.id,
     }).catch(console.error);
 
+    emitOrgEvent(req.user!.org_id, 'remote_changed');
     ok(res, { message: 'Remote session approved' });
   } catch (e) { next(e); }
 });
@@ -269,6 +271,7 @@ router.put('/remote/sessions/:id/reject', requirePermission('remote.approve'), a
       }).catch(console.error);
     }
 
+    emitOrgEvent(req.user!.org_id, 'remote_changed');
     ok(res, { message: 'Remote session rejected' });
   } catch (e) { next(e); }
 });
@@ -1102,6 +1105,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
       }).catch(console.error);
     }
 
+    emitOrgEvent(req.user!.org_id, 'attendance_changed');
     ok(res, record);
   } catch (e) { next(e); }
 });
@@ -1199,6 +1203,7 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
       }).catch(console.error);
     }
 
+    emitOrgEvent(req.user!.org_id, 'attendance_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -1378,6 +1383,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           }).catch(console.error);
         }
 
+        emitOrgEvent(req.user!.org_id, 'attendance_changed');
         return ok(res, { action: 'checked_in', record });
       }
 
@@ -1408,6 +1414,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
               last_heartbeat_ssid: ssid ?? null,
             },
           });
+          emitOrgEvent(req.user!.org_id, 'attendance_changed');
           return ok(res, { action: 're_entered', gap_mins: gapSinceCheckout, forgiven: true, warning: null });
         }
 
@@ -1437,6 +1444,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
           const { notifyCheckIn, formatTime12h } = await import('../services/whatsapp');
           notifyCheckIn(req.user!.org_id, reu.name, formatTime12h(reentryTime)).catch(console.error);
         }
+        emitOrgEvent(req.user!.org_id, 'attendance_changed');
         return ok(res, { action: 're_entered', gap_mins: gapMins, forgiven: false, warning: limitExceeded ? 'This away time used an extra break and may be unpaid by policy.' : null });
       }
 
@@ -1495,6 +1503,7 @@ router.put('/:id/override', requirePermission('attendance.override'), async (req
       after: { check_in_at: updated.check_in_at, check_out_at: updated.check_out_at, hours_worked: updated.hours_worked },
       reason,
     });
+    emitOrgEvent(req.user!.org_id, 'attendance_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });

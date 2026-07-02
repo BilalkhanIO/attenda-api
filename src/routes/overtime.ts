@@ -2,6 +2,7 @@ import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../utils/prisma';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, ValidationError, NotFoundError } from '../utils/response';
+import { emitOrgEvent } from '../services/notifications';
 
 const router = Router();
 router.use(authenticate);
@@ -40,6 +41,7 @@ router.post('/requests', async (req: Request, res: Response, next: NextFunction)
       },
     });
 
+    emitOrgEvent(req.user!.org_id, 'overtime_changed');
     created(res, request);
   } catch (e) { next(e); }
 });
@@ -106,6 +108,7 @@ router.put('/requests/:id/approve', requirePermission('overtime.manage'), async 
       notifyOvertimeApproved(req.user!.org_id, request.user.name, request.requested_minutes, request.user.phone).catch(console.error);
     }
 
+    emitOrgEvent(req.user!.org_id, 'overtime_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -133,6 +136,7 @@ router.put('/requests/:id/reject', requirePermission('overtime.manage'), async (
       notifyOvertimeRejected(req.user!.org_id, request.user.name, reason, request.user.phone).catch(console.error);
     }
 
+    emitOrgEvent(req.user!.org_id, 'overtime_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });
