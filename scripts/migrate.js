@@ -179,6 +179,7 @@ async function run() {
       'prisma/migrations/20260621000000_heartbeat_grace/migration.sql',
       'prisma/migrations/20260622000000_refresh_token_rotation/migration.sql',
       'prisma/migrations/20260623000000_audit_logs/migration.sql',
+      'prisma/migrations/20260624000000_fcm_presence_challenge/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {

@@ -101,6 +101,8 @@ model User {
   employment_type      String?   @db.VarChar(30)
   joined_at            DateTime? @db.Date
   national_id          String?   @db.VarChar(100)
+  fcm_token            String?
+  fcm_token_updated_at DateTime?
   created_at     DateTime  @default(now())
   deleted_at     DateTime?
 
@@ -219,6 +221,7 @@ model AttendanceRecord {
   is_on_approved_leave Boolean @default(false)
   last_heartbeat_at    DateTime?
   last_heartbeat_ssid  String?   @db.VarChar(100)
+  challenge_sent_at    DateTime?
 
   user           User               @relation(fields: [user_id], references: [id])
   org            Organisation       @relation(fields: [org_id], references: [id])

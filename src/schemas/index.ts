@@ -75,6 +75,12 @@ export const leaveRequestSchema = z
 // ─── Users ────────────────────────────────────────────
 const ORG_ROLES = ['employee', 'manager', 'hr_admin', 'super_admin'] as const;
 
+// FCM registration tokens are long opaque strings; min(20) rejects junk
+// without pinning to an FCM-internal format.
+export const deviceTokenSchema = z.object({
+  token: z.string().min(20),
+});
+
 export const createUserSchema = z.object({
   name: z.string().trim().min(2),
   email: z.string().email(),

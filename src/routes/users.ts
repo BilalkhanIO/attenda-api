@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
-import { createUserSchema, updateUserSchema } from '../schemas';
+import { createUserSchema, updateUserSchema, deviceTokenSchema } from '../schemas';
 import { getUserCapabilities, resolveUserPermissions, can } from '../services/authorization';
 import { hashPassword, generateToken } from '../utils/auth';
 import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
@@ -67,6 +67,20 @@ router.put('/me', async (req: Request, res: Response, next: NextFunction) => {
       select: USER_SELECT,
     });
     ok(res, user);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /users/me/device-token ────────────────────────
+// Registers the caller's FCM device token so the server can send
+// presence-challenge pushes before auto-checkout (see services/pushChallenge).
+router.put('/me/device-token', validate({ body: deviceTokenSchema }), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token } = req.body as { token: string };
+    await prisma.user.update({
+      where: { id: req.user!.sub },
+      data: { fcm_token: token, fcm_token_updated_at: new Date() },
+    });
+    ok(res, { message: 'Device token updated' });
   } catch (e) { next(e); }
 });
 

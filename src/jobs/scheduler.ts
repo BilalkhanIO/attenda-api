@@ -12,6 +12,7 @@ import {
   minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow, scheduledInstant, shiftAutoCheckoutDue
 } from '../utils/shift';
 import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, updateAttendanceBreakSummary } from '../utils/attendance';
+import { isPushConfigured, sendPresenceChallenge } from '../services/pushChallenge';
 
 // Resolve the shift-end instant for overtime math: prefer the value persisted at
 // check-in (correct for overnight shifts), else recompute the window from checkOut.
@@ -328,6 +329,35 @@ export function startHeartbeatExpiryMonitor() {
           if (now < breakGraceDue) continue;
         }
 
+        // ─── FCM presence challenge (roadmap #24) ─────────
+        // Before auto-checking-out, ping the device with a high-priority FCM
+        // data message. High-priority pushes punch through Android Doze, so a
+        // phone still on office WiFi wakes and answers via its normal
+        // heartbeat — which refreshes last_heartbeat_at and drops the record
+        // out of the expired set. A challenge answered by a later heartbeat
+        // is treated as consumed, so a fresh loss of signal gets a fresh
+        // challenge instead of an instant checkout.
+        if (isPushConfigured() && record.user.fcm_token) {
+          const challengeSentAt =
+            record.challenge_sent_at && record.last_heartbeat_at! > record.challenge_sent_at
+              ? null // heartbeat arrived after the challenge — it was answered
+              : record.challenge_sent_at;
+
+          if (!challengeSentAt) {
+            const sent = await sendPresenceChallenge(record.user_id).catch(() => false);
+            if (sent) {
+              await prisma.attendanceRecord.update({
+                where: { id: record.id },
+                data: { challenge_sent_at: now },
+              }).catch(() => {});
+              continue; // grace tick: give the device a chance to respond
+            }
+          } else if (now.getTime() - challengeSentAt.getTime() < 5 * 60_000) {
+            continue; // challenge pending — wait up to 5 minutes for a reply
+          }
+          // Challenge sent 5+ minutes ago with no heartbeat → proceed with checkout.
+        }
+
         const checkOut = breakDueAt && breakDueAt > record.last_heartbeat_at!
           ? breakDueAt
           : record.last_heartbeat_at!;
@@ -356,6 +386,7 @@ export function startHeartbeatExpiryMonitor() {
             early_out_minutes: earlyMins,
             ...(score != null && { adherence_score: score }),
             last_heartbeat_at: null,
+            challenge_sent_at: null,
           },
         });
         await notifyCheckOut(record.user.org_id, record.user.name, formatTime12h(checkOut)).catch(() => {});
