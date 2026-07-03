@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { Router } from 'express';
 import { authenticate, requireOrgFeature, requirePermission } from '../middleware/auth';
 import { resolveUserPermissions } from '../services/authorization';
@@ -124,12 +123,12 @@ performanceRouter.post('/reviews/:userId', requirePermission('performance.manage
     }
     if (!m || !y || m < 1 || m > 12) throw new ValidationError('Invalid month/year format. Use MM-YYYY');
     const review = await prisma.performanceReview.findFirst({
-      where: { user_id: req.params.userId, period_month: m, period_year: y, org_id: req.user!.org_id },
+      where: { user_id: String(req.params.userId), period_month: m, period_year: y, org_id: req.user!.org_id },
     });
     if (!review) throw new NotFoundError('Review');
     if (review.submitted_at) throw new AppError('Review already submitted and locked', 400);
 
-    const attendanceScore = await calcAttendanceScore(req.params.userId, m, y);
+    const attendanceScore = await calcAttendanceScore(String(req.params.userId), m, y);
     const overallScore    = score * 20; // star 1-5 -> score 20-100
 
     const updated = await prisma.performanceReview.update({
@@ -222,7 +221,7 @@ performanceRouter.put('/goals/:id', requirePermission('performance.manage'), asy
     if (weight      !== undefined) data.weight      = weight;
     if (completion  !== undefined) data.completion  = completion;
     if (target_date !== undefined) data.target_date = target_date ? new Date(target_date) : null;
-    const goal = await prisma.performanceGoal.update({ where: { id: req.params.id }, data });
+    const goal = await prisma.performanceGoal.update({ where: { id: String(req.params.id) }, data });
     ok(res, goal);
   } catch (e) { next(e); }
 });
@@ -234,7 +233,7 @@ performanceRouter.get('/reviews/:userId/insights', requirePermission('performanc
     if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
 
     const user = await prisma.user.findUnique({
-      where: { id: req.params.userId },
+      where: { id: String(req.params.userId) },
       select: { id: true, name: true, department: true, job_title: true },
     });
     if (!user) throw new NotFoundError('User');
