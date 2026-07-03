@@ -1,4 +1,3 @@
-// @ts-nocheck
 import QRCode from 'qrcode';
 import { uploadBuffer, S3Keys, isS3Configured } from './s3';
 import prisma from '../utils/prisma';

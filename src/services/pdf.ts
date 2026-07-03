@@ -1,4 +1,3 @@
-// @ts-nocheck
 import PDFDocument from 'pdfkit';
 import { uploadBuffer, S3Keys, getSignedDownloadUrl, isS3Configured } from './s3';
 import { writeFileSync } from 'fs';

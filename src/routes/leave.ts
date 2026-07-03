@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
@@ -13,9 +12,9 @@ const router = Router();
 router.use(authenticate);
 
 const LEAVE_INCLUDE = {
-  user: { select: { id: true, name: true, avatar_url: true, department: true } },
+  user: { select: { id: true, name: true, avatar_url: true, department: true, email: true } },
   reviewer: { select: { id: true, name: true } },
-};
+} as const;
 
 // ─── GET /leave/requests/me ────────────────────────────
 router.get('/requests/me', async (req, res, next) => {
@@ -176,11 +175,11 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
 router.delete('/requests/:id', async (req, res, next) => {
   try {
     const request = await prisma.leaveRequest.findFirst({
-      where: { id: req.params.id, user_id: req.user!.sub },
+      where: { id: String(req.params.id), user_id: req.user!.sub },
     });
     if (!request) throw new NotFoundError('Leave request');
     if (request.status !== 'pending') throw new ValidationError('Only pending requests can be cancelled');
-    await prisma.leaveRequest.update({ where: { id: req.params.id }, data: { status: 'cancelled' } });
+    await prisma.leaveRequest.update({ where: { id: String(req.params.id) }, data: { status: 'cancelled' } });
     ok(res, { message: 'Leave request cancelled' });
   } catch (e) { next(e); }
 });
@@ -189,7 +188,7 @@ router.delete('/requests/:id', async (req, res, next) => {
 router.put('/requests/:id/approve', requirePermission('leave.approve'), async (req, res, next) => {
   try {
     const request = await prisma.leaveRequest.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
+      where: { id: String(req.params.id), org_id: req.user!.org_id, status: 'pending' },
     });
     if (!request) throw new NotFoundError('Leave request');
 
@@ -204,7 +203,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
 
     await prisma.$transaction(async (tx) => {
       await tx.leaveRequest.update({
-        where: { id: req.params.id },
+        where: { id: String(req.params.id) },
         data: { status: 'approved', reviewed_by: req.user!.sub, reviewed_at: new Date() },
       });
       // Deduct from leave balance
@@ -246,7 +245,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
       }
     });
 
-    const updated = await prisma.leaveRequest.findUnique({ where: { id: req.params.id }, include: LEAVE_INCLUDE });
+    const updated = await prisma.leaveRequest.findUnique({ where: { id: String(req.params.id) }, include: LEAVE_INCLUDE });
 
     // Email + WhatsApp notification
     if (updated?.user) {
@@ -284,7 +283,7 @@ router.put('/requests/:id/reject', requirePermission('leave.approve'), async (re
     if (!reason) throw new ValidationError('Rejection reason required');
 
     const request = await prisma.leaveRequest.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
+      where: { id: String(req.params.id), org_id: req.user!.org_id, status: 'pending' },
     });
     if (!request) throw new NotFoundError('Leave request');
 
@@ -298,7 +297,7 @@ router.put('/requests/:id/reject', requirePermission('leave.approve'), async (re
     }
 
     const updated = await prisma.leaveRequest.update({
-      where: { id: req.params.id },
+      where: { id: String(req.params.id) },
       data: { status: 'rejected', reviewed_by: req.user!.sub, reviewed_at: new Date(), rejection_reason: reason },
       include: LEAVE_INCLUDE,
     });
@@ -347,11 +346,11 @@ router.get('/balance/:userId', requirePermission('leave.view_team', 'leave.balan
   try {
     const year = parseInt((req.query.year as string) || String(new Date().getFullYear()));
     const targetUser = await prisma.user.findFirst({
-      where: { id: req.params.userId, org_id: req.user!.org_id },
+      where: { id: String(req.params.userId), org_id: req.user!.org_id },
     });
     if (!targetUser) throw new NotFoundError('User');
     const balances = await prisma.leaveBalance.findMany({
-      where: { user_id: req.params.userId, year },
+      where: { user_id: String(req.params.userId), year },
     });
     ok(res, balances);
   } catch (e) { next(e); }
@@ -365,7 +364,7 @@ router.put('/balance/:userId', requirePermission('leave.balance.manage'), async 
 
     const year = new Date().getFullYear();
     const balance = await prisma.leaveBalance.findFirst({
-      where: { user_id: req.params.userId, leave_type, year },
+      where: { user_id: String(req.params.userId), leave_type, year },
     });
     if (!balance) throw new NotFoundError('Leave balance');
 

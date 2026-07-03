@@ -1,4 +1,3 @@
-// @ts-nocheck
 import {
   S3Client,
   PutObjectCommand,
