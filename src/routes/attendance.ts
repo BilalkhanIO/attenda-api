@@ -1,6 +1,11 @@
 // @ts-nocheck
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { validate } from '../middleware/validate';
+import {
+  checkinSchema, checkoutSchema, breakStartSchema, breakEndSchema,
+  heartbeatSchema, ipEventSchema, lateNoticeSchema, attendanceOverrideSchema,
+} from '../schemas';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
@@ -375,7 +380,7 @@ router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next
     ok(res, session);
   } catch (e) { next(e); }
 });
-router.post('/break/start', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/break/start', validate({ body: breakStartSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { break_type = 'rest', shift_break_id } = req.body;
     const { today } = await orgTimeContext(req.user!.org_id);
@@ -429,7 +434,7 @@ router.post('/break/start', async (req: Request, res: Response, next: NextFuncti
 // wifi_connected = true when the device was on the office WiFi at the moment
 // the employee tapped "End Break". Used to populate wifi_on_at_end on the
 // break record for history and analytics.
-router.post('/break/end', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/break/end', validate({ body: breakEndSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { wifi_connected = false } = req.body as { wifi_connected?: boolean };
     const { today, timezone: tz } = await orgTimeContext(req.user!.org_id);
@@ -520,7 +525,7 @@ router.get('/late-notice/me', async (req: Request, res: Response, next: NextFunc
 // ─── POST /attendance/late-notice ─────────────────────
 // Employee submits an advance notice that they will arrive late.
 // The scheduler respects this: no manager alert until expected_time passes.
-router.post('/late-notice', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/late-notice', validate({ body: lateNoticeSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { date, expected_time, reason } = req.body;
     if (!date || !expected_time || !reason) throw new ValidationError('date, expected_time and reason required');
@@ -826,7 +831,7 @@ router.get('/leave-check', async (req: Request, res: Response, next: NextFunctio
 });
 
 // ─── POST /attendance/checkin ──────────────────────────
-router.post('/checkin', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { type = 'manual', qr_code, duration_type = 'full_day', count_away_as_break, away_shift_break_id } = req.body;
     const { org: orgInfo, timezone: orgTimezone, today } = await orgTimeContext(req.user!.org_id);
@@ -1111,7 +1116,7 @@ router.post('/checkin', async (req: Request, res: Response, next: NextFunction) 
 });
 
 // ─── POST /attendance/checkout ─────────────────────────
-router.post('/checkout', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/checkout', validate({ body: checkoutSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { timezone: orgTimezone, today } = await orgTimeContext(req.user!.org_id);
     const record = await prisma.attendanceRecord.findUnique({
@@ -1211,7 +1216,7 @@ router.post('/checkout', async (req: Request, res: Response, next: NextFunction)
 // ─── POST /attendance/heartbeat ────────────────────────
 // Called by Flutter app every ~4 min while on office WiFi.
 // Server-side expiry job checks out employees when heartbeat goes stale.
-router.post('/heartbeat', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/heartbeat', validate({ body: heartbeatSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { ip, ssid } = req.body;
     if (!ip && !ssid) throw new ValidationError('ip or ssid is required');
@@ -1250,7 +1255,7 @@ router.post('/heartbeat', async (req: Request, res: Response, next: NextFunction
 // Called by Flutter app when WiFi connect detected.
 // Accepts: event ('match'), ip (device LAN IP or CIDR), ssid (WiFi network name)
 // SSID matching is preferred — more reliable than IP for orgs without static IPs.
-router.post('/ip-event', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { event, ip, ssid, count_away_as_break, away_shift_break_id } = req.body;
     if (!event) throw new ValidationError('event is required');
@@ -1463,7 +1468,7 @@ router.post('/ip-event', async (req: Request, res: Response, next: NextFunction)
 });
 
 // ─── PUT /attendance/:id/override ─────────────────────
-router.put('/:id/override', requirePermission('attendance.override'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id/override', requirePermission('attendance.override'), validate({ body: attendanceOverrideSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { id } = req.params;
     const { check_in_at, check_out_at, reason } = req.body;

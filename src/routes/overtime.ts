@@ -1,5 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../utils/prisma';
+import { validate } from '../middleware/validate';
+import { overtimeRequestSchema, createOvertimeRuleSchema, updateOvertimeRuleSchema } from '../schemas';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, ValidationError, NotFoundError } from '../utils/response';
 import { emitOrgEvent } from '../services/notifications';
@@ -8,7 +10,7 @@ const router = Router();
 router.use(authenticate);
 
 // ─── POST /overtime/requests ──────────────────────────
-router.post('/requests', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/requests', validate({ body: overtimeRequestSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { attendance_id, reason } = req.body;
     if (!attendance_id) throw new ValidationError('attendance_id required');
@@ -153,7 +155,7 @@ router.get('/rules', requirePermission('overtime.manage'), async (req: Request, 
 });
 
 // ─── POST /overtime/rules ──────────────────────────────
-router.post('/rules', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/rules', requirePermission('overtime.manage'), validate({ body: createOvertimeRuleSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, rule_type, threshold_hours, multiplier, priority } = req.body;
     if (!name || !rule_type || !threshold_hours || !multiplier) {
@@ -177,7 +179,7 @@ router.post('/rules', requirePermission('overtime.manage'), async (req: Request,
 });
 
 // ─── PUT /overtime/rules/:id ───────────────────────────
-router.put('/rules/:id', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/rules/:id', requirePermission('overtime.manage'), validate({ body: updateOvertimeRuleSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rule = await prisma.overtimeRule.findFirst({
       where: { id: req.params.id as string, org_id: req.user!.org_id },

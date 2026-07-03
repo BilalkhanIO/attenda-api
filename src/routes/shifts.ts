@@ -3,6 +3,11 @@ import { authenticate, requireOrgFeature, requirePermission } from '../middlewar
 import { ok, created, noContent, NotFoundError, ValidationError } from '../utils/response';
 import { emitOrgEvent } from '../services/notifications';
 import prisma from '../utils/prisma';
+import { validate } from '../middleware/validate';
+import {
+  createShiftSchema, updateShiftSchema, shiftBreakSchema, updateShiftBreakSchema,
+  shiftAssignmentSchema, bulkAssignmentSchema, publishScheduleSchema, swapRequestSchema,
+} from '../schemas';
 
 const router = Router();
 router.use(authenticate);
@@ -96,7 +101,7 @@ router.get('/', requireOrgFeature('shifts'), requirePermission('shifts.view'), a
 });
 
 // ─── POST /shifts ──────────────────────────────────────
-router.post('/', requireOrgFeature('shifts'), requirePermission('shifts.manage'), async (req, res, next) => {
+router.post('/', requireOrgFeature('shifts'), requirePermission('shifts.manage'), validate({ body: createShiftSchema }), async (req, res, next) => {
   try {
     const { name, start_time, end_time, color, active_days, days_of_week, overtime_multiplier, min_rest_hours, late_tolerance_mins, early_checkout_tolerance_mins, auto_checkout, auto_checkout_buffer_mins, overtime_enabled, overtime_requires_approval, extra_time_label, is_org_wide, is_default } = req.body;
     if (!name || !start_time || !end_time) throw new ValidationError('name, start_time and end_time required');
@@ -137,7 +142,7 @@ router.post('/', requireOrgFeature('shifts'), requirePermission('shifts.manage')
 });
 
 // ─── POST /shifts/:id/breaks ───────────────────────────
-router.post('/:id/breaks', requirePermission('shifts.breaks.manage'), async (req, res, next) => {
+router.post('/:id/breaks', requirePermission('shifts.breaks.manage'), validate({ body: shiftBreakSchema }), async (req, res, next) => {
   try {
     const { name, is_paid } = req.body;
     if (!name) throw new ValidationError('name required');
@@ -152,7 +157,7 @@ router.post('/:id/breaks', requirePermission('shifts.breaks.manage'), async (req
 });
 
 // ─── PUT /shifts/:shiftId/breaks/:breakId ─────────────
-router.put('/:shiftId/breaks/:breakId', requirePermission('shifts.breaks.manage'), async (req, res, next) => {
+router.put('/:shiftId/breaks/:breakId', requirePermission('shifts.breaks.manage'), validate({ body: updateShiftBreakSchema }), async (req, res, next) => {
   try {
     const { name, is_paid } = req.body;
     const b = await prisma.shiftBreak.findFirst({
@@ -182,7 +187,7 @@ router.delete('/:shiftId/breaks/:breakId', requirePermission('shifts.breaks.mana
 });
 
 // ─── PUT /shifts/:id ───────────────────────────────────
-router.put('/:id', requirePermission('shifts.manage'), async (req, res, next) => {
+router.put('/:id', requirePermission('shifts.manage'), validate({ body: updateShiftSchema }), async (req, res, next) => {
   try {
     const id = req.params.id as string;
     const shift = await prisma.shift.findFirst({ where: { id, org_id: req.user!.org_id } });
@@ -309,7 +314,7 @@ router.get('/assignments', requirePermission('shifts.view'), async (req, res, ne
 });
 
 // ─── POST /shifts/assignments ──────────────────────────
-router.post('/assignments', requirePermission('shifts.assign'), async (req, res, next) => {
+router.post('/assignments', requirePermission('shifts.assign'), validate({ body: shiftAssignmentSchema }), async (req, res, next) => {
   try {
     const { user_id, shift_id, date } = req.body;
     if (!user_id || !shift_id || !date) throw new ValidationError('user_id, shift_id and date required');
@@ -440,7 +445,7 @@ router.get('/assignments/:id/detail', async (req, res, next) => {
 // ─── POST /shifts/assignments/bulk ────────────────────
 // Assign a shift to multiple employees across multiple dates in one call.
 // Returns created assignments, skipped conflicts, and leave/off-day warnings.
-router.post('/assignments/bulk', requirePermission('shifts.assign'), async (req, res, next) => {
+router.post('/assignments/bulk', requirePermission('shifts.assign'), validate({ body: bulkAssignmentSchema }), async (req, res, next) => {
   try {
     const { user_ids, shift_id, dates } = req.body;
     if (!Array.isArray(user_ids) || user_ids.length === 0) throw new ValidationError('user_ids array required');
@@ -526,7 +531,7 @@ router.delete('/assignments/:id', requirePermission('shifts.assign'), async (req
 });
 
 // ─── POST /shifts/schedule/publish ────────────────────
-router.post('/schedule/publish', requirePermission('shifts.assign'), async (req, res, next) => {
+router.post('/schedule/publish', requirePermission('shifts.assign'), validate({ body: publishScheduleSchema }), async (req, res, next) => {
   try {
     const { week_start } = req.body;
     const ws = week_start ? parseDateOnly(week_start, 'week_start') : startOfCurrentWeek();
@@ -632,7 +637,7 @@ router.get('/swaps', requirePermission('shifts.swaps.approve'), async (req, res,
 });
 
 // ─── POST /shifts/swaps ────────────────────────────────
-router.post('/swaps', async (req, res, next) => {
+router.post('/swaps', validate({ body: swapRequestSchema }), async (req, res, next) => {
   try {
     const { target_id, requester_assign_id, target_assign_id, reason } = req.body;
     if (!target_id || !requester_assign_id || !target_assign_id) throw new ValidationError('Missing required fields');

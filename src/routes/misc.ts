@@ -5,6 +5,8 @@ import { resolveUserPermissions } from '../services/authorization';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
+import { validate } from '../middleware/validate';
+import { orgSettingsSchema } from '../schemas';
 
 // ─── PERFORMANCE ──────────────────────────────────────
 export const performanceRouter = Router();
@@ -535,7 +537,7 @@ orgRouter.get('/settings', async (req, res, next) => {
 });
 
 // PUT /org/settings
-orgRouter.put('/settings', requirePermission('org.settings.update'), async (req, res, next) => {
+orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ body: orgSettingsSchema }), async (req, res, next) => {
   try {
     const {
       name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold, totp_required,
