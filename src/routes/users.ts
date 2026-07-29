@@ -191,9 +191,10 @@ router.get('/meta/departments', async (req: Request, res: Response, next: NextFu
 // ─── GET /users ────────────────────────────────────────
 router.get('/', requirePermission('employees.view', 'employees.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { page = '1', limit = '50', department, role, status, search } = req.query as Record<string, string>;
+    const { page = '1', limit = '50', department, role, status, search, q, sort, order } = req.query as Record<string, string>;
     const pg = Math.max(1, parseInt(page));
     const lm = Math.min(100, parseInt(limit));
+    const term = q || search; // q is the cross-endpoint contract; search kept for old clients
 
     const where: Record<string, unknown> = {
       org_id: req.user!.org_id,
@@ -202,10 +203,15 @@ router.get('/', requirePermission('employees.view', 'employees.view_team'), asyn
     if (department) where.department = department;
     if (role)       where.role       = role;
     if (status)     where.is_active  = status === 'active';
-    if (search)     where.OR         = [
-      { name: { contains: search, mode: 'insensitive' } },
-      { email: { contains: search, mode: 'insensitive' } },
+    if (term)       where.OR         = [
+      { name: { contains: term, mode: 'insensitive' } },
+      { email: { contains: term, mode: 'insensitive' } },
     ];
+
+    // Whitelisted sort fields only — never feed raw query strings to Prisma.
+    const SORTABLE = new Set(['name', 'email', 'department', 'job_title', 'joined_at', 'created_at']);
+    const sortField = SORTABLE.has(sort) ? sort : 'name';
+    const sortDir = order === 'desc' ? 'desc' as const : 'asc' as const;
 
     // Org-wide list needs employees.view; team-level viewers (managers or
     // custom roles with only employees.view_team) see their direct reports.
@@ -214,7 +220,7 @@ router.get('/', requirePermission('employees.view', 'employees.view_team'), asyn
     }
 
     const [users, total] = await Promise.all([
-      prisma.user.findMany({ where, select: USER_SELECT, skip: (pg - 1) * lm, take: lm, orderBy: { name: 'asc' } }),
+      prisma.user.findMany({ where, select: USER_SELECT, skip: (pg - 1) * lm, take: lm, orderBy: { [sortField]: sortDir } }),
       prisma.user.count({ where }),
     ]);
 

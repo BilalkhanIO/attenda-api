@@ -1,7 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import prisma from '../utils/prisma';
 import { authenticate, requirePermission } from '../middleware/auth';
-import { ok, ValidationError, NotFoundError, ForbiddenError } from '../utils/response';
+import { ok, paginated, ValidationError, NotFoundError, ForbiddenError } from '../utils/response';
 import { generateToken } from '../utils/auth';
 
 const router = Router();
@@ -69,13 +69,30 @@ router.get('/stats', canViewOrgs, async (_req: Request, res: Response, next: Nex
 
 // ── Organisations ─────────────────────────────────────────────────────────────
 
-router.get('/orgs', canViewOrgs, async (_req: Request, res: Response, next: NextFunction) => {
+router.get('/orgs', canViewOrgs, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const orgs = await prisma.organisation.findMany({
-      where: { status: { not: 'pending' }, id: { not: 'SYSTEM' } },
-      orderBy: { created_at: 'desc' },
-      include: { _count: { select: { users: { where: { deleted_at: null, is_active: true } } } } },
-    });
+    const { q, status, page, limit, sort, order } = req.query as Record<string, string>;
+    const where: Record<string, unknown> = { status: { not: 'pending' }, id: { not: 'SYSTEM' } };
+    if (status && status !== 'pending') where.status = status;
+    if (q) where.name = { contains: q, mode: 'insensitive' };
+
+    const SORTABLE = new Set(['created_at', 'name', 'status', 'subscription_status']);
+    const orderBy = { [SORTABLE.has(sort) ? sort : 'created_at']: order === 'asc' ? 'asc' as const : 'desc' as const };
+    const include = { _count: { select: { users: { where: { deleted_at: null, is_active: true } } } } } as const;
+
+    // Pagination is opt-in — plain calls keep returning the full list.
+    if (page || limit) {
+      const pg = Math.max(1, parseInt(page || '1'));
+      const lm = Math.min(100, Math.max(1, parseInt(limit || '25')));
+      const [orgs, total] = await Promise.all([
+        prisma.organisation.findMany({ where, orderBy, include, skip: (pg - 1) * lm, take: lm }),
+        prisma.organisation.count({ where }),
+      ]);
+      paginated(res, orgs.map(mapOrg), total, pg, lm);
+      return;
+    }
+
+    const orgs = await prisma.organisation.findMany({ where, orderBy, include });
     ok(res, orgs.map(mapOrg));
   } catch (e) { next(e); }
 });

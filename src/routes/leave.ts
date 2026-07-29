@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { leaveRequestSchema } from '../schemas';
-import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
+import { ok, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
 import { calculateWorkingDays } from '../utils/auth';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
@@ -47,14 +47,32 @@ router.get('/requests/team', requirePermission('leave.view_team', 'leave.approve
 // ─── GET /leave/requests ───────────────────────────────
 router.get('/requests', requirePermission('leave.view_all'), async (req, res, next) => {
   try {
-    const { status, department } = req.query as Record<string, string>;
+    const { status, department, q, page, limit, sort, order } = req.query as Record<string, string>;
     const where: Record<string, unknown> = { org_id: req.user!.org_id };
     if (status) where.status = status;
     if (department) {
       const deptUsers = await prisma.user.findMany({ where: { org_id: req.user!.org_id, department }, select: { id: true } });
       where.user_id = { in: deptUsers.map(u => u.id) };
     }
-    const requests = await prisma.leaveRequest.findMany({ where, include: LEAVE_INCLUDE, orderBy: { created_at: 'desc' } });
+    if (q) where.user = { name: { contains: q, mode: 'insensitive' } };
+
+    const SORTABLE = new Set(['created_at', 'start_date', 'end_date', 'status', 'leave_type']);
+    const orderBy = { [SORTABLE.has(sort) ? sort : 'created_at']: order === 'asc' ? 'asc' as const : 'desc' as const };
+
+    // Pagination is opt-in: without page/limit the full list is returned,
+    // matching what existing clients expect.
+    if (page || limit) {
+      const pg = Math.max(1, parseInt(page || '1'));
+      const lm = Math.min(100, Math.max(1, parseInt(limit || '25')));
+      const [requests, total] = await Promise.all([
+        prisma.leaveRequest.findMany({ where, include: LEAVE_INCLUDE, orderBy, skip: (pg - 1) * lm, take: lm }),
+        prisma.leaveRequest.count({ where }),
+      ]);
+      paginated(res, requests, total, pg, lm);
+      return;
+    }
+
+    const requests = await prisma.leaveRequest.findMany({ where, include: LEAVE_INCLUDE, orderBy });
     ok(res, requests);
   } catch (e) { next(e); }
 });
