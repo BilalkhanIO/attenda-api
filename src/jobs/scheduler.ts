@@ -1,4 +1,3 @@
-// @ts-nocheck
 import cron from 'node-cron';
 import redis from '../utils/redis';
 import { jobLogger } from '../utils/logger';
@@ -708,7 +707,7 @@ export function startTrialExpiryMonitor() {
         data: { subscription_status: 'inactive' },
       });
     } catch (err) {
-      console.error('[trial-expiry] Error:', err.message);
+      console.error('[trial-expiry] Error:', err instanceof Error ? err.message : err);
     }
   });
 }

@@ -1,4 +1,3 @@
-// @ts-nocheck
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
@@ -11,6 +10,7 @@ import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
 import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, calculateBreakTotals } from '../utils/attendance';
 import prisma from '../utils/prisma';
+import type { Shift, ShiftBreak } from '@prisma/client';
 import { recordAudit } from '../services/audit';
 import { emitOrgEvent } from '../services/notifications';
 
@@ -21,12 +21,12 @@ const RECORD_INCLUDE = {
   user:  { select: { id: true, name: true, avatar_url: true, department: true, job_title: true } },
   shift: { select: { id: true, name: true, start_time: true, end_time: true, color: true, overtime_enabled: true, overtime_requires_approval: true, extra_time_label: true } },
   break_records: { orderBy: { break_start: 'asc' } },
-};
+} as const;
 
 async function orgTimeContext(orgId: string) {
   const org = await prisma.organisation.findUnique({
     where: { id: orgId },
-    select: { timezone: true, late_threshold: true },
+    select: { timezone: true, late_threshold: true, gap_forgiveness_mins: true },
   });
   const timezone = org?.timezone ?? 'UTC';
   return { org, timezone, today: dateOnlyInTz(new Date(), timezone) };
@@ -47,8 +47,12 @@ function dayMatchesBreak(b: any, date: Date): boolean {
   return (days.length === 0 || days.includes(day)) && (dates.length === 0 || dates.includes(dateStr));
 }
 
-async function effectiveShiftForUser(userId: string, orgId: string, date: Date, at = new Date(), includeBreaks = false) {
-  const include = includeBreaks ? { breaks: { orderBy: { after_minutes: 'asc' } } } : undefined;
+// The conditional include hides `breaks` from Prisma's inferred payload, so the
+// return type is declared explicitly: `breaks` is present iff includeBreaks was true.
+type EffectiveShift = Shift & { breaks?: ShiftBreak[] };
+
+async function effectiveShiftForUser(userId: string, orgId: string, date: Date, at = new Date(), includeBreaks = false): Promise<EffectiveShift | null> {
+  const include = includeBreaks ? ({ breaks: { orderBy: { after_minutes: 'asc' } } } as const) : undefined;
   const assignment = await prisma.shiftAssignment.findFirst({
     where: { user_id: userId, date },
     include: { shift: include ? { include } : true },
@@ -205,7 +209,7 @@ router.get('/remote/sessions', requirePermission('remote.approve'), async (req: 
 router.put('/remote/sessions/:id/approve', requirePermission('remote.approve'), async (req, res, next) => {
   try {
     const session = await prisma.remoteSession.findUnique({
-      where: { id: req.params.id },
+      where: { id: String(req.params.id) },
       include: { user: true },
     });
     if (!session || session.user.org_id !== req.user!.org_id) throw new NotFoundError('Remote session');
@@ -238,7 +242,7 @@ router.put('/remote/sessions/:id/approve', requirePermission('remote.approve'), 
 // ─── PUT /attendance/remote/sessions/:id/reject ───────
 router.put('/remote/sessions/:id/reject', requirePermission('remote.approve'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const session = await prisma.remoteSession.findFirst({ where: { id: req.params.id, user: { org_id: req.user!.org_id } } });
+    const session = await prisma.remoteSession.findFirst({ where: { id: String(req.params.id), user: { org_id: req.user!.org_id } } });
     if (!session) throw new NotFoundError('Remote session');
     if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
 
@@ -368,8 +372,8 @@ router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next
     const isEmployee = req.user!.role === 'employee';
     const session = await prisma.remoteSession.findFirst({
       where: isEmployee
-        ? { id: req.params.id, user_id: req.user!.sub }
-        : { id: req.params.id, user: { org_id: req.user!.org_id } },
+        ? { id: String(req.params.id), user_id: req.user!.sub }
+        : { id: String(req.params.id), user: { org_id: req.user!.org_id } },
       include: {
         user:         { select: { id: true, name: true, department: true, avatar_url: true } },
         attendance:   { select: { date: true } },
@@ -603,7 +607,7 @@ router.get('/late-notices', requirePermission('attendance.late_notices.manage'),
 router.put('/late-notice/:id/acknowledge', requirePermission('attendance.late_notices.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const notice = await prisma.lateArrivalNotice.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id },
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
       include: { user: true },
     });
     if (!notice) throw new NotFoundError('Late arrival notice');
@@ -632,7 +636,7 @@ router.put('/late-notice/:id/acknowledge', requirePermission('attendance.late_no
 router.delete('/late-notice/:id', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const notice = await prisma.lateArrivalNotice.findFirst({
-      where: { id: req.params.id, user_id: req.user!.sub },
+      where: { id: String(req.params.id), user_id: req.user!.sub },
     });
     if (!notice) throw new NotFoundError('Late arrival notice');
     if (notice.status === 'acknowledged') throw new ValidationError('Cannot cancel an already-acknowledged notice');
@@ -1470,7 +1474,7 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
 // ─── PUT /attendance/:id/override ─────────────────────
 router.put('/:id/override', requirePermission('attendance.override'), validate({ body: attendanceOverrideSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { id } = req.params;
+    const id = String(req.params.id);
     const { check_in_at, check_out_at, reason } = req.body;
     if (!reason) throw new ValidationError('Reason is required for override');
 
@@ -1543,7 +1547,7 @@ router.get('/report/export', requirePermission('attendance.export'), async (req:
 // before Express falls through to the wildcard segment.
 router.get('/:userId', requirePermission('attendance.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { userId } = req.params;
+    const userId = String(req.params.userId);
     const { start, end } = req.query as { start?: string; end?: string };
 
     const user = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
