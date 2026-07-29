@@ -108,24 +108,41 @@ app.use(metricsMiddleware);
 // ─── API Routes ───────────────────────────────────────
 const API = '/api/v1';
 
-app.use(`${API}/auth`,        authLimiter, authRouter);
-app.use(`${API}/users`,       usersRouter);
-app.use(`${API}/attendance`,  attendanceRouter);
-app.use(`${API}/leave`,       leaveRouter);
-app.use(`${API}/shifts`,      shiftsRouter);
-app.use(`${API}/payroll`,     payrollRouter);
-app.use(`${API}/performance`, performanceRouter);
-app.use(`${API}/analytics`,   analyticsRouter);
-app.use(`${API}/org/departments`, departmentsRouter);
-app.use(`${API}/org`,         orgRouter);
-app.use(`${API}/org`,         orgRbacRouter);
-app.use(`${API}/reports`,      reportsRouter);
-app.use(`${API}/webhooks`,    webhooksRouter);
-app.use(`${API}/admin/users`, adminPlatformUsersRouter);
-app.use(`${API}/admin`,      adminRouter);
-app.use(`${API}/overtime`,       overtimeRouter);
-app.use(`${API}/notifications`, notificationsRouter);
-app.use(`${API}/public`,       publicRouter);
+// The mount table doubles as the OpenAPI generator's route source —
+// add new routers here and they appear in /api/v1/openapi.json.
+const MOUNTS: Array<[string, express.Router]> = [
+  [`${API}/auth`,            authRouter],
+  [`${API}/users`,           usersRouter],
+  [`${API}/attendance`,      attendanceRouter],
+  [`${API}/leave`,           leaveRouter],
+  [`${API}/shifts`,          shiftsRouter],
+  [`${API}/payroll`,         payrollRouter],
+  [`${API}/performance`,     performanceRouter],
+  [`${API}/analytics`,       analyticsRouter],
+  [`${API}/org/departments`, departmentsRouter],
+  [`${API}/org`,             orgRouter],
+  [`${API}/org`,             orgRbacRouter],
+  [`${API}/reports`,         reportsRouter],
+  [`${API}/webhooks`,        webhooksRouter],
+  [`${API}/admin/users`,     adminPlatformUsersRouter],
+  [`${API}/admin`,           adminRouter],
+  [`${API}/overtime`,        overtimeRouter],
+  [`${API}/notifications`,   notificationsRouter],
+  [`${API}/public`,          publicRouter],
+];
+
+app.use(`${API}/auth`, authLimiter);
+for (const [prefix, router] of MOUNTS) app.use(prefix, router);
+
+// ─── OpenAPI spec (generated once, on first request) ──
+let openApiDoc: Record<string, unknown> | null = null;
+app.get(`${API}/openapi.json`, (_req, res) => {
+  if (!openApiDoc) {
+    const { buildOpenApiDoc } = require('./services/openapi') as typeof import('./services/openapi');
+    openApiDoc = buildOpenApiDoc(MOUNTS);
+  }
+  res.json(openApiDoc);
+});
 
 // ─── 404 & Error handler ──────────────────────────────
 app.use(notFound);

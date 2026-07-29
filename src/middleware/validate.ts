@@ -28,12 +28,14 @@ function formatIssues(err: ZodError): Array<{ path: string; message: string }> {
  * Express 5 query/params objects are getter-backed; we re-assign via
  * Object.defineProperty to keep replacement reliable across versions.
  */
-export function validate(schemas: {
+export interface ValidationSchemas {
   body?: ZodType;
   query?: ZodType;
   params?: ZodType;
-}) {
-  return (req: Request, _res: Response, next: NextFunction) => {
+}
+
+export function validate(schemas: ValidationSchemas) {
+  const middleware = (req: Request, _res: Response, next: NextFunction) => {
     try {
       if (schemas.body) {
         req.body = schemas.body.parse(req.body ?? {});
@@ -56,4 +58,8 @@ export function validate(schemas: {
       next(e);
     }
   };
+  // Tag the middleware so the OpenAPI generator can find each route's
+  // schemas by walking the router stack (see services/openapi.ts).
+  (middleware as { __validationSchemas?: ValidationSchemas }).__validationSchemas = schemas;
+  return middleware;
 }
