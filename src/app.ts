@@ -7,6 +7,7 @@ import cookieParser from 'cookie-parser';
 import { randomUUID } from 'node:crypto';
 import { pinoHttp } from 'pino-http';
 import { logger, requestContext } from './utils/logger';
+import { metricsMiddleware, metricsHandler } from './utils/metrics';
 import redis from './utils/redis';
 
 import authRouter       from './routes/auth';
@@ -97,10 +98,12 @@ const authLimiter = rateLimit({
 
 app.use(globalLimiter);
 
-// ─── Health check ─────────────────────────────────────
+// ─── Health check & metrics ───────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '1.0.0' });
 });
+app.get('/metrics', metricsHandler);
+app.use(metricsMiddleware);
 
 // ─── API Routes ───────────────────────────────────────
 const API = '/api/v1';
