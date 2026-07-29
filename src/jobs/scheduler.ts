@@ -740,8 +740,18 @@ export function startDailyRemoteNudgeJob() {
   console.log('🏠 Daily remote nudge job started (08:00 UTC)');
 }
 
+// ─── Job: Monthly Leave Accrual ───────────────────────
+export function startLeaveAccrualJob() {
+  scheduledJob('startLeaveAccrualJob', '0 2 1 * *', async () => {
+    const { runMonthlyAccrual } = await import('../services/leaveAccrual');
+    await runMonthlyAccrual();
+  });
+  console.log('🌴 Leave accrual job started (1st of month, 02:00 UTC)');
+}
+
 export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
+  startLeaveAccrualJob();
   startLateArrivalDetector();
   startAbsentDetector();
   startHeartbeatExpiryMonitor();

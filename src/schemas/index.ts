@@ -274,6 +274,13 @@ export const orgSettingsSchema = z.object({
   heartbeat_grace_mins: z.coerce.number().int().min(10).max(120).optional(),
   gap_forgiveness_mins: z.coerce.number().int().min(0).max(90).optional(),
   totp_required: z.boolean().optional(),
+  leave_accrual: z.record(
+    z.string().min(1).max(40),
+    z.object({
+      days_per_year: z.coerce.number().min(0.5).max(366),
+      carry_over_max: z.coerce.number().min(0).max(366).optional(),
+    }),
+  ).nullish(),
   logo_url: z.string().max(1000).nullish(),
   address: z.string().max(2000).nullish(),
   phone: z.string().max(50).nullish(),

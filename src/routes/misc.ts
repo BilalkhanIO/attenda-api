@@ -578,6 +578,9 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
       if (mins < 10 || mins > 120) throw new ValidationError('heartbeat_grace_mins must be between 10 and 120');
       data.heartbeat_grace_mins = mins;
     }
+    if (req.body.leave_accrual !== undefined) {
+      data.leave_accrual = req.body.leave_accrual ?? undefined;
+    }
     if (req.body.gap_forgiveness_mins !== undefined) {
       const mins = parseInt(req.body.gap_forgiveness_mins);
       if (mins < 0 || mins > 90) throw new ValidationError('gap_forgiveness_mins must be between 0 and 90');
