@@ -4,7 +4,7 @@ import { ok, NotFoundError, ValidationError, AppError } from '../utils/response'
 import { startOfMonth, endOfMonth } from '../utils/auth';
 import prisma from '../utils/prisma';
 import { validate } from '../middleware/validate';
-import { payrollPeriodSchema, payrollAdjustSchema } from '../schemas';
+import { payrollPeriodSchema, payrollAdjustSchema, payrollRecallSchema } from '../schemas';
 import { recordAudit } from '../services/audit';
 
 const router = Router();
@@ -61,10 +61,23 @@ router.post('/generate', requirePermission('payroll.manage'), validate({ body: p
     const taxRate     = (org?.tax_rate     ?? 0) / 100;
     const pensionRate = (org?.pension_rate ?? 0) / 100;
 
+    // Processed records are immutable — a re-run must never silently rewrite
+    // pay that has already been finalized and payslipped. Recall first.
+    const processed = await prisma.payrollRecord.findMany({
+      where: { org_id: req.user!.org_id, period_month: m, period_year: y, status: 'processed' },
+      select: { user_id: true },
+    });
+    const processedUserIds = new Set(processed.map(r => r.user_id));
+
     const created: string[] = [];
     const incomplete: string[] = [];
+    const skippedProcessed: string[] = [];
 
     for (const user of users) {
+      if (processedUserIds.has(user.id)) {
+        skippedProcessed.push(user.name);
+        continue;
+      }
       if (Number(user.hourly_rate) === 0) {
         incomplete.push(user.name);
       }
@@ -112,7 +125,11 @@ router.post('/generate', requirePermission('payroll.manage'), validate({ body: p
       created.push(user.name);
     }
 
-    ok(res, { generated: created.length, incomplete: incomplete.length, incomplete_users: incomplete, month: m, year: y });
+    ok(res, {
+      generated: created.length, incomplete: incomplete.length, incomplete_users: incomplete,
+      skipped_processed: skippedProcessed.length, skipped_processed_users: skippedProcessed,
+      month: m, year: y,
+    });
   } catch (e) { next(e); }
 });
 
@@ -192,6 +209,40 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), validate({ body: 
       action: 'payroll.adjust', entityType: 'payroll_record', entityId: record.id,
       before: { field, value: record[field === 'adjustments' ? 'manual_adjustment' : field as 'regular_hours' | 'overtime_hours'], gross_pay: record.gross_pay, net_pay: record.net_pay },
       after: { field, value, gross_pay: updated.gross_pay, net_pay: updated.net_pay },
+      reason,
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /payroll/:id/recall ──────────────────────────
+// Controlled reopen of a processed record: status → 'recalled' so it can be
+// adjusted and re-processed. The stale payslip stops being served (payslip
+// endpoints gate on status === 'processed') and the recall is audited.
+router.post('/:id/recall', requirePermission('payroll.process'), validate({ body: payrollRecallSchema }), async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+
+    const record = await prisma.payrollRecord.findFirst({
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
+      include: RECORD_INCLUDE,
+    });
+    if (!record) throw new NotFoundError('Payroll record');
+    if (record.status !== 'processed') {
+      throw new AppError('Only processed payroll can be recalled', 400, 'NOT_PROCESSED');
+    }
+
+    const updated = await prisma.payrollRecord.update({
+      where: { id: record.id },
+      data: { status: 'recalled', adjustment_reason: reason },
+      include: RECORD_INCLUDE,
+    });
+
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'payroll.recall', entityType: 'payroll_record', entityId: record.id,
+      before: { status: 'processed', processed_at: record.processed_at, net_pay: record.net_pay },
+      after: { status: 'recalled' },
       reason,
     });
     ok(res, updated);

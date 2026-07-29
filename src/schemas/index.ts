@@ -262,6 +262,10 @@ export const payrollAdjustSchema = z.object({
   reason: z.string().min(10).max(1000),
 }).passthrough();
 
+export const payrollRecallSchema = z.object({
+  reason: z.string().min(10).max(1000),
+}).passthrough();
+
 // ─── Org settings / departments ───────────────────────
 export const orgSettingsSchema = z.object({
   name: z.string().trim().min(1).max(255).optional(),
