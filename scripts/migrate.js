@@ -183,6 +183,7 @@ async function run() {
       'prisma/migrations/20260625000000_leave_accrual/migration.sql',
       'prisma/migrations/20260626000000_late_policy/migration.sql',
       'prisma/migrations/20260627000000_org_holidays/migration.sql',
+      'prisma/migrations/20260628000000_attendance_corrections/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {

@@ -266,6 +266,18 @@ export const payrollRecallSchema = z.object({
   reason: z.string().min(10).max(1000),
 }).passthrough();
 
+// ─── Attendance corrections ───────────────────────────
+export const correctionRequestSchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
+  requested_check_in: z.string().datetime({ offset: true }).optional(),
+  requested_check_out: z.string().datetime({ offset: true }).optional(),
+  reason: z.string().trim().min(5).max(1000),
+}).passthrough();
+
+export const correctionReviewSchema = z.object({
+  note: z.string().trim().max(1000).optional(),
+}).passthrough();
+
 // ─── Holidays ─────────────────────────────────────────
 export const holidaySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),

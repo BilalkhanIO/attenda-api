@@ -50,6 +50,7 @@ model Organisation {
 
   users               User[]
   attendance_records  AttendanceRecord[]
+  attendance_corrections AttendanceCorrection[]
   leave_requests      LeaveRequest[]
   leave_balances      LeaveBalance[]
   shifts              Shift[]
@@ -114,6 +115,8 @@ model User {
   manager                 User?               @relation("UserManager", fields: [manager_id], references: [id])
   direct_reports          User[]              @relation("UserManager")
   attendance_records      AttendanceRecord[]
+  corrections_requested   AttendanceCorrection[] @relation("CorrectionUser")
+  corrections_reviewed    AttendanceCorrection[] @relation("CorrectionReviewer")
   leave_requests          LeaveRequest[]
   leave_balances          LeaveBalance[]
   reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
@@ -135,6 +138,30 @@ model User {
   platform_role_assignments PlatformUserRole[]
 
   @@map("users")
+}
+
+model AttendanceCorrection {
+  id                  String    @id @default(uuid())
+  user_id             String
+  org_id              String
+  attendance_id       String?
+  date                DateTime  @db.Date
+  requested_check_in  DateTime?
+  requested_check_out DateTime?
+  reason              String
+  status              String    @default("pending")
+  reviewed_by         String?
+  review_note         String?
+  reviewed_at         DateTime?
+  created_at          DateTime  @default(now())
+
+  user       User              @relation("CorrectionUser", fields: [user_id], references: [id])
+  reviewer   User?             @relation("CorrectionReviewer", fields: [reviewed_by], references: [id])
+  org        Organisation      @relation(fields: [org_id], references: [id])
+  attendance AttendanceRecord? @relation(fields: [attendance_id], references: [id])
+
+  @@index([org_id, status])
+  @@map("attendance_corrections")
 }
 
 model OrgHoliday {
@@ -246,6 +273,7 @@ model AttendanceRecord {
   late_notice    LateArrivalNotice? @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
   remote_session RemoteSession?
   break_records  BreakRecord[]
+  corrections   AttendanceCorrection[]
   overtime_request OvertimeRequest?
 
   @@unique([user_id, date])

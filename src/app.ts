@@ -19,6 +19,7 @@ import payrollRouter    from './routes/payroll';
 import departmentsRouter from './routes/departments';
 import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './routes/misc';
 import holidaysRouter from './routes/holidays';
+import correctionsRouter from './routes/corrections';
 import orgRbacRouter from './routes/org-rbac';
 import webhooksRouter from './routes/webhooks';
 import adminRouter         from './routes/admin';
@@ -114,6 +115,9 @@ const API = '/api/v1';
 const MOUNTS: Array<[string, express.Router]> = [
   [`${API}/auth`,            authRouter],
   [`${API}/users`,           usersRouter],
+  // corrections mounts before the attendance router so its paths are not
+  // swallowed by /attendance/:userId
+  [`${API}/attendance/corrections`, correctionsRouter],
   [`${API}/attendance`,      attendanceRouter],
   [`${API}/leave`,           leaveRouter],
   [`${API}/shifts`,          shiftsRouter],
