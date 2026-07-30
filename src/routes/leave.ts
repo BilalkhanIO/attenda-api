@@ -356,7 +356,22 @@ router.get('/balance/me', async (req, res, next) => {
     const balances = await prisma.leaveBalance.findMany({
       where: { user_id: req.user!.sub, year },
     });
-    ok(res, balances);
+
+    // Annotate rows with the org's accrual policy (additive — clients that
+    // don't know the field ignore it) so employees can see how balances grow.
+    const { parseAccrualConfig, monthlyIncrement } = await import('../services/leaveAccrual');
+    const org = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: { leave_accrual: true },
+    });
+    const accrual = parseAccrualConfig(org?.leave_accrual);
+    const annotated = balances.map(b => {
+      const policy = accrual?.[b.leave_type];
+      return policy
+        ? { ...b, accrual: { days_per_year: policy.days_per_year, monthly: monthlyIncrement(policy), carry_over_max: policy.carry_over_max ?? 0 } }
+        : b;
+    });
+    ok(res, annotated);
   } catch (e) { next(e); }
 });
 
