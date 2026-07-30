@@ -75,7 +75,7 @@ Status legend: ☐ planned · ◐ partial · ☑ done (recently shipped items no
 
 ## Tier 3 — Differentiators (quarter horizon)
 
-28. ☐ **Late/absence policy engine** (org-configurable grace/tiers/points/pattern rules, provisional auto-absent + nightly finalization, "Running late" quick actions both clients).
+28. ◐ **Late/absence policy engine** (org-configurable grace/tiers/points/pattern rules, provisional auto-absent + nightly finalization, "Running late" quick actions both clients). *Shipped: `late_policy` org config (absent_after_mins wired into the absent detector, lateness tiers → points, rolling window, alert threshold), nightly pattern scan notifying manager + HR (deduped 7d), GET /attendance/late-summary, settings exposure. Open: provisional-vs-finalized absent states, web/mobile policy UI. "Running late" quick actions already existed (late notices).*
 29. ◐ **Leave accrual engine** (accrual rates, carry-over with caps/expiry, public-holiday calendars per org; balances are static per-year rows today). *Shipped: per-type `leave_accrual` org policy (days_per_year, carry_over_max), monthly accrual job (1st, 02:00 UTC), settings API exposure. Open: expiry rules, public-holiday calendars, web settings UI.*
 30. ☐ **Payroll period locking + recall workflow** (processed payroll is mutable today via adjust).
 31. ☐ **Break compliance packs** (CA/EU rule templates, attestation-based deduction, pre-deadline reminders) — break-state must suspend auto-checkout.

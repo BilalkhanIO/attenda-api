@@ -199,11 +199,14 @@ export function startAbsentDetector() {
   scheduledJob('startAbsentDetector', '0 * * * *', async () => {
     const now = new Date();
     try {
-      const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
+      const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true, late_policy: true } });
       for (const org of orgs) {
         const tz = org.timezone || 'UTC';
         const orgToday = dateOnlyInTz(now, tz);
         const weekday = toZonedTime(now, tz).getDay();
+        // Org-configurable no-show window (late_policy.absent_after_mins), default 2h
+        const { parseLatePolicy, DEFAULT_ABSENT_AFTER_MINS } = await import('../services/latePolicy');
+        const absentAfterMins = parseLatePolicy(org.late_policy)?.absent_after_mins ?? DEFAULT_ABSENT_AFTER_MINS;
 
         const employees = await prisma.user.findMany({
           where: { org_id: org.id, is_active: true, deleted_at: null },
@@ -234,7 +237,7 @@ export function startAbsentDetector() {
           let diffMins = nowMins - shiftStartMins;
           if (diffMins < -720) diffMins += 1440;
 
-          if (diffMins < 120 || diffMins >= 720) continue;
+          if (diffMins < absentAfterMins || diffMins >= 720) continue;
 
           const record = recordMap.get(user.id);
           if (!record || !record.check_in_at) {
@@ -740,6 +743,17 @@ export function startDailyRemoteNudgeJob() {
 }
 
 // ─── Job: Monthly Leave Accrual ───────────────────────
+// ─── Job: Late Pattern Scan ───────────────────────────
+// Nightly: rolling lateness points per user (org late_policy tiers);
+// alerts manager + HR when someone crosses the org's threshold.
+export function startLatePatternScanJob() {
+  scheduledJob('startLatePatternScanJob', '30 2 * * *', async () => {
+    const { runLatePatternScan } = await import('../services/latePolicy');
+    await runLatePatternScan();
+  });
+  console.log('⏰ Late pattern scan job started (daily, 02:30 UTC)');
+}
+
 export function startLeaveAccrualJob() {
   scheduledJob('startLeaveAccrualJob', '0 2 1 * *', async () => {
     const { runMonthlyAccrual } = await import('../services/leaveAccrual');
@@ -751,6 +765,7 @@ export function startLeaveAccrualJob() {
 export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
   startLeaveAccrualJob();
+  startLatePatternScanJob();
   startLateArrivalDetector();
   startAbsentDetector();
   startHeartbeatExpiryMonitor();

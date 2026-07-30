@@ -161,6 +161,42 @@ router.get('/today', requirePermission('attendance.view_team'), async (req: Requ
   } catch (e) { next(e); }
 });
 
+// ─── GET /attendance/late-summary ──────────────────────
+// Rolling lateness totals + policy points per user (org late_policy tiers).
+// Team-level viewers see their direct reports; org viewers see everyone.
+router.get('/late-summary', requirePermission('attendance.view_team'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { parseLatePolicy, lateSummaryForOrg, DEFAULT_POINTS_WINDOW_DAYS } = await import('../services/latePolicy');
+    const org = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: { late_policy: true },
+    });
+    const policy = parseLatePolicy(org?.late_policy);
+
+    const rawDays = parseInt(String(req.query.days ?? ''));
+    const windowDays = Number.isFinite(rawDays) && rawDays >= 7 && rawDays <= 365
+      ? rawDays
+      : policy?.points_window_days ?? DEFAULT_POINTS_WINDOW_DAYS;
+
+    let userIds: string[] | undefined;
+    if (!req.permissions?.has('employees.view')) {
+      const team = await prisma.user.findMany({
+        where: { manager_id: req.user!.sub, is_active: true },
+        select: { id: true },
+      });
+      userIds = team.map(u => u.id);
+    }
+
+    const summary = await lateSummaryForOrg(req.user!.org_id, policy, windowDays, userIds);
+    ok(res, {
+      window_days: windowDays,
+      policy_configured: !!policy?.tiers?.length,
+      alert_threshold_points: policy?.alert_threshold_points ?? null,
+      users: summary,
+    });
+  } catch (e) { next(e); }
+});
+
 // ─── GET /attendance/me ────────────────────────────────
 router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {

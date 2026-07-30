@@ -285,6 +285,15 @@ export const orgSettingsSchema = z.object({
       carry_over_max: z.coerce.number().min(0).max(366).optional(),
     }),
   ).nullish(),
+  late_policy: z.object({
+    absent_after_mins: z.coerce.number().int().min(30).max(720).optional(),
+    tiers: z.array(z.object({
+      after_mins: z.coerce.number().int().min(1).max(720),
+      points: z.coerce.number().min(0.5).max(100),
+    })).max(10).optional(),
+    points_window_days: z.coerce.number().int().min(7).max(365).optional(),
+    alert_threshold_points: z.coerce.number().min(0.5).max(1000).optional(),
+  }).nullish(),
   logo_url: z.string().max(1000).nullish(),
   address: z.string().max(2000).nullish(),
   phone: z.string().max(50).nullish(),

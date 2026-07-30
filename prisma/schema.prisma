@@ -27,6 +27,7 @@ model Organisation {
   heartbeat_grace_mins Int    @default(20)
   gap_forgiveness_mins Int    @default(15)
   leave_accrual      Json?
+  late_policy        Json?
   plan               String   @db.VarChar(50) @default("trial")
   status             String   @db.VarChar(20) @default("active")
   subscription_status String  @db.VarChar(30) @default("active")

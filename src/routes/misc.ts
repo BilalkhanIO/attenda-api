@@ -4,6 +4,7 @@ import { resolveUserPermissions } from '../services/authorization';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
+import { Prisma } from '@prisma/client';
 import { validate } from '../middleware/validate';
 import { orgSettingsSchema } from '../schemas';
 
@@ -578,8 +579,12 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
       if (mins < 10 || mins > 120) throw new ValidationError('heartbeat_grace_mins must be between 10 and 120');
       data.heartbeat_grace_mins = mins;
     }
+    // JSON policy columns: explicit null clears the policy (DbNull), a value replaces it.
     if (req.body.leave_accrual !== undefined) {
-      data.leave_accrual = req.body.leave_accrual ?? undefined;
+      data.leave_accrual = req.body.leave_accrual === null ? Prisma.DbNull : req.body.leave_accrual;
+    }
+    if (req.body.late_policy !== undefined) {
+      data.late_policy = req.body.late_policy === null ? Prisma.DbNull : req.body.late_policy;
     }
     if (req.body.gap_forgiveness_mins !== undefined) {
       const mins = parseInt(req.body.gap_forgiveness_mins);

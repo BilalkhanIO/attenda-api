@@ -181,6 +181,7 @@ async function run() {
       'prisma/migrations/20260623000000_audit_logs/migration.sql',
       'prisma/migrations/20260624000000_fcm_presence_challenge/migration.sql',
       'prisma/migrations/20260625000000_leave_accrual/migration.sql',
+      'prisma/migrations/20260626000000_late_policy/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {
