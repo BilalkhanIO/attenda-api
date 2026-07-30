@@ -266,6 +266,13 @@ export const payrollRecallSchema = z.object({
   reason: z.string().min(10).max(1000),
 }).passthrough();
 
+// ─── Holidays ─────────────────────────────────────────
+export const holidaySchema = z.object({
+  date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
+  name: z.string().trim().min(1).max(120),
+  recurring: z.coerce.boolean().optional(),
+}).passthrough();
+
 // ─── Org settings / departments ───────────────────────
 export const orgSettingsSchema = z.object({
   name: z.string().trim().min(1).max(255).optional(),

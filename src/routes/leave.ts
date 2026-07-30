@@ -3,7 +3,6 @@ import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { leaveRequestSchema } from '../schemas';
 import { ok, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
-import { calculateWorkingDays } from '../utils/auth';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
 import { emitOrgEvent } from '../services/notifications';
@@ -115,9 +114,11 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
       }
     }
 
+    // Working days exclude weekends AND the org's public holidays.
+    const { workingDaysForOrg } = await import('../services/holidays');
     const working_days = hasTimeWindow
       ? Math.max(0.1, Math.round((((leave_end_time.split(':').map(Number)[0] * 60 + leave_end_time.split(':').map(Number)[1]) - (leave_start_time.split(':').map(Number)[0] * 60 + leave_start_time.split(':').map(Number)[1])) / (8 * 60)) * 100) / 100)
-      : is_half_day ? 0.5 : calculateWorkingDays(start, end);
+      : is_half_day ? 0.5 : await workingDaysForOrg(req.user!.org_id, start, end);
 
     // Check leave balance (skip for unpaid leave)
     if (leave_type !== 'unpaid') {

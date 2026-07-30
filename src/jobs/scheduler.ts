@@ -208,6 +208,10 @@ export function startAbsentDetector() {
         const { parseLatePolicy, DEFAULT_ABSENT_AFTER_MINS } = await import('../services/latePolicy');
         const absentAfterMins = parseLatePolicy(org.late_policy)?.absent_after_mins ?? DEFAULT_ABSENT_AFTER_MINS;
 
+        // Public holidays are not workdays — never mark anyone absent on them.
+        const { isOrgHoliday } = await import('../services/holidays');
+        if (await isOrgHoliday(org.id, orgToday)) continue;
+
         const employees = await prisma.user.findMany({
           where: { org_id: org.id, is_active: true, deleted_at: null },
           include: { manager: true },

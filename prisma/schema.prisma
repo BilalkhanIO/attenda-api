@@ -63,6 +63,7 @@ model Organisation {
   org_roles             OrgRole[]
   user_permission_grants UserPermissionGrant[]
   departments           Department[]
+  holidays              OrgHoliday[]
 
   @@map("organisations")
 }
@@ -134,6 +135,20 @@ model User {
   platform_role_assignments PlatformUserRole[]
 
   @@map("users")
+}
+
+model OrgHoliday {
+  id         String   @id @default(uuid())
+  org_id     String
+  date       DateTime @db.Date
+  name       String   @db.VarChar(120)
+  recurring  Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  org Organisation @relation(fields: [org_id], references: [id])
+
+  @@unique([org_id, date])
+  @@map("org_holidays")
 }
 
 model Department {
