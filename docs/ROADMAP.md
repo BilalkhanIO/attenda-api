@@ -42,8 +42,8 @@ Status legend: ☐ planned · ◐ partial · ☑ done (recently shipped items no
 5. ☑ **Fix the SSE stream**: reconnect with capped backoff, auth via header (`@microsoft/fetch-event-source`) instead of `?token=` in the URL (leaks to logs), re-subscribe on token refresh, heartbeat timeout.
 6. ☑ **TanStack Query bootstrap** (already in package.json, unused) + migrate Dashboard & Leave as templates (optimistic approve/reject).
 7. ☑ **Refresh-interceptor mutex** (concurrent 401s race today) + cookie hardening (SameSite=Strict refresh token).
-8. ◐ **Burn down 55 react-hooks/compiler lint errors** (prereq for React Compiler; many die with #6).
-9. ☐ **Vitest bootstrap** + first units (utils, zod schemas, navItemVisible, proxy decision logic).
+8. ☑ **Burn down 55 react-hooks/compiler lint errors** (prereq for React Compiler; many die with #6).
+9. ☑ **Vitest bootstrap** + first units (utils, zod schemas, navItemVisible, proxy decision logic).
 
 ### Mobile
 10. ☑ **hive → hive_ce** (unmaintained storage under the offline queue).
@@ -56,21 +56,21 @@ Status legend: ☐ planned · ◐ partial · ☑ done (recently shipped items no
 13. ◐ **Cron → BullMQ repeatable jobs** with idempotent handlers (in-process cron double-fires at 2+ instances; SSE fan-out needs Redis pub/sub at the same point). *Interim shipped: every job runs through `scheduledJob()` Redis tick-locks, so multi-instance double-fires are already prevented; BullMQ + Redis pub/sub for SSE remain open.*
 14. ☑ **Refresh-token rotation + revocation family** (tokens are reusable for 30 days today); device/session list endpoint.
 15. ☑ **Audit trail for pay-affecting mutations** (payroll adjust/process, leave balance edits, attendance overrides — append-only table; overrides partially covered today).
-16. ◐ **@ts-nocheck burn-down** (attendance.ts first) + OpenAPI generation from zod schemas (replaces hand-maintained API docs). *Burn-down complete — zero `@ts-nocheck` in `src/`, enforced by CI; OpenAPI generation still open.*
+16. ☑ **@ts-nocheck burn-down** (attendance.ts first) + OpenAPI generation from zod schemas (replaces hand-maintained API docs). *Burn-down complete — zero `@ts-nocheck` in `src/`, enforced by CI; OpenAPI generation still open.*
 17. ☐ **Sentry + minimal metrics** (prom-client), Prisma slow-query logging.
 
 ### Web
 18. ◐ **Finish Query migration** (overtime/remote/swaps/attendance/employees/notifications); filters into URL params.
-19. ☐ **Server-side pagination/sort/search** on employees, attendance, leave, admin orgs (DataTable props exist; small API contract addition: `sort`, `q`, `{items,total}`).
+19. ◐ **Server-side pagination/sort/search** on employees, attendance, leave, admin orgs (DataTable props exist; small API contract addition: `sort`, `q`, `{items,total}`). *API half shipped (users / leave requests / admin orgs: whitelisted sort, q search, opt-in page/limit); web DataTable wiring open.*
 20. ☑ **Unified Approvals inbox** — one queue for leave/overtime/remote/swaps/late-notices with keyboard nav + mobile card layout. Flagship UX change.
-21. ◐ **A11y retrofit** of ui/index.tsx (Radix internals for Modal/Dropdown/Menu/Tabs, aria sweep, contrast audit).
+21. ☑ **A11y retrofit** of ui/index.tsx (Radix internals for Modal/Dropdown/Menu/Tabs, aria sweep, contrast audit).
 22. ◐ **CSP (report-only → enforce) via proxy.ts** + security headers; dependency audit in CI.
 23. ☐ **Playwright E2E** (6 money paths) + `reactCompiler: true` once lint is clean.
 
 ### Mobile
 24. ◐ **FCM wiring** (needs Firebase project credentials from owner) → device-token endpoint → **presence-challenge before auto-checkout** (server pings through Doze; unanswered challenge ⇒ checkout). Completes the screen-off story. *Server half shipped (device-token endpoint, challenge send via lazy firebase-admin behind `FIREBASE_SERVICE_ACCOUNT`); mobile half blocked on `google-services.json` from owner.*
 25. ☐ **Repository + typed models** (home/attendance/leave), Result returns, cache consolidation.
-26. ◐ **home_screen.dart decomposition** (2,600 lines → section widgets + view-models).
+26. ☑ **home_screen.dart decomposition** (2,600 lines → section widgets + view-models). *Shipped: 2,774 → 1,926 lines, 8 widget files under lib/screens/home/widgets/, CI-verified.*
 27. ☐ **Upgrade train**: Flutter 3.38 + go_router 17 + network_info_plus 8 + permission_handler 12 (one PR, behind CI).
 
 ## Tier 3 — Differentiators (quarter horizon)
