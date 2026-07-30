@@ -93,6 +93,15 @@ typography, whitespace as the primary structure. Concretely:
 - Every screen keeps behavior identical: this is a reskin + dead-style purge,
   validated by `flutter analyze` + the 43 widget tests + CI.
 
+## Delivery status (2026-07-31)
+Tier A shipped end-to-end and CI-verified on all three repos: A1 holidays
+(API f46a736 + web HolidaysCard c8e930e + mobile banner 46b6642), A2
+corrections (API ae9eb48 + web approvals tab f180781 + mobile sheet 7aa839b
++ hub 626d04a), A3 who's-out (API a76e05c + web widget 5b853ae + mobile
+card 46b6642). Accrual visibility: API 483b6be + mobile 1dc0121. Mobile
+minimal-design restyle: 10 commits (b93c0da…12a7582), all screens, zero
+glass remnants. Widget tests: af09b1d. Tier B remains the next cycle's menu.
+
 ## Execution order (this cycle)
 1. Docs (this file) → commit.
 2. A1 holidays: schema + API + engine wiring + tests → commit(s).
