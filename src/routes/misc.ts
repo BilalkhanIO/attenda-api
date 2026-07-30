@@ -597,6 +597,48 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
 });
 
 // GET /org/audit-logs — append-only trail of pay-affecting mutations
+// ─── GET /org/whos-out ─────────────────────────────────
+// Who's away for a date range (default: today): approved leave, remote
+// sessions and public holidays in one read model. Open to all org members —
+// it powers the team calendar on both clients.
+orgRouter.get('/whos-out', async (req, res, next) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const fromStr = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.from ?? '')) ? String(req.query.from) : today;
+    const toStr = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to ?? '')) ? String(req.query.to) : fromStr;
+    const from = new Date(`${fromStr}T00:00:00.000Z`);
+    const to = new Date(`${toStr}T00:00:00.000Z`);
+    if (to < from) throw new ValidationError('to must be on or after from');
+    if ((to.getTime() - from.getTime()) / 86_400_000 > 62) throw new ValidationError('Range cannot exceed 62 days');
+
+    const USER_SEL = { select: { id: true, name: true, avatar_url: true, department: true } };
+    const [leave, remote, holidaySet] = await Promise.all([
+      prisma.leaveRequest.findMany({
+        where: { org_id: req.user!.org_id, status: 'approved', start_date: { lte: to }, end_date: { gte: from } },
+        select: { id: true, leave_type: true, start_date: true, end_date: true, is_half_day: true, half_day_period: true, user: USER_SEL },
+        orderBy: { start_date: 'asc' },
+      }),
+      prisma.remoteSession.findMany({
+        where: {
+          status: 'approved',
+          user: { org_id: req.user!.org_id },
+          attendance: { date: { gte: from, lte: to } },
+        },
+        select: { id: true, user: USER_SEL, attendance: { select: { date: true } } },
+      }),
+      import('../services/holidays').then(m => m.holidaySetForRange(req.user!.org_id, from, to)),
+    ]);
+
+    ok(res, {
+      from: fromStr,
+      to: toStr,
+      on_leave: leave,
+      remote: remote.map(r => ({ id: r.id, user: r.user, date: r.attendance?.date ?? null })),
+      holidays: [...holidaySet].sort(),
+    });
+  } catch (e) { next(e); }
+});
+
 orgRouter.get('/audit-logs', requirePermission('org.settings.update'), async (req, res, next) => {
   try {
     const page  = Math.max(1, parseInt(String(req.query.page  ?? '1')));
