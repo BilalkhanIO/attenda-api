@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { authenticate, requirePermission, requireOrgFeature } from '../middleware/auth';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfMonth, endOfMonth } from '../utils/auth';
-import { recalcPayrollTotals } from '../utils/payroll';
+import { recalcPayrollTotals, computePeriodPayroll } from '../utils/payroll';
 import prisma from '../utils/prisma';
 import { validate } from '../middleware/validate';
 import { payrollPeriodSchema, payrollAdjustSchema, payrollRecallSchema } from '../schemas';
@@ -59,16 +59,17 @@ router.post('/generate', requirePermission('payroll.manage'), validate({ body: p
       prisma.user.findMany({ where: { org_id: req.user!.org_id, is_active: true, deleted_at: null } }),
       prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { tax_rate: true, pension_rate: true } }),
     ]);
-    const taxRate     = (org?.tax_rate     ?? 0) / 100;
-    const pensionRate = (org?.pension_rate ?? 0) / 100;
 
-    // Processed records are immutable — a re-run must never silently rewrite
-    // pay that has already been finalized and payslipped. Recall first.
-    const processed = await prisma.payrollRecord.findMany({
-      where: { org_id: req.user!.org_id, period_month: m, period_year: y, status: 'processed' },
-      select: { user_id: true },
+    // Existing records for the period: processed ones are immutable (a re-run
+    // must never silently rewrite finalized pay — recall first), and
+    // manual_adjustment MUST survive regeneration or reimbursements already
+    // applied to the record silently vanish from gross/net.
+    const existingRecords = await prisma.payrollRecord.findMany({
+      where: { org_id: req.user!.org_id, period_month: m, period_year: y },
+      select: { user_id: true, status: true, manual_adjustment: true },
     });
-    const processedUserIds = new Set(processed.map(r => r.user_id));
+    const processedUserIds = new Set(existingRecords.filter(r => r.status === 'processed').map(r => r.user_id));
+    const manualAdjByUser  = new Map(existingRecords.map(r => [r.user_id, Number(r.manual_adjustment) || 0]));
 
     const created: string[] = [];
     const incomplete: string[] = [];
@@ -83,14 +84,12 @@ router.post('/generate', requirePermission('payroll.manage'), validate({ body: p
         incomplete.push(user.name);
       }
 
-      // Get attendance records for the month
+      // Attendance for the month, with each record's shift so overtime is
+      // paid at that shift's overtime_multiplier (fallback 1.5)
       const attendance = await prisma.attendanceRecord.findMany({
         where: { user_id: user.id, date: { gte: start, lte: end } },
+        include: { shift: { select: { overtime_multiplier: true } } },
       });
-
-      // Prefer net_hours_worked (gross minus unpaid breaks) — fall back to hours_worked for old records
-      const regularHours  = attendance.reduce((s: number, r: typeof attendance[0]) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
-      const overtimeHours = attendance.reduce((s: number, r: typeof attendance[0]) => s + Number(r.overtime_hours), 0);
 
       // Get unpaid leave days
       const unpaidLeave = await prisma.leaveRequest.findMany({
@@ -100,28 +99,27 @@ router.post('/generate', requirePermission('payroll.manage'), validate({ body: p
           start_date: { lte: end }, end_date: { gte: start },
         },
       });
-      const unpaidDays  = unpaidLeave.reduce((s: number, l: typeof unpaidLeave[0]) => s + l.working_days, 0);
-      const hourlyRate  = Number(user.hourly_rate);
-      const dailyRate   = (hourlyRate * 8);
-      const basePay     = regularHours * hourlyRate;
-      const overtimePay = overtimeHours * hourlyRate * 1.5;
-      const deduction   = unpaidDays * dailyRate;
-      const grossPay      = Math.max(0, basePay + overtimePay - deduction);
-      const taxDeduction  = grossPay * taxRate;
-      const pensionDeduct = grossPay * pensionRate;
-      const netPay        = Math.max(0, grossPay - taxDeduction - pensionDeduct);
+      const unpaidDays = unpaidLeave.reduce((s: number, l: typeof unpaidLeave[0]) => s + l.working_days, 0);
 
+      const totals = computePeriodPayroll({
+        attendance,
+        unpaid_leave_days: unpaidDays,
+        hourly_rate: Number(user.hourly_rate),
+        manual_adjustment: manualAdjByUser.get(user.id) ?? 0,
+      }, Number(org?.tax_rate) || 0, Number(org?.pension_rate) || 0);
+
+      const fields = {
+        regular_hours: totals.regular_hours, overtime_hours: totals.overtime_hours,
+        hourly_rate: Number(user.hourly_rate), base_pay: totals.base_pay,
+        overtime_pay: totals.overtime_pay, unpaid_deduction: totals.unpaid_deduction,
+        gross_pay: totals.gross_pay, tax_deduction: totals.tax_deduction,
+        pension_deduction: totals.pension_deduction, net_pay: totals.net_pay,
+        is_incomplete: Number(user.hourly_rate) === 0,
+      };
       await prisma.payrollRecord.upsert({
         where: { user_id_period_month_period_year: { user_id: user.id, period_month: m, period_year: y } },
-        update: { regular_hours: regularHours, overtime_hours: overtimeHours, hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay, unpaid_deduction: deduction, gross_pay: grossPay, tax_deduction: taxDeduction, pension_deduction: pensionDeduct, net_pay: netPay, is_incomplete: Number(user.hourly_rate) === 0 },
-        create: {
-          user_id: user.id, org_id: req.user!.org_id, period_month: m, period_year: y,
-          regular_hours: regularHours, overtime_hours: overtimeHours,
-          hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay,
-          unpaid_deduction: deduction, gross_pay: grossPay,
-          tax_deduction: taxDeduction, pension_deduction: pensionDeduct, net_pay: netPay,
-          is_incomplete: Number(user.hourly_rate) === 0,
-        },
+        update: fields,
+        create: { user_id: user.id, org_id: req.user!.org_id, period_month: m, period_year: y, ...fields },
       });
       created.push(user.name);
     }

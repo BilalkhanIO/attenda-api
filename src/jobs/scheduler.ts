@@ -564,25 +564,49 @@ export function startPayrollAutoGenerate() {
         const end = endOfMonth(year, month);
 
         const users = await prisma.user.findMany({ where: { org_id: org.id, is_active: true, deleted_at: null } });
-        const taxRate = (org.tax_rate || 0) / 100;
-        const pensionRate = (org.pension_rate || 0) / 100;
+
+        // Same shared computation as POST /payroll/generate — unpaid-leave
+        // deduction, per-shift overtime multiplier and manual_adjustment
+        // preservation must never drift between the route and this cron.
+        const { computePeriodPayroll } = await import('../utils/payroll');
 
         for (const user of users) {
-          const attendance = await prisma.attendanceRecord.findMany({ where: { user_id: user.id, date: { gte: start, lte: end } } });
-          const regHours = attendance.reduce((s, r) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
-          const otHours = attendance.reduce((s, r) => s + Number(r.overtime_hours || 0), 0);
-          const rate = Number(user.hourly_rate);
-          const base = regHours * rate;
-          const otPay = otHours * rate * 1.5;
-          const gross = base + otPay;
-          const tax = gross * taxRate;
-          const pension = gross * pensionRate;
-          const net = gross - tax - pension;
+          const attendance = await prisma.attendanceRecord.findMany({
+            where: { user_id: user.id, date: { gte: start, lte: end } },
+            include: { shift: { select: { overtime_multiplier: true } } },
+          });
+          const unpaidLeave = await prisma.leaveRequest.findMany({
+            where: {
+              user_id: user.id, status: 'approved', leave_type: 'unpaid',
+              start_date: { lte: end }, end_date: { gte: start },
+            },
+            select: { working_days: true },
+          });
+          const unpaidDays = unpaidLeave.reduce((s, l) => s + l.working_days, 0);
+          const existing = await prisma.payrollRecord.findFirst({
+            where: { user_id: user.id, period_month: month, period_year: year },
+            select: { manual_adjustment: true },
+          });
 
+          const rate = Number(user.hourly_rate);
+          const totals = computePeriodPayroll({
+            attendance,
+            unpaid_leave_days: unpaidDays,
+            hourly_rate: rate,
+            manual_adjustment: Number(existing?.manual_adjustment) || 0,
+          }, Number(org.tax_rate) || 0, Number(org.pension_rate) || 0);
+
+          const fields = {
+            regular_hours: totals.regular_hours, overtime_hours: totals.overtime_hours,
+            hourly_rate: rate, base_pay: totals.base_pay, overtime_pay: totals.overtime_pay,
+            unpaid_deduction: totals.unpaid_deduction, gross_pay: totals.gross_pay,
+            tax_deduction: totals.tax_deduction, pension_deduction: totals.pension_deduction,
+            net_pay: totals.net_pay, is_incomplete: rate === 0,
+          };
           await prisma.payrollRecord.upsert({
             where: { user_id_period_month_period_year: { user_id: user.id, period_month: month, period_year: year } },
-            update: { regular_hours: regHours, overtime_hours: otHours, hourly_rate: rate, base_pay: base, overtime_pay: otPay, gross_pay: gross, tax_deduction: tax, pension_deduction: pension, net_pay: net, is_incomplete: rate === 0 },
-            create: { user_id: user.id, org_id: org.id, period_month: month, period_year: year, regular_hours: regHours, overtime_hours: otHours, hourly_rate: rate, base_pay: base, overtime_pay: otPay, gross_pay: gross, tax_deduction: tax, pension_deduction: pension, net_pay: net, is_incomplete: rate === 0 },
+            update: fields,
+            create: { user_id: user.id, org_id: org.id, period_month: month, period_year: year, ...fields },
           });
         }
       }
