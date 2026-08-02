@@ -69,6 +69,8 @@ model Organisation {
   outbound_webhooks     OrgWebhook[]
   employee_documents    EmployeeDocument[]
   announcements         Announcement[]
+  onboarding_templates  OnboardingTemplate[]
+  onboarding_tasks      OnboardingTask[]
 
   @@map("organisations")
 }
@@ -127,6 +129,9 @@ model User {
   documents_uploaded      EmployeeDocument[]     @relation("DocumentUploader")
   announcements_authored  Announcement[]         @relation("AnnouncementAuthor")
   announcement_receipts   AnnouncementReceipt[]
+  onboarding_templates_created OnboardingTemplate[] @relation("OnboardingTemplateCreator")
+  onboarding_tasks             OnboardingTask[]     @relation("OnboardingHire")
+  onboarding_tasks_assigned    OnboardingTask[]     @relation("OnboardingAssignee")
   leave_requests          LeaveRequest[]
   leave_balances          LeaveBalance[]
   reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
@@ -757,6 +762,67 @@ model Announcement {
 
   @@index([org_id, published_at])
   @@map("announcements")
+}
+
+// Onboarding checklists: a template holds ordered items; assigning it to a
+// hire materializes each item as an OnboardingTask (denormalized title/desc
+// so later template edits never rewrite in-flight checklists). Items owned
+// by 'manager' resolve to the hire's manager at assignment time, falling
+// back to the hire when they have no manager.
+model OnboardingTemplate {
+  id         String    @id @default(uuid())
+  org_id     String
+  name       String    @db.VarChar(120)
+  is_default Boolean   @default(false) // auto-assigned to every new user
+  created_by String
+  created_at DateTime  @default(now())
+  deleted_at DateTime?
+
+  org     Organisation             @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  creator User                     @relation("OnboardingTemplateCreator", fields: [created_by], references: [id])
+  items   OnboardingTemplateItem[]
+  tasks   OnboardingTask[]
+
+  @@index([org_id])
+  @@map("onboarding_templates")
+}
+
+model OnboardingTemplateItem {
+  id            String  @id @default(uuid())
+  template_id   String
+  title         String  @db.VarChar(200)
+  description   String?
+  due_days      Int?    // days after assignment the item is due
+  sort_order    Int     @default(0)
+  assignee_role String  @default("employee") @db.VarChar(20) // employee | manager
+
+  template OnboardingTemplate @relation(fields: [template_id], references: [id], onDelete: Cascade)
+
+  @@map("onboarding_template_items")
+}
+
+model OnboardingTask {
+  id               String    @id @default(uuid())
+  org_id           String
+  user_id          String // the new hire
+  item_title       String    @db.VarChar(200)
+  item_description String?
+  assignee_id      String // resolved at assignment: the hire or their manager
+  due_date         DateTime? @db.Date
+  status           String    @default("pending") @db.VarChar(20) // pending | done | skipped
+  completed_at     DateTime?
+  completed_by     String?
+  template_id      String?
+  created_at       DateTime  @default(now())
+
+  org      Organisation        @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user     User                @relation("OnboardingHire", fields: [user_id], references: [id], onDelete: Cascade)
+  assignee User                @relation("OnboardingAssignee", fields: [assignee_id], references: [id])
+  template OnboardingTemplate? @relation(fields: [template_id], references: [id], onDelete: SetNull)
+
+  @@index([org_id, user_id])
+  @@index([assignee_id, status])
+  @@map("onboarding_tasks")
 }
 
 // Read receipts: one row per (announcement, reader), upserted idempotently.

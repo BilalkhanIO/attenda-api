@@ -188,6 +188,7 @@ async function run() {
       'prisma/migrations/20260630000000_org_webhooks/migration.sql',
       'prisma/migrations/20260701000000_employee_documents/migration.sql',
       'prisma/migrations/20260702000000_announcements/migration.sql',
+      'prisma/migrations/20260703000000_onboarding/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {

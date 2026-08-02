@@ -88,6 +88,9 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   // Documents
   { key: 'documents.view_team', module: 'documents', description: 'View team member documents' },
   { key: 'documents.manage', module: 'documents', description: 'Upload and manage employee documents' },
+  // Onboarding
+  { key: 'onboarding.manage', module: 'onboarding', description: 'Manage onboarding templates and assignments' },
+  { key: 'onboarding.view_team', module: 'onboarding', description: 'View team onboarding progress' },
   // Platform (cross-tenant)
   { key: 'platform.orgs.view', module: 'platform', description: 'View organisations' },
   { key: 'platform.orgs.manage', module: 'platform', description: 'Manage organisation subscriptions' },
