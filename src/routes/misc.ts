@@ -648,10 +648,31 @@ analyticsRouter.post('/chat', async (req, res, next) => {
 export const orgRouter = Router();
 orgRouter.use(authenticate);
 
+// Explicit safe column list for org settings responses. NEVER add:
+// - wa_access_token (WhatsApp Cloud API bearer token — GET /org/whatsapp
+//   returns it redacted; returning it here undoes that)
+// - admin_notes / features_override / billing_email / contact_* /
+//   company_size (platform-admin internal columns)
+// - wa_* config (managed via the dedicated /org/whatsapp endpoints)
+// - office_ips / office_ssids (managed via the gated office-network endpoints)
+const ORG_SETTINGS_SELECT = {
+  id: true, name: true, logo_url: true, timezone: true, currency: true,
+  payroll_day: true, tax_rate: true, pension_rate: true, late_threshold: true,
+  heartbeat_grace_mins: true, gap_forgiveness_mins: true,
+  leave_accrual: true, late_policy: true,
+  plan: true, status: true, subscription_status: true,
+  trial_started_at: true, trial_ends_at: true, seats_limit: true,
+  totp_required: true, address: true, phone: true, website: true,
+  industry: true, registration_number: true, created_at: true,
+} as const;
+
 // GET /org/settings
 orgRouter.get('/settings', async (req, res, next) => {
   try {
-    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
+    const org = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: ORG_SETTINGS_SELECT,
+    });
     if (!org) throw new NotFoundError('Organisation');
     ok(res, org);
   } catch (e) { next(e); }
@@ -712,7 +733,10 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
       if (mins < 0 || mins > 90) throw new ValidationError('gap_forgiveness_mins must be between 0 and 90');
       data.gap_forgiveness_mins = mins;
     }
-    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
+    const updated = await prisma.organisation.update({
+      where: { id: req.user!.org_id }, data,
+      select: ORG_SETTINGS_SELECT,
+    });
     ok(res, updated);
   } catch (e) { next(e); }
 });
