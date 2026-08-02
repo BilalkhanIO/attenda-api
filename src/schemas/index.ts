@@ -336,6 +336,13 @@ export const onboardingAssignSchema = z.object({
   template_id: z.string().min(1),
 }).passthrough();
 
+// ─── Kudos ────────────────────────────────────────────
+export const kudosCreateSchema = z.object({
+  to_user_id: z.string().min(1),
+  message: z.string().trim().min(3).max(500),
+  emoji: z.string().trim().min(1).max(20).optional(), // client-chosen, e.g. 👏
+}).passthrough();
+
 // ─── Holidays ─────────────────────────────────────────
 export const holidaySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),

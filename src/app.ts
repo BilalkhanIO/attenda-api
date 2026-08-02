@@ -29,6 +29,7 @@ import adminRouter         from './routes/admin';
 import adminPlatformUsersRouter from './routes/admin-platform-users';
 import overtimeRouter      from './routes/overtime';
 import onboardingRouter    from './routes/onboarding';
+import kudosRouter         from './routes/kudos';
 import notificationsRouter from './routes/notifications';
 import publicRouter        from './routes/public';
 import { errorHandler, notFound } from './middleware/errorHandler';
@@ -129,6 +130,7 @@ const MOUNTS: Array<[string, express.Router]> = [
   [`${API}/expenses`,        expensesRouter],
   [`${API}/documents`,       documentsRouter],
   [`${API}/onboarding`,      onboardingRouter],
+  [`${API}/kudos`,           kudosRouter],
   [`${API}/performance`,     performanceRouter],
   [`${API}/analytics`,       analyticsRouter],
   [`${API}/org/departments`, departmentsRouter],

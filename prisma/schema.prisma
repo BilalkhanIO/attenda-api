@@ -71,6 +71,7 @@ model Organisation {
   announcements         Announcement[]
   onboarding_templates  OnboardingTemplate[]
   onboarding_tasks      OnboardingTask[]
+  kudos                 Kudos[]
 
   @@map("organisations")
 }
@@ -132,6 +133,8 @@ model User {
   onboarding_templates_created OnboardingTemplate[] @relation("OnboardingTemplateCreator")
   onboarding_tasks             OnboardingTask[]     @relation("OnboardingHire")
   onboarding_tasks_assigned    OnboardingTask[]     @relation("OnboardingAssignee")
+  kudos_given                  Kudos[]              @relation("KudosGiver")
+  kudos_received               Kudos[]              @relation("KudosRecipient")
   leave_requests          LeaveRequest[]
   leave_balances          LeaveBalance[]
   reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
@@ -823,6 +826,27 @@ model OnboardingTask {
   @@index([org_id, user_id])
   @@index([assignee_id, status])
   @@map("onboarding_tasks")
+}
+
+// Kudos / recognition feed: any org member can publicly thank another.
+// Soft-deleted (author or org.settings.update) so moderation keeps the
+// audit trail intact. Capped at 20 per giver per day in the router.
+model Kudos {
+  id           String    @id @default(uuid())
+  org_id       String
+  from_user_id String
+  to_user_id   String
+  message      String
+  emoji        String?   @db.VarChar(20)
+  created_at   DateTime  @default(now())
+  deleted_at   DateTime?
+
+  org       Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  giver     User         @relation("KudosGiver", fields: [from_user_id], references: [id])
+  recipient User         @relation("KudosRecipient", fields: [to_user_id], references: [id])
+
+  @@index([org_id, created_at])
+  @@map("kudos")
 }
 
 // Read receipts: one row per (announcement, reader), upserted idempotently.
