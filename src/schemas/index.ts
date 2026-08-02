@@ -316,6 +316,26 @@ export const documentCreateSchema = z.object({
   expires_at: dateStr.nullish(),
 }).passthrough();
 
+// ─── Onboarding checklists ────────────────────────────
+const onboardingItemSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+  description: z.string().max(2000).nullish(),
+  due_days: z.coerce.number().int().min(0).max(365).nullish(),
+  sort_order: z.coerce.number().int().min(0).optional(),
+  assignee_role: z.enum(['employee', 'manager']).optional(),
+}).passthrough();
+
+export const onboardingTemplateSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  is_default: z.boolean().optional(),
+  items: z.array(onboardingItemSchema).min(1).max(50),
+}).passthrough();
+
+export const onboardingAssignSchema = z.object({
+  user_id: z.string().min(1),
+  template_id: z.string().min(1),
+}).passthrough();
+
 // ─── Holidays ─────────────────────────────────────────
 export const holidaySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),

@@ -67,7 +67,8 @@ export type NotifType =
   | 'remote_request' | 'remote_approved' | 'remote_rejected' | 'remote_no_reply'
   | 'payslip_ready' | 'goal_assigned' | 'review_submitted' | 'shift_reminder'
   | 'account_locked'
-  | 'document_added' | 'document_expiring';
+  | 'document_added' | 'document_expiring'
+  | 'onboarding_assigned' | 'onboarding_complete';
 
 export interface NotifPayload {
   userId:      string;
