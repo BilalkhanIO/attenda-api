@@ -48,6 +48,24 @@ export async function revokeAllForUser(userId: string): Promise<void> {
 }
 
 /**
+ * Retention purge (daily job): expired tokens are dead weight the moment
+ * they lapse; revoked/rotated ones are kept 30 days for reuse-detection
+ * forensics, then dropped. Without this the table accretes forever.
+ */
+export async function purgeRefreshTokens(now = new Date()): Promise<number> {
+  const cutoff = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+  const { count } = await prisma.refreshToken.deleteMany({
+    where: {
+      OR: [
+        { expires_at: { lt: now } },
+        { revoked_at: { lt: cutoff } },
+      ],
+    },
+  });
+  return count;
+}
+
+/**
  * Validates and rotates. Returns the user id and the successor token.
  * Tokens issued before rotation shipped (valid JWT, no DB row) are accepted
  * once and seeded into a new family, so deploying this does not log

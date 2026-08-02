@@ -811,6 +811,19 @@ export function startLeaveAccrualJob() {
   console.log('🌴 Leave accrual job started (1st of month, 02:00 UTC)');
 }
 
+// ─── Job: Refresh-Token Purge ─────────────────────────
+// Daily: delete expired tokens and revoked/rotated ones older than 30 days
+// (kept that long for reuse-detection forensics). Without this the
+// refresh_tokens table accretes forever — rotation only sets revoked_at.
+export function startRefreshTokenPurgeJob() {
+  scheduledJob('startRefreshTokenPurgeJob', '30 3 * * *', async () => {
+    const { purgeRefreshTokens } = await import('../services/refreshTokens');
+    const purged = await purgeRefreshTokens();
+    jobLogger.info({ purged }, 'refresh token purge complete');
+  });
+  console.log('🔑 Refresh-token purge job started (daily, 03:30 UTC)');
+}
+
 export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
   startLeaveAccrualJob();
@@ -828,5 +841,6 @@ export function startAllJobs() {
   startPayrollAutoGenerate();
   startShiftBreakAutoManager();
   startTrialExpiryMonitor();
+  startRefreshTokenPurgeJob();
   console.log('✅ All background jobs running\n');
 }
