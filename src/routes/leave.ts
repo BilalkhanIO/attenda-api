@@ -402,9 +402,16 @@ router.put('/balance/:userId', requirePermission('leave.balance.manage'), async 
     const adj = Number(adjustment);
     if (!Number.isFinite(adj)) throw new ValidationError('adjustment must be a number');
 
+    // Org scoping: the target user must belong to the caller's org
+    const targetUser = await prisma.user.findFirst({
+      where: { id: String(req.params.userId), org_id: req.user!.org_id },
+      select: { id: true },
+    });
+    if (!targetUser) throw new NotFoundError('User');
+
     const year = new Date().getFullYear();
     const balance = await prisma.leaveBalance.findFirst({
-      where: { user_id: String(req.params.userId), leave_type, year },
+      where: { user_id: String(req.params.userId), org_id: req.user!.org_id, leave_type, year },
     });
     if (!balance) throw new NotFoundError('Leave balance');
 

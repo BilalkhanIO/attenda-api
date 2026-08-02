@@ -297,6 +297,15 @@ performanceRouter.post('/goals', requirePermission('performance.manage'), async 
   try {
     const { user_id, review_id, title, description, weight, target_date } = req.body;
     if (!user_id || !review_id || !title || !weight) throw new ValidationError('Missing required fields');
+
+    // Target user and review must both belong to the caller's org
+    const [targetUser, review] = await Promise.all([
+      prisma.user.findFirst({ where: { id: user_id, org_id: req.user!.org_id }, select: { id: true } }),
+      prisma.performanceReview.findFirst({ where: { id: review_id, org_id: req.user!.org_id }, select: { id: true } }),
+    ]);
+    if (!targetUser) throw new NotFoundError('User');
+    if (!review)     throw new NotFoundError('Performance review');
+
     const goal = await prisma.performanceGoal.create({
       data: { user_id, review_id, title, description, weight, target_date: target_date ? new Date(target_date) : null },
       include: { user: { select: { id: true, name: true, department: true } } },
@@ -326,7 +335,15 @@ performanceRouter.put('/goals/:id', requirePermission('performance.manage'), asy
     if (weight      !== undefined) data.weight      = weight;
     if (completion  !== undefined) data.completion  = completion;
     if (target_date !== undefined) data.target_date = target_date ? new Date(target_date) : null;
-    const goal = await prisma.performanceGoal.update({ where: { id: String(req.params.id) }, data });
+
+    // Org scoping: the goal's subject must belong to the caller's org
+    const existing = await prisma.performanceGoal.findFirst({
+      where: { id: String(req.params.id), user: { org_id: req.user!.org_id } },
+      select: { id: true },
+    });
+    if (!existing) throw new NotFoundError('Goal');
+
+    const goal = await prisma.performanceGoal.update({ where: { id: existing.id }, data });
     ok(res, goal);
   } catch (e) { next(e); }
 });
@@ -337,8 +354,8 @@ performanceRouter.get('/reviews/:userId/insights', requirePermission('performanc
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
 
-    const user = await prisma.user.findUnique({
-      where: { id: String(req.params.userId) },
+    const user = await prisma.user.findFirst({
+      where: { id: String(req.params.userId), org_id: req.user!.org_id },
       select: { id: true, name: true, department: true, job_title: true },
     });
     if (!user) throw new NotFoundError('User');
