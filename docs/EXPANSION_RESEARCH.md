@@ -164,3 +164,31 @@ Remaining UI work (next agents):
   `org.announcements.send` key was never seeded — now in catalog +
   hr_admin/super_admin. UI next: compose dialog gains schedule + department
   pickers and a receipts drawer; clients post the read receipt on open.
+
+## Delivery status (2026-08-02) — Onboarding checklists + Kudos feed
+
+- **Onboarding checklists** shipped on the API (417d502, 2a7374e, 25507f6):
+  `OnboardingTemplate`/`OnboardingTemplateItem`/`OnboardingTask` models
+  (migration 20260703000000), `onboarding.manage` (hr_admin+) and
+  `onboarding.view_team` (manager+) RBAC. `/api/v1/onboarding` router:
+  templates CRUD (single default per org, PUT replaces items wholesale,
+  soft delete, audited), POST `/assign` materializing per-hire tasks
+  (employee items → hire, manager items → manager_id with hire fallback,
+  due_date = assignment day + due_days, idempotent per user+template,
+  `onboarding_assigned` notifications), GET `/me` (assignee list, pending
+  first), GET `/user/:userId` (checklist + `{done,total}` progress), PUT
+  `/tasks/:id/complete|skip` (assignee or manage, audited,
+  `onboarding_complete` to manager + completer when the last pending task
+  closes). POST /users auto-assigns the org's default template
+  (best-effort, never fails creation). UI next: web HR template builder +
+  per-employee progress tab; both clients get a "my onboarding tasks"
+  checklist surface.
+- **Kudos / recognition feed** shipped on the API (da6a7f7 + tests commit):
+  `Kudos` model (migration 20260704000000, soft delete). `/api/v1/kudos`:
+  POST `/` (active org member target, no self-kudos, 20/day per-giver cap →
+  429 RATE_LIMITED, `kudos_received` notification), GET `/` (org feed,
+  opt-in page/limit pagination), GET `/mine` (received/given counts +
+  recent received), DELETE `/:id` (author or org.settings.update, audited).
+  No new permissions — giving is open to every org member by design. UI
+  next: feed page/tab with give-kudos dialog (emoji picker), profile badge
+  counts from `/mine`.
