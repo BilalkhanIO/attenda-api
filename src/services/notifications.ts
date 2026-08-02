@@ -29,6 +29,22 @@ export function emitOrgEvent(orgId: string, type: OrgEventType): void {
   } catch (e) {
     console.error('[Notifications] emitOrgEvent failed:', e);
   }
+  // Second, independent fan-out channel (outbound webhook delivery). Kept
+  // outside the SSE try so a webhook listener failure can never affect SSE.
+  try {
+    orgEvents.emit('org:*', orgId, type);
+  } catch (e) {
+    console.error('[Notifications] emitOrgEvent wildcard fanout failed:', e);
+  }
+}
+
+/** Subscribe to every org's events (used by the outbound-webhook fan-out).
+ *  Returns an unsubscribe fn. */
+export function subscribeAllOrgEvents(
+  listener: (orgId: string, type: OrgEventType) => void,
+): () => void {
+  orgEvents.on('org:*', listener);
+  return () => orgEvents.off('org:*', listener);
 }
 
 /** Subscribe an SSE connection to its org's events. Returns an unsubscribe fn. */
