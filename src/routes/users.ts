@@ -328,6 +328,11 @@ router.post('/', requirePermission('employees.create'), validate({ body: createU
       skipDuplicates: true,
     });
 
+    // Auto-assign the org's default onboarding checklist. Best-effort:
+    // a failed assignment must never fail user creation (logged inside).
+    const { autoAssignDefaultTemplate } = await import('../services/onboarding');
+    await autoAssignDefaultTemplate(req.user!.org_id, user.id);
+
     created(res, user);
   } catch (e) { next(e); }
 });
