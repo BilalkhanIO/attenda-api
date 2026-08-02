@@ -81,6 +81,9 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'whatsapp.logs.view', module: 'whatsapp', description: 'View WhatsApp notification logs' },
   // Overtime
   { key: 'overtime.manage', module: 'overtime', description: 'Manage overtime rules' },
+  // Expenses
+  { key: 'expenses.view', module: 'expenses', description: 'View team expense claims' },
+  { key: 'expenses.manage', module: 'expenses', description: 'Approve and reimburse expense claims' },
   // Platform (cross-tenant)
   { key: 'platform.orgs.view', module: 'platform', description: 'View organisations' },
   { key: 'platform.orgs.manage', module: 'platform', description: 'Manage organisation subscriptions' },

@@ -16,7 +16,8 @@ export type OrgEventType =
   | 'leave_changed'
   | 'overtime_changed'
   | 'remote_changed'
-  | 'swap_changed';
+  | 'swap_changed'
+  | 'expense_changed';
 
 const orgEvents = new EventEmitter();
 orgEvents.setMaxListeners(0); // one listener per SSE connection — unbounded
@@ -45,6 +46,7 @@ export type NotifType =
   | 'attendance_late_escalation' | 'attendance_early_in' | 'attendance_early_out' | 'late_pattern'
   | 'late_notice' | 'late_notice_ack' | 'leave_checkin_override'
   | 'correction_request' | 'correction_approved' | 'correction_rejected'
+  | 'expense_request' | 'expense_approved' | 'expense_rejected' | 'expense_reimbursed'
   | 'leave_request' | 'leave_approved' | 'leave_rejected'
   | 'remote_request' | 'remote_approved' | 'remote_rejected' | 'remote_no_reply'
   | 'payslip_ready' | 'goal_assigned' | 'review_submitted' | 'shift_reminder'

@@ -65,6 +65,8 @@ model Organisation {
   user_permission_grants UserPermissionGrant[]
   departments           Department[]
   holidays              OrgHoliday[]
+  expense_claims        ExpenseClaim[]
+  outbound_webhooks     OrgWebhook[]
 
   @@map("organisations")
 }
@@ -117,6 +119,8 @@ model User {
   attendance_records      AttendanceRecord[]
   corrections_requested   AttendanceCorrection[] @relation("CorrectionUser")
   corrections_reviewed    AttendanceCorrection[] @relation("CorrectionReviewer")
+  expense_claims          ExpenseClaim[]         @relation("ExpenseClaimant")
+  expenses_reviewed       ExpenseClaim[]         @relation("ExpenseReviewer")
   leave_requests          LeaveRequest[]
   leave_balances          LeaveBalance[]
   reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
@@ -526,9 +530,38 @@ model PayrollRecord {
   user      User         @relation(fields: [user_id], references: [id])
   org       Organisation @relation(fields: [org_id], references: [id])
   processor User?        @relation("PayrollProcessor", fields: [processed_by], references: [id])
+  reimbursed_expenses ExpenseClaim[]
 
   @@unique([user_id, period_month, period_year])
   @@map("payroll_records")
+}
+
+// Employee expense claims: submit → approve/reject → reimburse through the
+// existing payroll manual-adjustment machinery (recall/adjust flow).
+model ExpenseClaim {
+  id                       String    @id @default(uuid())
+  user_id                  String
+  org_id                   String
+  amount                   Decimal   @db.Decimal(12, 2)
+  currency                 String    @db.VarChar(10)
+  category                 String    @db.VarChar(50)
+  description              String
+  expense_date             DateTime  @db.Date
+  receipt_url              String?
+  status                   String    @default("pending") // pending | approved | rejected | reimbursed
+  reviewed_by              String?
+  review_note              String?
+  reviewed_at              DateTime?
+  reimbursed_in_payroll_id String?
+  created_at               DateTime  @default(now())
+
+  user          User           @relation("ExpenseClaimant", fields: [user_id], references: [id])
+  reviewer      User?          @relation("ExpenseReviewer", fields: [reviewed_by], references: [id])
+  org           Organisation   @relation(fields: [org_id], references: [id])
+  reimbursed_in PayrollRecord? @relation(fields: [reimbursed_in_payroll_id], references: [id])
+
+  @@index([org_id, status])
+  @@map("expense_claims")
 }
 
 model OvertimeRule {

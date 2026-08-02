@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { authenticate, requirePermission, requireOrgFeature } from '../middleware/auth';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfMonth, endOfMonth } from '../utils/auth';
+import { recalcPayrollTotals } from '../utils/payroll';
 import prisma from '../utils/prisma';
 import { validate } from '../middleware/validate';
 import { payrollPeriodSchema, payrollAdjustSchema, payrollRecallSchema } from '../schemas';
@@ -177,27 +178,21 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), validate({ body: 
     else if (field === 'adjustments') updateData.manual_adjustment = value;
 
     // Recalculate gross pay
-    const rh  = Number(field === 'regular_hours'  ? value : record.regular_hours);
-    const oh  = Number(field === 'overtime_hours' ? value : record.overtime_hours);
-    const adj = Number(field === 'adjustments'    ? value : record.manual_adjustment);
-    const grossPay = Math.max(0,
-      rh * Number(record.hourly_rate) +
-      oh * Number(record.hourly_rate) * 1.5 -
-      Number(record.unpaid_deduction) +
-      adj
-    );
     const org = await prisma.organisation.findUnique({
       where: { id: record.org_id },
       select: { tax_rate: true, pension_rate: true },
     });
-    const taxRate     = (Number(org?.tax_rate)     || 0) / 100;
-    const pensionRate = (Number(org?.pension_rate) || 0) / 100;
-    const taxDeduction     = grossPay * taxRate;
-    const pensionDeduction = grossPay * pensionRate;
-    updateData.gross_pay          = grossPay;
-    updateData.tax_deduction      = taxDeduction;
-    updateData.pension_deduction  = pensionDeduction;
-    updateData.net_pay            = Math.max(0, grossPay - taxDeduction - pensionDeduction);
+    const totals = recalcPayrollTotals({
+      regular_hours:     Number(field === 'regular_hours'  ? value : record.regular_hours),
+      overtime_hours:    Number(field === 'overtime_hours' ? value : record.overtime_hours),
+      manual_adjustment: Number(field === 'adjustments'    ? value : record.manual_adjustment),
+      hourly_rate:       Number(record.hourly_rate),
+      unpaid_deduction:  Number(record.unpaid_deduction),
+    }, Number(org?.tax_rate) || 0, Number(org?.pension_rate) || 0);
+    updateData.gross_pay          = totals.gross_pay;
+    updateData.tax_deduction      = totals.tax_deduction;
+    updateData.pension_deduction  = totals.pension_deduction;
+    updateData.net_pay            = totals.net_pay;
 
     const updated = await prisma.payrollRecord.update({
       where: { id: req.params.id as string },
