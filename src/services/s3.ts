@@ -44,6 +44,21 @@ export async function getSignedDownloadUrl(
   return getSignedUrl(s3, command, { expiresIn });
 }
 
+// ─── Get a signed upload URL (presigned PUT) ─────────
+// The caller must send the same Content-Type header it presigned with.
+export async function getSignedUploadUrl(
+  key:         string,
+  contentType: string,
+  expiresIn = 900, // 15 minutes
+): Promise<string> {
+  const command = new PutObjectCommand({
+    Bucket:      BUCKET,
+    Key:         key,
+    ContentType: contentType,
+  });
+  return getSignedUrl(s3, command, { expiresIn });
+}
+
 // ─── Delete an object ─────────────────────────────────
 export async function deleteFile(key: string): Promise<void> {
   await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }));
@@ -61,6 +76,9 @@ export const S3Keys = {
     `orgs/${orgId}/logo.${ext}`,
   avatar:    (orgId: string, userId: string, ext: string) =>
     `orgs/${orgId}/avatars/${userId}.${ext}`,
+  // `fileName` must already be sanitized — see services/documents.ts
+  document:  (orgId: string, userId: string, unique: string, fileName: string) =>
+    `documents/${orgId}/${userId}/${unique}-${fileName}`,
 };
 
 // ─── Check if S3 is configured ───────────────────────

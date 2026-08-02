@@ -21,6 +21,7 @@ import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './
 import holidaysRouter from './routes/holidays';
 import correctionsRouter from './routes/corrections';
 import expensesRouter from './routes/expenses';
+import documentsRouter from './routes/documents';
 import orgRbacRouter from './routes/org-rbac';
 import orgWebhooksRouter from './routes/org-webhooks';
 import webhooksRouter from './routes/webhooks';
@@ -125,6 +126,7 @@ const MOUNTS: Array<[string, express.Router]> = [
   [`${API}/shifts`,          shiftsRouter],
   [`${API}/payroll`,         payrollRouter],
   [`${API}/expenses`,        expensesRouter],
+  [`${API}/documents`,       documentsRouter],
   [`${API}/performance`,     performanceRouter],
   [`${API}/analytics`,       analyticsRouter],
   [`${API}/org/departments`, departmentsRouter],

@@ -297,6 +297,25 @@ export const expenseReimburseSchema = z.object({
   year: z.coerce.number().int().min(2000).max(2100),
 }).passthrough();
 
+// ─── Employee documents ───────────────────────────────
+export const documentUploadUrlSchema = z.object({
+  user_id: z.string().min(1).optional(), // omitted ⇒ self-upload
+  file_name: z.string().trim().min(1).max(255),
+  mime_type: z.string().trim().min(1).max(100),
+  file_size: z.coerce.number().int().positive(),
+}).passthrough();
+
+export const documentCreateSchema = z.object({
+  user_id: z.string().min(1).optional(), // omitted ⇒ self
+  title: z.string().trim().min(1).max(200),
+  category: z.string().trim().min(1).max(50), // e.g. contract | id | visa | certificate | other
+  file_key: z.string().min(1).max(1000),
+  file_name: z.string().trim().min(1).max(255),
+  file_size: z.coerce.number().int().positive(),
+  mime_type: z.string().trim().min(1).max(100),
+  expires_at: dateStr.nullish(),
+}).passthrough();
+
 // ─── Holidays ─────────────────────────────────────────
 export const holidaySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),

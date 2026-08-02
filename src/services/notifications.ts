@@ -66,7 +66,8 @@ export type NotifType =
   | 'leave_request' | 'leave_approved' | 'leave_rejected'
   | 'remote_request' | 'remote_approved' | 'remote_rejected' | 'remote_no_reply'
   | 'payslip_ready' | 'goal_assigned' | 'review_submitted' | 'shift_reminder'
-  | 'account_locked';
+  | 'account_locked'
+  | 'document_added' | 'document_expiring';
 
 export interface NotifPayload {
   userId:      string;
