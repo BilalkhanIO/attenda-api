@@ -304,6 +304,25 @@ export const holidaySchema = z.object({
   recurring: z.coerce.boolean().optional(),
 }).passthrough();
 
+// ─── Outbound org webhooks ────────────────────────────
+// Canonical subscribable event list (mirrors OrgEventType in
+// services/notifications.ts); kept here so this module stays prisma-free.
+export const WEBHOOK_EVENT_TYPES = [
+  'attendance_changed',
+  'leave_changed',
+  'overtime_changed',
+  'remote_changed',
+  'swap_changed',
+  'expense_changed',
+] as const;
+export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
+
+export const orgWebhookSchema = z.object({
+  url: z.string().url().max(1000)
+    .refine(u => u.startsWith('https://'), { message: 'url must use https' }),
+  events: z.array(z.enum(WEBHOOK_EVENT_TYPES)).min(1),
+}).passthrough();
+
 // ─── Org settings / departments ───────────────────────
 export const orgSettingsSchema = z.object({
   name: z.string().trim().min(1).max(255).optional(),

@@ -112,3 +112,33 @@ glass remnants. Widget tests: af09b1d. Tier B remains the next cycle's menu.
    API pieces land. Incremental commits, CI-gated.
 6. Web agent: holidays settings card, corrections tab in Approvals, who's-out
    dashboard widget. Incremental commits, CI-gated.
+
+## Tier B delivery status (2026-08-02) — API
+
+Two Tier B items shipped on attenda-api (branch claude/zealous-sagan-8aa4gb):
+- **Expense claims** end-to-end on the API: schema + `expenses.view`/
+  `expenses.manage` RBAC + shared payroll recalc util (82bcc12), the
+  `/api/v1/expenses` router — submit → approve/reject → reimburse into the
+  claimant's payroll `manual_adjustment` via the exact `/payroll/:id/adjust`
+  math, audited both sides (7e9d497), recalc unit tests (719038a).
+  Note: 82bcc12 briefly referenced the then-unadded OrgWebhook model;
+  fixed in 7e9d497 (CI red only on that intermediate push).
+- **Outbound org webhooks** (the "Slack/Teams webhooks" item, generalised):
+  `org_webhooks` model + HMAC-SHA256-signed fire-and-forget delivery with
+  5s timeout, failure-streak bookkeeping and auto-disable at 20 (44670e8);
+  `/api/v1/org/outbound-webhooks` management router (secret returned once),
+  boot wiring via `registerWebhookFanout()`, delivery unit tests (this
+  commit). Events: attendance/leave/overtime/remote/swap/expense `_changed`.
+
+Remaining UI work (next agents):
+- **Web**: expenses approvals tab (list + approve/reject + reimburse dialog
+  choosing period, recall hint on LOCKED), employee "My expenses" submit
+  form; Settings card for outbound webhooks (create shows secret once,
+  list/delete/test, failure badges); subscribe TanStack invalidation to the
+  new `expense_changed` SSE scope.
+- **Mobile**: expense submission (amount/category/receipt photo upload —
+  needs an S3 presign endpoint, not yet built) + "my claims" list; approvals
+  hub entry for managers with `expenses.manage`.
+- **API follow-ups** (small): receipt upload presign route reusing
+  services/s3.ts; optional Redis pub/sub upgrade of the org bus would give
+  multi-instance webhook fanout for free.

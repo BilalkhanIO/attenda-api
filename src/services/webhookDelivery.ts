@@ -16,17 +16,9 @@ import { subscribeAllOrgEvents, type OrgEventType } from './notifications';
 // SECURITY: secrets are generated with crypto.randomBytes, stored server-side,
 // returned to the caller exactly once (at creation) and NEVER logged.
 
-/** Event types an org webhook may subscribe to. */
-export const WEBHOOK_EVENT_TYPES = [
-  'attendance_changed',
-  'leave_changed',
-  'overtime_changed',
-  'remote_changed',
-  'swap_changed',
-  'expense_changed',
-] as const;
-
-export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
+// Event types an org webhook may subscribe to — canonical list lives in
+// src/schemas (kept prisma-free so pure schema consumers can import it).
+export { WEBHOOK_EVENT_TYPES, type WebhookEventType } from '../schemas';
 
 /** Consecutive delivery failures after which a hook is auto-disabled. */
 export const AUTO_DISABLE_THRESHOLD = 20;

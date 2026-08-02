@@ -22,6 +22,7 @@ import holidaysRouter from './routes/holidays';
 import correctionsRouter from './routes/corrections';
 import expensesRouter from './routes/expenses';
 import orgRbacRouter from './routes/org-rbac';
+import orgWebhooksRouter from './routes/org-webhooks';
 import webhooksRouter from './routes/webhooks';
 import adminRouter         from './routes/admin';
 import adminPlatformUsersRouter from './routes/admin-platform-users';
@@ -128,6 +129,9 @@ const MOUNTS: Array<[string, express.Router]> = [
   [`${API}/analytics`,       analyticsRouter],
   [`${API}/org/departments`, departmentsRouter],
   [`${API}/org/holidays`,    holidaysRouter],
+  // outbound-webhooks mounts before the generic /org routers so its paths
+  // are not swallowed by their parameterised routes
+  [`${API}/org/outbound-webhooks`, orgWebhooksRouter],
   [`${API}/org`,             orgRouter],
   [`${API}/org`,             orgRbacRouter],
   [`${API}/reports`,         reportsRouter],
