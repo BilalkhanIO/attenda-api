@@ -412,8 +412,8 @@ model LeaveBalance {
   org_id     String
   leave_type String   @db.VarChar(50)
   year       Int
-  total_days Int
-  used_days  Int      @default(0)
+  total_days Decimal  @db.Decimal(6, 2)
+  used_days  Decimal  @default(0) @db.Decimal(6, 2)
   updated_at DateTime @default(now()) @updatedAt
 
   user User         @relation(fields: [user_id], references: [id])

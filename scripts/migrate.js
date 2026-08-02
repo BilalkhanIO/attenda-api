@@ -190,6 +190,7 @@ async function run() {
       'prisma/migrations/20260702000000_announcements/migration.sql',
       'prisma/migrations/20260703000000_onboarding/migration.sql',
       'prisma/migrations/20260704000000_kudos/migration.sql',
+      'prisma/migrations/20260705000000_leave_balance_decimal/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {

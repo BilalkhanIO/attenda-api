@@ -7,7 +7,7 @@ jest.mock('../../utils/logger', () => ({
   jobLogger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-import { parseAccrualConfig, monthlyIncrement, carryOver } from '../../services/leaveAccrual';
+import { parseAccrualConfig, monthlyIncrement, carryOver, toDays, accruedTotal, availableDays } from '../../services/leaveAccrual';
 
 describe('parseAccrualConfig', () => {
   it('returns null for non-object input', () => {
@@ -67,5 +67,48 @@ describe('carryOver', () => {
 
   it('rounds to 2dp', () => {
     expect(carryOver({ days_per_year: 20, carry_over_max: 9.999 }, 20, 10.005)).toBeCloseTo(9.99, 2);
+  });
+});
+
+// leave_balances.total_days/used_days are DECIMAL(6,2) — Prisma hands them
+// back as Decimal objects that stringify. These helpers are the write/read
+// paths for fractional days (0.5 half-days, days_per_year/12 accrual).
+describe('toDays', () => {
+  it('normalizes Decimal-like objects, strings and numbers', () => {
+    expect(toDays(20)).toBe(20);
+    expect(toDays('1.67')).toBe(1.67);
+    expect(toDays({ toString: () => '0.50' })).toBe(0.5); // Prisma Decimal shape
+  });
+
+  it('falls back to 0 for garbage', () => {
+    expect(toDays(null)).toBe(0);
+    expect(toDays(undefined)).toBe(0);
+    expect(toDays('not a number')).toBe(0);
+  });
+});
+
+describe('accruedTotal (days_per_year/12 write path)', () => {
+  it('applies a monthly increment to a Decimal-backed total at 2dp', () => {
+    const inc = monthlyIncrement({ days_per_year: 20 }); // 1.67 — non-integer
+    expect(inc).toBe(1.67);
+    expect(accruedTotal({ toString: () => '1.67' }, inc)).toBe(3.34);
+    expect(accruedTotal('18.33', inc)).toBe(20);
+  });
+
+  it('applies signed manual adjustments', () => {
+    expect(accruedTotal(20, -2.5)).toBe(17.5);
+    expect(accruedTotal('20.00', 0.5)).toBe(20.5);
+  });
+});
+
+describe('availableDays (0.5 half-day read path)', () => {
+  it('subtracts fractional used days from Decimal-backed columns', () => {
+    expect(availableDays('20.00', '0.50')).toBe(19.5);
+    expect(availableDays({ toString: () => '20' }, { toString: () => '0.5' })).toBe(19.5);
+  });
+
+  it('handles accrued fractional totals', () => {
+    expect(availableDays('1.67', '0.5')).toBe(1.17);
+    expect(availableDays(0, 0)).toBe(0);
   });
 });

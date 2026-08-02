@@ -31,6 +31,26 @@ export function monthlyIncrement(policy: AccrualPolicy): number {
   return Math.round((policy.days_per_year / 12) * 100) / 100;
 }
 
+/**
+ * leave_balances.total_days/used_days are DECIMAL(6,2) — Prisma returns them
+ * as Decimal objects (which serialize to strings). Normalize to a plain
+ * number before any arithmetic or JSON response.
+ */
+export function toDays(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
+
+/** New total after applying an increment to an existing balance, 2dp. */
+export function accruedTotal(existingTotal: unknown, inc: number): number {
+  return Math.round((toDays(existingTotal) + inc) * 100) / 100;
+}
+
+/** Remaining balance (total - used), 2dp — handles Decimal inputs. */
+export function availableDays(total: unknown, used: unknown): number {
+  return Math.round((toDays(total) - toDays(used)) * 100) / 100;
+}
+
 /** Days carried into a new year from last year's unused balance. */
 export function carryOver(policy: AccrualPolicy, priorTotal: number, priorUsed: number): number {
   const unused = Math.max(0, priorTotal - priorUsed);
@@ -79,7 +99,7 @@ export async function runMonthlyAccrual(now = new Date()): Promise<{ orgs: numbe
         if (existing) {
           await prisma.leaveBalance.update({
             where: { id: existing.id },
-            data: { total_days: Math.round((existing.total_days + inc) * 100) / 100 },
+            data: { total_days: accruedTotal(existing.total_days, inc) },
           });
         } else {
           let seed = inc;
@@ -87,7 +107,7 @@ export async function runMonthlyAccrual(now = new Date()): Promise<{ orgs: numbe
             const prior = await prisma.leaveBalance.findFirst({
               where: { user_id: user.id, leave_type: type, year: year - 1 },
             });
-            if (prior) seed += carryOver(policy, prior.total_days, prior.used_days);
+            if (prior) seed += carryOver(policy, toDays(prior.total_days), toDays(prior.used_days));
           }
           await prisma.leaveBalance.create({
             data: {

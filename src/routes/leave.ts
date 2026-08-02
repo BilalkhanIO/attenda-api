@@ -127,7 +127,8 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
         where: { user_id: req.user!.sub, leave_type, year },
       });
       if (balance) {
-        const available = balance.total_days - balance.used_days;
+        const { availableDays } = await import('../services/leaveAccrual');
+        const available = availableDays(balance.total_days, balance.used_days);
         if (working_days > available) {
           throw new ValidationError(`Insufficient ${leave_type} leave balance. Available: ${available} days, requested: ${working_days} days`);
         }
@@ -359,7 +360,7 @@ router.get('/balance/me', async (req, res, next) => {
 
     // Annotate rows with the org's accrual policy (additive — clients that
     // don't know the field ignore it) so employees can see how balances grow.
-    const { parseAccrualConfig, monthlyIncrement } = await import('../services/leaveAccrual');
+    const { parseAccrualConfig, monthlyIncrement, toDays } = await import('../services/leaveAccrual');
     const org = await prisma.organisation.findUnique({
       where: { id: req.user!.org_id },
       select: { leave_accrual: true },
@@ -367,9 +368,11 @@ router.get('/balance/me', async (req, res, next) => {
     const accrual = parseAccrualConfig(org?.leave_accrual);
     const annotated = balances.map(b => {
       const policy = accrual?.[b.leave_type];
+      // Decimal columns serialize as strings — clients expect numbers
+      const row = { ...b, total_days: toDays(b.total_days), used_days: toDays(b.used_days) };
       return policy
-        ? { ...b, accrual: { days_per_year: policy.days_per_year, monthly: monthlyIncrement(policy), carry_over_max: policy.carry_over_max ?? 0 } }
-        : b;
+        ? { ...row, accrual: { days_per_year: policy.days_per_year, monthly: monthlyIncrement(policy), carry_over_max: policy.carry_over_max ?? 0 } }
+        : row;
     });
     ok(res, annotated);
   } catch (e) { next(e); }
@@ -386,7 +389,8 @@ router.get('/balance/:userId', requirePermission('leave.view_team', 'leave.balan
     const balances = await prisma.leaveBalance.findMany({
       where: { user_id: String(req.params.userId), year },
     });
-    ok(res, balances);
+    const { toDays } = await import('../services/leaveAccrual');
+    ok(res, balances.map(b => ({ ...b, total_days: toDays(b.total_days), used_days: toDays(b.used_days) })));
   } catch (e) { next(e); }
 });
 
@@ -395,6 +399,8 @@ router.put('/balance/:userId', requirePermission('leave.balance.manage'), async 
   try {
     const { leave_type, adjustment, reason } = req.body;
     if (!leave_type || adjustment === undefined || !reason) throw new ValidationError('leave_type, adjustment and reason required');
+    const adj = Number(adjustment);
+    if (!Number.isFinite(adj)) throw new ValidationError('adjustment must be a number');
 
     const year = new Date().getFullYear();
     const balance = await prisma.leaveBalance.findFirst({
@@ -402,18 +408,19 @@ router.put('/balance/:userId', requirePermission('leave.balance.manage'), async 
     });
     if (!balance) throw new NotFoundError('Leave balance');
 
+    const { toDays, accruedTotal } = await import('../services/leaveAccrual');
     const updated = await prisma.leaveBalance.update({
       where: { id: balance.id },
-      data: { total_days: balance.total_days + adjustment },
+      data: { total_days: accruedTotal(balance.total_days, adj) },
     });
     recordAudit({
       orgId: req.user!.org_id, actorId: req.user!.sub,
       action: 'leave.balance.update', entityType: 'leave_balance', entityId: balance.id,
-      before: { total_days: balance.total_days },
-      after: { total_days: updated.total_days, adjustment },
+      before: { total_days: toDays(balance.total_days) },
+      after: { total_days: toDays(updated.total_days), adjustment: adj },
       reason,
     });
-    ok(res, updated);
+    ok(res, { ...updated, total_days: toDays(updated.total_days), used_days: toDays(updated.used_days) });
   } catch (e) { next(e); }
 });
 
