@@ -443,77 +443,99 @@ router.get('/assignments/:id/detail', async (req, res, next) => {
 });
 
 // ─── POST /shifts/assignments/bulk ────────────────────
-// Assign a shift to multiple employees across multiple dates in one call.
-// Returns created assignments, skipped conflicts, and leave/off-day warnings.
+// Body matches bulkAssignmentSchema: { assignments: [{user_id, shift_id, date}], dry_run? }.
+// Each row is validated independently; invalid rows are reported as conflicts
+// instead of failing the whole batch. With dry_run:true nothing is written —
+// the response reports what WOULD be created and every conflict/warning.
 router.post('/assignments/bulk', requirePermission('shifts.assign'), validate({ body: bulkAssignmentSchema }), async (req, res, next) => {
   try {
-    const { user_ids, shift_id, dates } = req.body;
-    if (!Array.isArray(user_ids) || user_ids.length === 0) throw new ValidationError('user_ids array required');
-    if (!shift_id)                                          throw new ValidationError('shift_id required');
-    if (!Array.isArray(dates)    || dates.length === 0)    throw new ValidationError('dates array required');
+    const { assignments, dry_run } = req.body as {
+      assignments: { user_id: string; shift_id: string; date: string }[];
+      dry_run?: boolean;
+    };
 
-    const shift = await prisma.shift.findFirst({ where: { id: shift_id, org_id: req.user!.org_id } });
-    if (!shift) throw new NotFoundError('Shift');
+    const userIds  = [...new Set(assignments.map(a => a.user_id))];
+    const shiftIds = [...new Set(assignments.map(a => a.shift_id))];
 
-    // Validate all employees belong to org
-    const users = await prisma.user.findMany({
-      where: { id: { in: user_ids }, org_id: req.user!.org_id, is_active: true },
-      select: { id: true, name: true },
-    });
-    if (users.length !== user_ids.length) throw new ValidationError('One or more employees not found in your organisation');
+    // Both employees and shifts must belong to the caller's org
+    const [users, shifts] = await Promise.all([
+      prisma.user.findMany({
+        where: { id: { in: userIds }, org_id: req.user!.org_id, is_active: true },
+        select: { id: true, name: true },
+      }),
+      prisma.shift.findMany({
+        where: { id: { in: shiftIds }, org_id: req.user!.org_id },
+        select: { id: true, active_days: true },
+      }),
+    ]);
+    const userMap  = new Map(users.map(u => [u.id, u.name]));
+    const shiftMap = new Map(shifts.map(s => [s.id, s]));
 
-    const parsedDates = dates.map((d: string) => parseDateOnly(d));
+    const parsedDates = assignments.map(a => parseDateOnly(a.date, 'date'));
+    const minDate = new Date(Math.min(...parsedDates.map(d => d.getTime())));
+    const maxDate = new Date(Math.max(...parsedDates.map(d => d.getTime())));
 
     // Pre-fetch existing assignments and approved leave to avoid N+1 checks
     const existingAssignments = await prisma.shiftAssignment.findMany({
-      where: { user_id: { in: user_ids }, date: { in: parsedDates } },
+      where: { user_id: { in: userIds }, date: { in: parsedDates } },
       select: { user_id: true, date: true },
     });
-    const conflictSet = new Set(existingAssignments.map(a => `${a.user_id}:${a.date.toISOString().split('T')[0]}`));
+    const takenSet = new Set(existingAssignments.map(a => `${a.user_id}:${a.date.toISOString().split('T')[0]}`));
 
     const approvedLeave = await prisma.leaveRequest.findMany({
       where: {
-        user_id: { in: user_ids }, status: 'approved',
-        start_date: { lte: parsedDates[parsedDates.length - 1] },
-        end_date:   { gte: parsedDates[0] },
+        user_id: { in: userIds }, status: 'approved',
+        start_date: { lte: maxDate }, end_date: { gte: minDate },
       },
       select: { user_id: true, start_date: true, end_date: true },
     });
 
-    const created: { user_id: string; user_name: string; date: string }[] = [];
-    const skipped: { user_id: string; user_name: string; date: string; reason: string }[] = [];
-    const warnings: { user_id: string; user_name: string; date: string; type: string }[] = [];
+    type RowRef = { user_id: string; user_name: string; shift_id: string; date: string };
+    const creatable: { row: RowRef; assignDate: Date }[] = [];
+    const conflicts: (RowRef & { reason: string })[] = [];
+    const warnings:  (RowRef & { type: string })[]   = [];
 
-    const userMap = new Map(users.map(u => [u.id, u.name]));
+    for (let i = 0; i < assignments.length; i++) {
+      const a = assignments[i];
+      const assignDate = parsedDates[i];
+      const dateStr = assignDate.toISOString().split('T')[0];
+      const row: RowRef = { user_id: a.user_id, user_name: userMap.get(a.user_id) ?? a.user_id, shift_id: a.shift_id, date: dateStr };
 
-    for (const userId of user_ids) {
-      for (const assignDate of parsedDates) {
-        const dateStr  = assignDate.toISOString().split('T')[0];
-        const userName = userMap.get(userId) ?? userId;
+      if (!userMap.has(a.user_id))  { conflicts.push({ ...row, reason: 'user_not_found' });  continue; }
+      const shift = shiftMap.get(a.shift_id);
+      if (!shift)                    { conflicts.push({ ...row, reason: 'shift_not_found' }); continue; }
+      const key = `${a.user_id}:${dateStr}`;
+      if (takenSet.has(key))         { conflicts.push({ ...row, reason: 'already_assigned' }); continue; }
+      takenSet.add(key); // also catches duplicates within the same request
 
-        if (conflictSet.has(`${userId}:${dateStr}`)) {
-          skipped.push({ user_id: userId, user_name: userName, date: dateStr, reason: 'already_assigned' });
-          continue;
-        }
+      // Leave / off-day warnings (don't block — HR may be overriding)
+      const onLeave = approvedLeave.some(l =>
+        l.user_id === a.user_id &&
+        new Date(l.start_date) <= assignDate &&
+        new Date(l.end_date)   >= assignDate
+      );
+      const weekday = assignDate.getUTCDay(); // UTC-anchored date → use getUTCDay (see single-assign route above)
+      const offDay  = Array.isArray(shift.active_days) && shift.active_days.length > 0 && !shift.active_days.includes(weekday);
+      if (onLeave) warnings.push({ ...row, type: 'leave_overlap' });
+      if (offDay)  warnings.push({ ...row, type: 'off_day' });
 
-        // Leave warning (don't block — HR may be overriding)
-        const onLeave = approvedLeave.some(l =>
-          l.user_id === userId &&
-          new Date(l.start_date) <= assignDate &&
-          new Date(l.end_date)   >= assignDate
-        );
-        const weekday = assignDate.getUTCDay(); // UTC-anchored date → use getUTCDay (see single-assign route above)
-        const offDay  = Array.isArray(shift.active_days) && shift.active_days.length > 0 && !shift.active_days.includes(weekday);
-
-        await prisma.shiftAssignment.create({ data: { shift_id, user_id: userId, date: assignDate } });
-        created.push({ user_id: userId, user_name: userName, date: dateStr });
-
-        if (onLeave) warnings.push({ user_id: userId, user_name: userName, date: dateStr, type: 'leave_overlap' });
-        if (offDay)  warnings.push({ user_id: userId, user_name: userName, date: dateStr, type: 'off_day' });
-      }
+      creatable.push({ row, assignDate });
     }
 
-    ok(res, { created: created.length, skipped: skipped.length, warnings: warnings.length, details: { created, skipped, warnings } }, 201);
+    if (!dry_run && creatable.length > 0) {
+      await prisma.shiftAssignment.createMany({
+        data: creatable.map(c => ({ shift_id: c.row.shift_id, user_id: c.row.user_id, date: c.assignDate })),
+      });
+    }
+
+    ok(res, {
+      dry_run: !!dry_run,
+      created: dry_run ? 0 : creatable.length,
+      would_create: creatable.length,
+      conflicts,
+      warnings,
+      details: { created: dry_run ? [] : creatable.map(c => c.row) },
+    }, dry_run ? 200 : 201);
   } catch (e) { next(e); }
 });
 
