@@ -20,6 +20,7 @@ import departmentsRouter from './routes/departments';
 import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './routes/misc';
 import holidaysRouter from './routes/holidays';
 import correctionsRouter from './routes/corrections';
+import expensesRouter from './routes/expenses';
 import orgRbacRouter from './routes/org-rbac';
 import webhooksRouter from './routes/webhooks';
 import adminRouter         from './routes/admin';
@@ -122,6 +123,7 @@ const MOUNTS: Array<[string, express.Router]> = [
   [`${API}/leave`,           leaveRouter],
   [`${API}/shifts`,          shiftsRouter],
   [`${API}/payroll`,         payrollRouter],
+  [`${API}/expenses`,        expensesRouter],
   [`${API}/performance`,     performanceRouter],
   [`${API}/analytics`,       analyticsRouter],
   [`${API}/org/departments`, departmentsRouter],

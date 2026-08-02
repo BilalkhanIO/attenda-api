@@ -278,6 +278,25 @@ export const correctionReviewSchema = z.object({
   note: z.string().trim().max(1000).optional(),
 }).passthrough();
 
+// ─── Expense claims ───────────────────────────────────
+export const expenseClaimSchema = z.object({
+  amount: z.coerce.number().positive('amount must be greater than 0'),
+  currency: z.string().trim().min(1).max(10).optional(), // defaults to org currency
+  category: z.string().trim().min(1).max(50),
+  description: z.string().trim().min(5).max(1000),
+  expense_date: dateStr,
+  receipt_url: z.string().url().max(1000).optional(),
+}).passthrough();
+
+export const expenseReviewSchema = z.object({
+  note: z.string().trim().max(1000).optional(),
+}).passthrough();
+
+export const expenseReimburseSchema = z.object({
+  month: z.coerce.number().int().min(1).max(12),
+  year: z.coerce.number().int().min(2000).max(2100),
+}).passthrough();
+
 // ─── Holidays ─────────────────────────────────────────
 export const holidaySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
