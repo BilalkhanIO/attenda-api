@@ -31,6 +31,7 @@ const MANAGER_PERMS = [
   'analytics.view',
   'remote.approve',
   'expenses.view',
+  'documents.view_team',
 ];
 
 const HR_ADMIN_PERMS = [
@@ -54,6 +55,7 @@ const HR_ADMIN_PERMS = [
   'analytics.advanced',
   'overtime.manage',
   'expenses.manage',
+  'documents.manage',
   'whatsapp.test',
   'whatsapp.logs.view',
   'org.settings.view',

@@ -84,6 +84,9 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   // Expenses
   { key: 'expenses.view', module: 'expenses', description: 'View team expense claims' },
   { key: 'expenses.manage', module: 'expenses', description: 'Approve and reimburse expense claims' },
+  // Documents
+  { key: 'documents.view_team', module: 'documents', description: 'View team member documents' },
+  { key: 'documents.manage', module: 'documents', description: 'Upload and manage employee documents' },
   // Platform (cross-tenant)
   { key: 'platform.orgs.view', module: 'platform', description: 'View organisations' },
   { key: 'platform.orgs.manage', module: 'platform', description: 'Manage organisation subscriptions' },

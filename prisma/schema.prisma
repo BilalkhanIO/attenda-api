@@ -67,6 +67,7 @@ model Organisation {
   holidays              OrgHoliday[]
   expense_claims        ExpenseClaim[]
   outbound_webhooks     OrgWebhook[]
+  employee_documents    EmployeeDocument[]
 
   @@map("organisations")
 }
@@ -121,6 +122,8 @@ model User {
   corrections_reviewed    AttendanceCorrection[] @relation("CorrectionReviewer")
   expense_claims          ExpenseClaim[]         @relation("ExpenseClaimant")
   expenses_reviewed       ExpenseClaim[]         @relation("ExpenseReviewer")
+  documents               EmployeeDocument[]     @relation("DocumentOwner")
+  documents_uploaded      EmployeeDocument[]     @relation("DocumentUploader")
   leave_requests          LeaveRequest[]
   leave_balances          LeaveBalance[]
   reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
@@ -583,6 +586,32 @@ model ExpenseClaim {
 
   @@index([org_id, status])
   @@map("expense_claims")
+}
+
+// Employee document vault: HR/self-uploaded files (contracts, IDs, visas,
+// certificates) stored in S3 under documents/<org>/<user>/. Rows are
+// soft-deleted (deleted_at) so the audit trail keeps pointing at real data.
+model EmployeeDocument {
+  id          String    @id @default(uuid())
+  user_id     String
+  org_id      String
+  title       String    @db.VarChar(200)
+  category    String    @db.VarChar(50) // contract | id | visa | certificate | other
+  file_key    String
+  file_name   String
+  file_size   Int
+  mime_type   String    @db.VarChar(100)
+  expires_at  DateTime? @db.Date
+  uploaded_by String
+  created_at  DateTime  @default(now())
+  deleted_at  DateTime?
+
+  owner    User         @relation("DocumentOwner", fields: [user_id], references: [id])
+  uploader User         @relation("DocumentUploader", fields: [uploaded_by], references: [id])
+  org      Organisation @relation(fields: [org_id], references: [id])
+
+  @@index([org_id, user_id])
+  @@map("employee_documents")
 }
 
 model OvertimeRule {
