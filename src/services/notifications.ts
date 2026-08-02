@@ -69,7 +69,8 @@ export type NotifType =
   | 'account_locked'
   | 'document_added' | 'document_expiring'
   | 'onboarding_assigned' | 'onboarding_complete'
-  | 'kudos_received';
+  | 'kudos_received'
+  | 'announcement';
 
 export interface NotifPayload {
   userId:      string;

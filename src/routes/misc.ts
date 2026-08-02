@@ -666,8 +666,10 @@ const ORG_SETTINGS_SELECT = {
   industry: true, registration_number: true, created_at: true,
 } as const;
 
-// GET /org/settings
-orgRouter.get('/settings', async (req, res, next) => {
+// GET /org/settings — gated on org.settings.view, matching the web nav
+// (the Settings page is only shown to holders of this key; the TrialBanner
+// swallow-errors on 403 by design).
+orgRouter.get('/settings', requirePermission('org.settings.view'), async (req, res, next) => {
   try {
     const org = await prisma.organisation.findUnique({
       where: { id: req.user!.org_id },

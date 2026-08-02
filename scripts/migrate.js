@@ -536,6 +536,8 @@ Schedule a demo or start your free trial to see Attenda's shift management in ac
       ['platform.plans.manage', 'Manage plan definitions'],
       ['platform.blog.manage',  'Manage blog posts'],
       ['platform.users.manage', 'Manage platform admin users'],
+      ['platform.audit.view',   'View platform admin activity logs'],
+      ['platform.broadcast.send', 'Broadcast announcements to organisations'],
     ];
     for (const [key, description] of platformPerms) {
       await client.query(

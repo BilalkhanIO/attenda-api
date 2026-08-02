@@ -98,6 +98,8 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'platform.plans.manage', module: 'platform', description: 'Manage plan definitions' },
   { key: 'platform.blog.manage', module: 'platform', description: 'Manage blog posts' },
   { key: 'platform.users.manage', module: 'platform', description: 'Manage platform admin users' },
+  { key: 'platform.audit.view', module: 'platform', description: 'View platform admin activity logs' },
+  { key: 'platform.broadcast.send', module: 'platform', description: 'Broadcast announcements to organisations' },
 ];
 
 const allKeys = () => PERMISSION_CATALOG.map(p => p.key);
