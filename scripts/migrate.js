@@ -178,6 +178,7 @@ async function run() {
       'prisma/migrations/20260620000000_departments_user_org_details/migration.sql',
       'prisma/migrations/20260621000000_heartbeat_grace/migration.sql',
       'prisma/migrations/20260622000000_refresh_token_rotation/migration.sql',
+      'prisma/migrations/20260622000000_wa_log_error/migration.sql',
       'prisma/migrations/20260623000000_audit_logs/migration.sql',
       'prisma/migrations/20260624000000_fcm_presence_challenge/migration.sql',
       'prisma/migrations/20260625000000_leave_accrual/migration.sql',
