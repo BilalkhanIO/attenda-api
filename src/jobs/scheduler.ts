@@ -758,6 +758,17 @@ export function startLatePatternScanJob() {
   console.log('⏰ Late pattern scan job started (daily, 02:30 UTC)');
 }
 
+// ─── Job: Document Expiry Scan ────────────────────────
+// Daily: employee documents expiring in exactly 30 or 7 days notify the
+// owner + uploader (deduped via the notifications table).
+export function startDocumentExpiryScan() {
+  scheduledJob('startDocumentExpiryScan', '0 3 * * *', async () => {
+    const { runDocumentExpiryScan } = await import('../services/documents');
+    await runDocumentExpiryScan();
+  });
+  console.log('📄 Document expiry scan started (daily, 03:00 UTC)');
+}
+
 export function startLeaveAccrualJob() {
   scheduledJob('startLeaveAccrualJob', '0 2 1 * *', async () => {
     const { runMonthlyAccrual } = await import('../services/leaveAccrual');
@@ -770,6 +781,7 @@ export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
   startLeaveAccrualJob();
   startLatePatternScanJob();
+  startDocumentExpiryScan();
   startLateArrivalDetector();
   startAbsentDetector();
   startHeartbeatExpiryMonitor();
