@@ -65,6 +65,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'org.qr.manage', module: 'org', description: 'Manage check-in QR codes' },
   { key: 'org.departments.manage', module: 'org', description: 'Manage departments and sub-departments' },
   { key: 'org.roles.manage', module: 'org', description: 'Manage custom org roles' },
+  { key: 'org.announcements.send', module: 'org', description: 'Send org announcements and view read receipts' },
   { key: 'org.permissions.grant', module: 'org', description: 'Grant per-user permission overrides' },
   // Analytics & reports
   { key: 'analytics.view', module: 'analytics', description: 'View analytics dashboards' },

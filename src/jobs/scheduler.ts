@@ -769,6 +769,16 @@ export function startDocumentExpiryScan() {
   console.log('📄 Document expiry scan started (daily, 03:00 UTC)');
 }
 
+// ─── Job: Announcement Publisher ──────────────────────
+// Every 5 minutes: fan out scheduled announcements whose time has come.
+export function startAnnouncementPublisher() {
+  scheduledJob('startAnnouncementPublisher', '*/5 * * * *', async () => {
+    const { publishDueAnnouncements } = await import('../services/announcements');
+    await publishDueAnnouncements();
+  });
+  console.log('📣 Announcement publisher started (every 5 min)');
+}
+
 export function startLeaveAccrualJob() {
   scheduledJob('startLeaveAccrualJob', '0 2 1 * *', async () => {
     const { runMonthlyAccrual } = await import('../services/leaveAccrual');
@@ -782,6 +792,7 @@ export function startAllJobs() {
   startLeaveAccrualJob();
   startLatePatternScanJob();
   startDocumentExpiryScan();
+  startAnnouncementPublisher();
   startLateArrivalDetector();
   startAbsentDetector();
   startHeartbeatExpiryMonitor();

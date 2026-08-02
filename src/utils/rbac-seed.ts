@@ -61,6 +61,9 @@ const HR_ADMIN_PERMS = [
   'org.settings.view',
   'org.qr.manage',
   'org.departments.manage',
+  // The announcements endpoint always required this key, but it was never in
+  // the catalog/seeds — without it no role could send announcements at all.
+  'org.announcements.send',
 ];
 
 const SUPER_ADMIN_PERMS = [

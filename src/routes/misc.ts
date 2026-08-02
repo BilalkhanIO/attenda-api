@@ -6,35 +6,84 @@ import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
 import { Prisma } from '@prisma/client';
 import { validate } from '../middleware/validate';
-import { orgSettingsSchema } from '../schemas';
+import { orgSettingsSchema, announcementSchema } from '../schemas';
+import { isScheduledForLater, publishAnnouncement } from '../services/announcements';
 
 // ─── PERFORMANCE ──────────────────────────────────────
 export const performanceRouter = Router();
 performanceRouter.use(authenticate);
 
 // ─── ANNOUNCEMENTS ────────────────────────────────────
-performanceRouter.post('/announcements', requirePermission('org.announcements.send'), async (req, res, next) => {
+// Persisted announcements with optional publish scheduling (scheduled_for)
+// and department targeting (department_id; target_dept_id is the legacy
+// alias). Unscheduled org-wide announcements behave exactly as before:
+// immediate in-app notification fan-out, response keeps {count, message}.
+performanceRouter.post('/announcements', requirePermission('org.announcements.send'), validate({ body: announcementSchema }), async (req, res, next) => {
   try {
-    const { title, body, target_dept_id } = req.body;
-    if (!title?.trim() || !body?.trim()) throw new ValidationError('title and body are required');
-
+    const { title, body, department_id, target_dept_id, scheduled_for } = req.body;
     const orgId = req.user!.org_id;
-    const where: any = { org_id: orgId, is_active: true, deleted_at: null };
-    if (target_dept_id) where.department_id = String(target_dept_id);
 
-    const users = await prisma.user.findMany({ where, select: { id: true } });
-    
-    await prisma.inAppNotification.createMany({
-      data: users.map(u => ({
-        user_id: u.id,
+    const deptId = department_id ?? target_dept_id ?? null;
+    if (deptId) {
+      const dept = await prisma.department.findFirst({
+        where: { id: String(deptId), org_id: orgId },
+        select: { id: true },
+      });
+      if (!dept) throw new NotFoundError('Department');
+    }
+
+    let scheduledFor: Date | null = null;
+    if (scheduled_for) {
+      scheduledFor = new Date(scheduled_for);
+      if (isNaN(scheduledFor.getTime())) throw new ValidationError('Invalid scheduled_for');
+    }
+
+    const announcement = await prisma.announcement.create({
+      data: {
         org_id: orgId,
-        type: 'announcement',
-        title: title.trim(),
-        body: body.trim(),
-      }))
+        title, body,
+        department_id: deptId ? String(deptId) : null,
+        scheduled_for: scheduledFor,
+        created_by: req.user!.sub,
+      },
     });
 
-    ok(res, { count: users.length, message: 'Announcement sent' });
+    if (isScheduledForLater(scheduledFor, new Date())) {
+      return ok(res, { announcement, count: 0, message: 'Announcement scheduled' });
+    }
+
+    const count = await publishAnnouncement(announcement);
+    const published = await prisma.announcement.findUnique({ where: { id: announcement.id } });
+    ok(res, { announcement: published ?? announcement, count, message: 'Announcement sent' });
+  } catch (e) { next(e); }
+});
+
+// GET /performance/announcements — published announcements targeted at the
+// caller (org-wide + their department), each with my_read_at.
+performanceRouter.get('/announcements', async (req, res, next) => {
+  try {
+    const me = await prisma.user.findUnique({
+      where: { id: req.user!.sub },
+      select: { department_id: true },
+    });
+
+    const audience: Array<Record<string, unknown>> = [{ department_id: null }];
+    if (me?.department_id) audience.push({ department_id: me.department_id });
+
+    const announcements = await prisma.announcement.findMany({
+      where: { org_id: req.user!.org_id, published_at: { not: null }, OR: audience },
+      include: {
+        author:   { select: { id: true, name: true, avatar_url: true } },
+        receipts: { where: { user_id: req.user!.sub }, select: { read_at: true } },
+      },
+      orderBy: { published_at: 'desc' },
+      take: 50,
+    });
+
+    ok(res, announcements.map(({ receipts, ...a }) => ({
+      ...a,
+      my_read_at: receipts[0]?.read_at ?? null,
+    })));
   } catch (e) { next(e); }
 });
 

@@ -342,6 +342,15 @@ export const orgWebhookSchema = z.object({
   events: z.array(z.enum(WEBHOOK_EVENT_TYPES)).min(1),
 }).passthrough();
 
+// ─── Announcements ────────────────────────────────────
+export const announcementSchema = z.object({
+  title: z.string().trim().min(1, 'title is required').max(255),
+  body: z.string().trim().min(1, 'body is required').max(5000),
+  department_id: z.string().min(1).nullish(),   // null/omitted ⇒ org-wide
+  target_dept_id: z.string().min(1).nullish(),  // legacy alias for department_id
+  scheduled_for: z.string().datetime({ offset: true }).nullish(), // omitted ⇒ publish now
+}).passthrough();
+
 // ─── Org settings / departments ───────────────────────
 export const orgSettingsSchema = z.object({
   name: z.string().trim().min(1).max(255).optional(),

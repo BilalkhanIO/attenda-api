@@ -68,6 +68,7 @@ model Organisation {
   expense_claims        ExpenseClaim[]
   outbound_webhooks     OrgWebhook[]
   employee_documents    EmployeeDocument[]
+  announcements         Announcement[]
 
   @@map("organisations")
 }
@@ -124,6 +125,8 @@ model User {
   expenses_reviewed       ExpenseClaim[]         @relation("ExpenseReviewer")
   documents               EmployeeDocument[]     @relation("DocumentOwner")
   documents_uploaded      EmployeeDocument[]     @relation("DocumentUploader")
+  announcements_authored  Announcement[]         @relation("AnnouncementAuthor")
+  announcement_receipts   AnnouncementReceipt[]
   leave_requests          LeaveRequest[]
   leave_balances          LeaveBalance[]
   reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
@@ -214,9 +217,10 @@ model Department {
   created_at DateTime @default(now())
 
   org      Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
-  parent   Department?  @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: Cascade)
-  children Department[] @relation("DepartmentParent")
-  users    User[]
+  parent        Department?    @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: Cascade)
+  children      Department[]   @relation("DepartmentParent")
+  users         User[]
+  announcements Announcement[]
 
   @@unique([org_id, name, parent_id])
   @@index([org_id])
@@ -730,6 +734,43 @@ model LateArrivalNotice {
 
   @@unique([user_id, date])
   @@map("late_arrival_notices")
+}
+
+// Announcements 2.0: persisted announcements (previously a pure notification
+// fan-out) with optional publish scheduling and department targeting.
+// published_at null ⇒ waiting for the 5-min publisher job.
+model Announcement {
+  id            String    @id @default(uuid())
+  org_id        String
+  title         String    @db.VarChar(255)
+  body          String    @db.Text
+  department_id String?   // null ⇒ org-wide
+  scheduled_for DateTime? // null ⇒ published immediately on create
+  published_at  DateTime?
+  created_by    String
+  created_at    DateTime  @default(now())
+
+  org        Organisation          @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  author     User                  @relation("AnnouncementAuthor", fields: [created_by], references: [id])
+  department Department?           @relation(fields: [department_id], references: [id], onDelete: SetNull)
+  receipts   AnnouncementReceipt[]
+
+  @@index([org_id, published_at])
+  @@map("announcements")
+}
+
+// Read receipts: one row per (announcement, reader), upserted idempotently.
+model AnnouncementReceipt {
+  id              String   @id @default(uuid())
+  announcement_id String
+  user_id         String
+  read_at         DateTime @default(now())
+
+  announcement Announcement @relation(fields: [announcement_id], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([announcement_id, user_id])
+  @@map("announcement_receipts")
 }
 
 model PlanDefinition {
