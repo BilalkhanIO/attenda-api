@@ -142,3 +142,25 @@ Remaining UI work (next agents):
 - **API follow-ups** (small): receipt upload presign route reusing
   services/s3.ts; optional Redis pub/sub upgrade of the org bus would give
   multi-instance webhook fanout for free.
+
+## Delivery status (2026-08-02) — Document vault + Announcements 2.0
+
+- **Employee document vault** shipped on the API (91bb572, 3e8bdc5, 0cd9471):
+  `EmployeeDocument` model + `documents.view_team`/`documents.manage` RBAC,
+  `/api/v1/documents` router (presigned S3 PUT upload-url → register →
+  me/user lists without file_key → 15-min presigned GET download → soft
+  delete, all audited, `document_added` notification), and the daily
+  03:00 UTC `startDocumentExpiryScan` job (`document_expiring` to owner +
+  uploader at exactly 30/7 days, notification-table dedupe). UI next: web
+  HR documents tab per employee + self-service "My documents"; mobile
+  profile documents list + upload.
+- **Announcements 2.0** shipped on the API (02fcd99 + receipts commit):
+  persisted `Announcement` model with `scheduled_for` (published by the
+  5-min `startAnnouncementPublisher` job) and `department_id` targeting,
+  `AnnouncementReceipt` read receipts. Endpoints under `/api/v1/performance`:
+  POST `/announcements` (back-compatible), GET `/announcements` (employee
+  list with `my_read_at`), POST `/announcements/:id/read`, GET
+  `/announcements/:id/receipts` (sender stats). Also fixed: the
+  `org.announcements.send` key was never seeded — now in catalog +
+  hr_admin/super_admin. UI next: compose dialog gains schedule + department
+  pickers and a receipts drawer; clients post the read receipt on open.

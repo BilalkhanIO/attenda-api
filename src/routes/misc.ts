@@ -7,7 +7,7 @@ import prisma from '../utils/prisma';
 import { Prisma } from '@prisma/client';
 import { validate } from '../middleware/validate';
 import { orgSettingsSchema, announcementSchema } from '../schemas';
-import { isScheduledForLater, publishAnnouncement } from '../services/announcements';
+import { isScheduledForLater, publishAnnouncement, announcementAudienceWhere } from '../services/announcements';
 
 // ─── PERFORMANCE ──────────────────────────────────────
 export const performanceRouter = Router();
@@ -84,6 +84,61 @@ performanceRouter.get('/announcements', async (req, res, next) => {
       ...a,
       my_read_at: receipts[0]?.read_at ?? null,
     })));
+  } catch (e) { next(e); }
+});
+
+// POST /performance/announcements/:id/read — the reader's receipt.
+// Idempotent: re-reading keeps the original read_at.
+performanceRouter.post('/announcements/:id/read', async (req, res, next) => {
+  try {
+    const announcement = await prisma.announcement.findFirst({
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
+      select: { id: true, published_at: true },
+    });
+    if (!announcement) throw new NotFoundError('Announcement');
+    if (!announcement.published_at) {
+      throw new AppError('Announcement is not published yet', 400, 'NOT_PUBLISHED');
+    }
+
+    const receipt = await prisma.announcementReceipt.upsert({
+      where: {
+        announcement_id_user_id: {
+          announcement_id: announcement.id,
+          user_id: req.user!.sub,
+        },
+      },
+      update: {},
+      create: { announcement_id: announcement.id, user_id: req.user!.sub },
+    });
+    ok(res, receipt);
+  } catch (e) { next(e); }
+});
+
+// GET /performance/announcements/:id/receipts — sender-side read stats.
+performanceRouter.get('/announcements/:id/receipts', requirePermission('org.announcements.send'), async (req, res, next) => {
+  try {
+    const announcement = await prisma.announcement.findFirst({
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
+    });
+    if (!announcement) throw new NotFoundError('Announcement');
+
+    const [receipts, audienceCount] = await Promise.all([
+      prisma.announcementReceipt.findMany({
+        where: { announcement_id: announcement.id },
+        include: { user: { select: { id: true, name: true, avatar_url: true, department: true } } },
+        orderBy: { read_at: 'desc' },
+      }),
+      prisma.user.count({
+        where: announcementAudienceWhere(req.user!.org_id, announcement.department_id) as never,
+      }),
+    ]);
+
+    ok(res, {
+      announcement,
+      read_count: receipts.length,
+      audience_count: audienceCount,
+      readers: receipts.map(r => ({ ...r.user, read_at: r.read_at })),
+    });
   } catch (e) { next(e); }
 });
 
