@@ -210,8 +210,20 @@ router.post('/:id/reimburse', requirePermission('expenses.manage'), validate({ b
 
     const org = await prisma.organisation.findUnique({
       where: { id: record.org_id },
-      select: { tax_rate: true, pension_rate: true },
+      select: { tax_rate: true, pension_rate: true, currency: true },
     });
+
+    // Payroll is denominated in the org currency — a claim in another
+    // currency cannot be added at face value. FX conversion is future work;
+    // until then reject the mismatch instead of paying the wrong amount.
+    const orgCurrency = org?.currency || 'USD';
+    if (claim.currency !== orgCurrency) {
+      throw new AppError(
+        `Claim is in ${claim.currency} but payroll is in ${orgCurrency} — convert the claim to ${orgCurrency} (currency conversion is not yet supported)`,
+        400, 'CURRENCY_MISMATCH',
+      );
+    }
+
     const totals = recalcPayrollTotals({
       regular_hours:     Number(record.regular_hours),
       overtime_hours:    Number(record.overtime_hours),
@@ -220,23 +232,27 @@ router.post('/:id/reimburse', requirePermission('expenses.manage'), validate({ b
       manual_adjustment: newAdjustment,
     }, Number(org?.tax_rate) || 0, Number(org?.pension_rate) || 0);
 
-    const updatedRecord = await prisma.payrollRecord.update({
-      where: { id: record.id },
-      data: {
-        manual_adjustment: newAdjustment,
-        adjustment_reason: reason,
-        gross_pay:         totals.gross_pay,
-        tax_deduction:     totals.tax_deduction,
-        pension_deduction: totals.pension_deduction,
-        net_pay:           totals.net_pay,
-      },
-    });
-
-    const updatedClaim = await prisma.expenseClaim.update({
-      where: { id: claim.id },
-      data: { status: 'reimbursed', reimbursed_in_payroll_id: record.id },
-      include: EXPENSE_INCLUDE,
-    });
+    // Atomic: pay bump + claim status must commit together — a crash between
+    // the two would leave pay increased with the claim still 'approved'
+    // (double-reimbursable) or vice versa.
+    const [updatedRecord, updatedClaim] = await prisma.$transaction([
+      prisma.payrollRecord.update({
+        where: { id: record.id },
+        data: {
+          manual_adjustment: newAdjustment,
+          adjustment_reason: reason,
+          gross_pay:         totals.gross_pay,
+          tax_deduction:     totals.tax_deduction,
+          pension_deduction: totals.pension_deduction,
+          net_pay:           totals.net_pay,
+        },
+      }),
+      prisma.expenseClaim.update({
+        where: { id: claim.id },
+        data: { status: 'reimbursed', reimbursed_in_payroll_id: record.id },
+        include: EXPENSE_INCLUDE,
+      }),
+    ]);
 
     recordAudit({
       orgId: req.user!.org_id, actorId: req.user!.sub,
