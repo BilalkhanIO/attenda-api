@@ -1,38 +1,144 @@
-// @ts-nocheck
 import { Router } from 'express';
 import { authenticate, requireOrgFeature, requirePermission } from '../middleware/auth';
 import { resolveUserPermissions } from '../services/authorization';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
+import { Prisma } from '@prisma/client';
+import { validate } from '../middleware/validate';
+import { orgSettingsSchema, announcementSchema } from '../schemas';
+import { isScheduledForLater, publishAnnouncement, announcementAudienceWhere } from '../services/announcements';
 
 // ─── PERFORMANCE ──────────────────────────────────────
 export const performanceRouter = Router();
 performanceRouter.use(authenticate);
 
 // ─── ANNOUNCEMENTS ────────────────────────────────────
-performanceRouter.post('/announcements', requirePermission('org.announcements.send'), async (req, res, next) => {
+// Persisted announcements with optional publish scheduling (scheduled_for)
+// and department targeting (department_id; target_dept_id is the legacy
+// alias). Unscheduled org-wide announcements behave exactly as before:
+// immediate in-app notification fan-out, response keeps {count, message}.
+performanceRouter.post('/announcements', requirePermission('org.announcements.send'), validate({ body: announcementSchema }), async (req, res, next) => {
   try {
-    const { title, body, target_dept_id } = req.body;
-    if (!title?.trim() || !body?.trim()) throw new ValidationError('title and body are required');
-
+    const { title, body, department_id, target_dept_id, scheduled_for } = req.body;
     const orgId = req.user!.org_id;
-    const where: any = { org_id: orgId, is_active: true, deleted_at: null };
-    if (target_dept_id) where.department_id = String(target_dept_id);
 
-    const users = await prisma.user.findMany({ where, select: { id: true } });
-    
-    await prisma.inAppNotification.createMany({
-      data: users.map(u => ({
-        user_id: u.id,
+    const deptId = department_id ?? target_dept_id ?? null;
+    if (deptId) {
+      const dept = await prisma.department.findFirst({
+        where: { id: String(deptId), org_id: orgId },
+        select: { id: true },
+      });
+      if (!dept) throw new NotFoundError('Department');
+    }
+
+    let scheduledFor: Date | null = null;
+    if (scheduled_for) {
+      scheduledFor = new Date(scheduled_for);
+      if (isNaN(scheduledFor.getTime())) throw new ValidationError('Invalid scheduled_for');
+    }
+
+    const announcement = await prisma.announcement.create({
+      data: {
         org_id: orgId,
-        type: 'announcement',
-        title: title.trim(),
-        body: body.trim(),
-      }))
+        title, body,
+        department_id: deptId ? String(deptId) : null,
+        scheduled_for: scheduledFor,
+        created_by: req.user!.sub,
+      },
     });
 
-    ok(res, { count: users.length, message: 'Announcement sent' });
+    if (isScheduledForLater(scheduledFor, new Date())) {
+      return ok(res, { announcement, count: 0, message: 'Announcement scheduled' });
+    }
+
+    const count = await publishAnnouncement(announcement);
+    const published = await prisma.announcement.findUnique({ where: { id: announcement.id } });
+    ok(res, { announcement: published ?? announcement, count, message: 'Announcement sent' });
+  } catch (e) { next(e); }
+});
+
+// GET /performance/announcements — published announcements targeted at the
+// caller (org-wide + their department), each with my_read_at.
+performanceRouter.get('/announcements', async (req, res, next) => {
+  try {
+    const me = await prisma.user.findUnique({
+      where: { id: req.user!.sub },
+      select: { department_id: true },
+    });
+
+    const audience: Array<Record<string, unknown>> = [{ department_id: null }];
+    if (me?.department_id) audience.push({ department_id: me.department_id });
+
+    const announcements = await prisma.announcement.findMany({
+      where: { org_id: req.user!.org_id, published_at: { not: null }, OR: audience },
+      include: {
+        author:   { select: { id: true, name: true, avatar_url: true } },
+        receipts: { where: { user_id: req.user!.sub }, select: { read_at: true } },
+      },
+      orderBy: { published_at: 'desc' },
+      take: 50,
+    });
+
+    ok(res, announcements.map(({ receipts, ...a }) => ({
+      ...a,
+      my_read_at: receipts[0]?.read_at ?? null,
+    })));
+  } catch (e) { next(e); }
+});
+
+// POST /performance/announcements/:id/read — the reader's receipt.
+// Idempotent: re-reading keeps the original read_at.
+performanceRouter.post('/announcements/:id/read', async (req, res, next) => {
+  try {
+    const announcement = await prisma.announcement.findFirst({
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
+      select: { id: true, published_at: true },
+    });
+    if (!announcement) throw new NotFoundError('Announcement');
+    if (!announcement.published_at) {
+      throw new AppError('Announcement is not published yet', 400, 'NOT_PUBLISHED');
+    }
+
+    const receipt = await prisma.announcementReceipt.upsert({
+      where: {
+        announcement_id_user_id: {
+          announcement_id: announcement.id,
+          user_id: req.user!.sub,
+        },
+      },
+      update: {},
+      create: { announcement_id: announcement.id, user_id: req.user!.sub },
+    });
+    ok(res, receipt);
+  } catch (e) { next(e); }
+});
+
+// GET /performance/announcements/:id/receipts — sender-side read stats.
+performanceRouter.get('/announcements/:id/receipts', requirePermission('org.announcements.send'), async (req, res, next) => {
+  try {
+    const announcement = await prisma.announcement.findFirst({
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
+    });
+    if (!announcement) throw new NotFoundError('Announcement');
+
+    const [receipts, audienceCount] = await Promise.all([
+      prisma.announcementReceipt.findMany({
+        where: { announcement_id: announcement.id },
+        include: { user: { select: { id: true, name: true, avatar_url: true, department: true } } },
+        orderBy: { read_at: 'desc' },
+      }),
+      prisma.user.count({
+        where: announcementAudienceWhere(req.user!.org_id, announcement.department_id) as never,
+      }),
+    ]);
+
+    ok(res, {
+      announcement,
+      read_count: receipts.length,
+      audience_count: audienceCount,
+      readers: receipts.map(r => ({ ...r.user, read_at: r.read_at })),
+    });
   } catch (e) { next(e); }
 });
 
@@ -122,12 +228,12 @@ performanceRouter.post('/reviews/:userId', requirePermission('performance.manage
     }
     if (!m || !y || m < 1 || m > 12) throw new ValidationError('Invalid month/year format. Use MM-YYYY');
     const review = await prisma.performanceReview.findFirst({
-      where: { user_id: req.params.userId, period_month: m, period_year: y, org_id: req.user!.org_id },
+      where: { user_id: String(req.params.userId), period_month: m, period_year: y, org_id: req.user!.org_id },
     });
     if (!review) throw new NotFoundError('Review');
     if (review.submitted_at) throw new AppError('Review already submitted and locked', 400);
 
-    const attendanceScore = await calcAttendanceScore(req.params.userId, m, y);
+    const attendanceScore = await calcAttendanceScore(String(req.params.userId), m, y);
     const overallScore    = score * 20; // star 1-5 -> score 20-100
 
     const updated = await prisma.performanceReview.update({
@@ -191,6 +297,15 @@ performanceRouter.post('/goals', requirePermission('performance.manage'), async 
   try {
     const { user_id, review_id, title, description, weight, target_date } = req.body;
     if (!user_id || !review_id || !title || !weight) throw new ValidationError('Missing required fields');
+
+    // Target user and review must both belong to the caller's org
+    const [targetUser, review] = await Promise.all([
+      prisma.user.findFirst({ where: { id: user_id, org_id: req.user!.org_id }, select: { id: true } }),
+      prisma.performanceReview.findFirst({ where: { id: review_id, org_id: req.user!.org_id }, select: { id: true } }),
+    ]);
+    if (!targetUser) throw new NotFoundError('User');
+    if (!review)     throw new NotFoundError('Performance review');
+
     const goal = await prisma.performanceGoal.create({
       data: { user_id, review_id, title, description, weight, target_date: target_date ? new Date(target_date) : null },
       include: { user: { select: { id: true, name: true, department: true } } },
@@ -220,7 +335,15 @@ performanceRouter.put('/goals/:id', requirePermission('performance.manage'), asy
     if (weight      !== undefined) data.weight      = weight;
     if (completion  !== undefined) data.completion  = completion;
     if (target_date !== undefined) data.target_date = target_date ? new Date(target_date) : null;
-    const goal = await prisma.performanceGoal.update({ where: { id: req.params.id }, data });
+
+    // Org scoping: the goal's subject must belong to the caller's org
+    const existing = await prisma.performanceGoal.findFirst({
+      where: { id: String(req.params.id), user: { org_id: req.user!.org_id } },
+      select: { id: true },
+    });
+    if (!existing) throw new NotFoundError('Goal');
+
+    const goal = await prisma.performanceGoal.update({ where: { id: existing.id }, data });
     ok(res, goal);
   } catch (e) { next(e); }
 });
@@ -231,8 +354,8 @@ performanceRouter.get('/reviews/:userId/insights', requirePermission('performanc
     const apiKey = process.env.ANTHROPIC_API_KEY;
     if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
 
-    const user = await prisma.user.findUnique({
-      where: { id: req.params.userId },
+    const user = await prisma.user.findFirst({
+      where: { id: String(req.params.userId), org_id: req.user!.org_id },
       select: { id: true, name: true, department: true, job_title: true },
     });
     if (!user) throw new NotFoundError('User');
@@ -525,17 +648,40 @@ analyticsRouter.post('/chat', async (req, res, next) => {
 export const orgRouter = Router();
 orgRouter.use(authenticate);
 
-// GET /org/settings
-orgRouter.get('/settings', async (req, res, next) => {
+// Explicit safe column list for org settings responses. NEVER add:
+// - wa_access_token (WhatsApp Cloud API bearer token — GET /org/whatsapp
+//   returns it redacted; returning it here undoes that)
+// - admin_notes / features_override / billing_email / contact_* /
+//   company_size (platform-admin internal columns)
+// - wa_* config (managed via the dedicated /org/whatsapp endpoints)
+// - office_ips / office_ssids (managed via the gated office-network endpoints)
+const ORG_SETTINGS_SELECT = {
+  id: true, name: true, logo_url: true, timezone: true, currency: true,
+  payroll_day: true, tax_rate: true, pension_rate: true, late_threshold: true,
+  heartbeat_grace_mins: true, gap_forgiveness_mins: true,
+  leave_accrual: true, late_policy: true,
+  plan: true, status: true, subscription_status: true,
+  trial_started_at: true, trial_ends_at: true, seats_limit: true,
+  totp_required: true, address: true, phone: true, website: true,
+  industry: true, registration_number: true, created_at: true,
+} as const;
+
+// GET /org/settings — gated on org.settings.view, matching the web nav
+// (the Settings page is only shown to holders of this key; the TrialBanner
+// swallow-errors on 403 by design).
+orgRouter.get('/settings', requirePermission('org.settings.view'), async (req, res, next) => {
   try {
-    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
+    const org = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: ORG_SETTINGS_SELECT,
+    });
     if (!org) throw new NotFoundError('Organisation');
     ok(res, org);
   } catch (e) { next(e); }
 });
 
 // PUT /org/settings
-orgRouter.put('/settings', requirePermission('org.settings.update'), async (req, res, next) => {
+orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ body: orgSettingsSchema }), async (req, res, next) => {
   try {
     const {
       name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold, totp_required,
@@ -577,17 +723,69 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), async (req,
       if (mins < 10 || mins > 120) throw new ValidationError('heartbeat_grace_mins must be between 10 and 120');
       data.heartbeat_grace_mins = mins;
     }
+    // JSON policy columns: explicit null clears the policy (DbNull), a value replaces it.
+    if (req.body.leave_accrual !== undefined) {
+      data.leave_accrual = req.body.leave_accrual === null ? Prisma.DbNull : req.body.leave_accrual;
+    }
+    if (req.body.late_policy !== undefined) {
+      data.late_policy = req.body.late_policy === null ? Prisma.DbNull : req.body.late_policy;
+    }
     if (req.body.gap_forgiveness_mins !== undefined) {
       const mins = parseInt(req.body.gap_forgiveness_mins);
       if (mins < 0 || mins > 90) throw new ValidationError('gap_forgiveness_mins must be between 0 and 90');
       data.gap_forgiveness_mins = mins;
     }
-    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
+    const updated = await prisma.organisation.update({
+      where: { id: req.user!.org_id }, data,
+      select: ORG_SETTINGS_SELECT,
+    });
     ok(res, updated);
   } catch (e) { next(e); }
 });
 
 // GET /org/audit-logs — append-only trail of pay-affecting mutations
+// ─── GET /org/whos-out ─────────────────────────────────
+// Who's away for a date range (default: today): approved leave, remote
+// sessions and public holidays in one read model. Open to all org members —
+// it powers the team calendar on both clients.
+orgRouter.get('/whos-out', async (req, res, next) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const fromStr = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.from ?? '')) ? String(req.query.from) : today;
+    const toStr = /^\d{4}-\d{2}-\d{2}$/.test(String(req.query.to ?? '')) ? String(req.query.to) : fromStr;
+    const from = new Date(`${fromStr}T00:00:00.000Z`);
+    const to = new Date(`${toStr}T00:00:00.000Z`);
+    if (to < from) throw new ValidationError('to must be on or after from');
+    if ((to.getTime() - from.getTime()) / 86_400_000 > 62) throw new ValidationError('Range cannot exceed 62 days');
+
+    const USER_SEL = { select: { id: true, name: true, avatar_url: true, department: true } };
+    const [leave, remote, holidaySet] = await Promise.all([
+      prisma.leaveRequest.findMany({
+        where: { org_id: req.user!.org_id, status: 'approved', start_date: { lte: to }, end_date: { gte: from } },
+        select: { id: true, leave_type: true, start_date: true, end_date: true, is_half_day: true, half_day_period: true, user: USER_SEL },
+        orderBy: { start_date: 'asc' },
+      }),
+      prisma.remoteSession.findMany({
+        where: {
+          status: 'approved',
+          user: { org_id: req.user!.org_id },
+          attendance: { date: { gte: from, lte: to } },
+        },
+        select: { id: true, user: USER_SEL, attendance: { select: { date: true } } },
+      }),
+      import('../services/holidays').then(m => m.holidaySetForRange(req.user!.org_id, from, to)),
+    ]);
+
+    ok(res, {
+      from: fromStr,
+      to: toStr,
+      on_leave: leave,
+      remote: remote.map(r => ({ id: r.id, user: r.user, date: r.attendance?.date ?? null })),
+      holidays: [...holidaySet].sort(),
+    });
+  } catch (e) { next(e); }
+});
+
 orgRouter.get('/audit-logs', requirePermission('org.settings.update'), async (req, res, next) => {
   try {
     const page  = Math.max(1, parseInt(String(req.query.page  ?? '1')));

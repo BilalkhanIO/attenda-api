@@ -30,6 +30,9 @@ const MANAGER_PERMS = [
   'performance.manage',
   'analytics.view',
   'remote.approve',
+  'expenses.view',
+  'documents.view_team',
+  'onboarding.view_team',
 ];
 
 const HR_ADMIN_PERMS = [
@@ -52,11 +55,17 @@ const HR_ADMIN_PERMS = [
   'reports.export',
   'analytics.advanced',
   'overtime.manage',
+  'expenses.manage',
+  'documents.manage',
+  'onboarding.manage',
   'whatsapp.test',
   'whatsapp.logs.view',
   'org.settings.view',
   'org.qr.manage',
   'org.departments.manage',
+  // The announcements endpoint always required this key, but it was never in
+  // the catalog/seeds — without it no role could send announcements at all.
+  'org.announcements.send',
 ];
 
 const SUPER_ADMIN_PERMS = [

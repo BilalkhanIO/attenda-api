@@ -2,7 +2,10 @@ import { Router } from 'express';
 import { authenticate, requirePermission, requireOrgFeature } from '../middleware/auth';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { startOfMonth, endOfMonth } from '../utils/auth';
+import { recalcPayrollTotals, computePeriodPayroll } from '../utils/payroll';
 import prisma from '../utils/prisma';
+import { validate } from '../middleware/validate';
+import { payrollPeriodSchema, payrollAdjustSchema, payrollRecallSchema } from '../schemas';
 import { recordAudit } from '../services/audit';
 
 const router = Router();
@@ -43,7 +46,7 @@ router.get('/', requirePermission('payroll.view'), async (req, res, next) => {
 });
 
 // ─── POST /payroll/generate ────────────────────────────
-router.post('/generate', requirePermission('payroll.manage'), async (req, res, next) => {
+router.post('/generate', requirePermission('payroll.manage'), validate({ body: payrollPeriodSchema }), async (req, res, next) => {
   try {
     const { month, year } = req.body;
     const m = month || new Date().getMonth() + 1;
@@ -56,25 +59,37 @@ router.post('/generate', requirePermission('payroll.manage'), async (req, res, n
       prisma.user.findMany({ where: { org_id: req.user!.org_id, is_active: true, deleted_at: null } }),
       prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { tax_rate: true, pension_rate: true } }),
     ]);
-    const taxRate     = (org?.tax_rate     ?? 0) / 100;
-    const pensionRate = (org?.pension_rate ?? 0) / 100;
+
+    // Existing records for the period: processed ones are immutable (a re-run
+    // must never silently rewrite finalized pay — recall first), and
+    // manual_adjustment MUST survive regeneration or reimbursements already
+    // applied to the record silently vanish from gross/net.
+    const existingRecords = await prisma.payrollRecord.findMany({
+      where: { org_id: req.user!.org_id, period_month: m, period_year: y },
+      select: { user_id: true, status: true, manual_adjustment: true },
+    });
+    const processedUserIds = new Set(existingRecords.filter(r => r.status === 'processed').map(r => r.user_id));
+    const manualAdjByUser  = new Map(existingRecords.map(r => [r.user_id, Number(r.manual_adjustment) || 0]));
 
     const created: string[] = [];
     const incomplete: string[] = [];
+    const skippedProcessed: string[] = [];
 
     for (const user of users) {
+      if (processedUserIds.has(user.id)) {
+        skippedProcessed.push(user.name);
+        continue;
+      }
       if (Number(user.hourly_rate) === 0) {
         incomplete.push(user.name);
       }
 
-      // Get attendance records for the month
+      // Attendance for the month, with each record's shift so overtime is
+      // paid at that shift's overtime_multiplier (fallback 1.5)
       const attendance = await prisma.attendanceRecord.findMany({
         where: { user_id: user.id, date: { gte: start, lte: end } },
+        include: { shift: { select: { overtime_multiplier: true } } },
       });
-
-      // Prefer net_hours_worked (gross minus unpaid breaks) — fall back to hours_worked for old records
-      const regularHours  = attendance.reduce((s: number, r: typeof attendance[0]) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
-      const overtimeHours = attendance.reduce((s: number, r: typeof attendance[0]) => s + Number(r.overtime_hours), 0);
 
       // Get unpaid leave days
       const unpaidLeave = await prisma.leaveRequest.findMany({
@@ -84,33 +99,36 @@ router.post('/generate', requirePermission('payroll.manage'), async (req, res, n
           start_date: { lte: end }, end_date: { gte: start },
         },
       });
-      const unpaidDays  = unpaidLeave.reduce((s: number, l: typeof unpaidLeave[0]) => s + l.working_days, 0);
-      const hourlyRate  = Number(user.hourly_rate);
-      const dailyRate   = (hourlyRate * 8);
-      const basePay     = regularHours * hourlyRate;
-      const overtimePay = overtimeHours * hourlyRate * 1.5;
-      const deduction   = unpaidDays * dailyRate;
-      const grossPay      = Math.max(0, basePay + overtimePay - deduction);
-      const taxDeduction  = grossPay * taxRate;
-      const pensionDeduct = grossPay * pensionRate;
-      const netPay        = Math.max(0, grossPay - taxDeduction - pensionDeduct);
+      const unpaidDays = unpaidLeave.reduce((s: number, l: typeof unpaidLeave[0]) => s + l.working_days, 0);
 
+      const totals = computePeriodPayroll({
+        attendance,
+        unpaid_leave_days: unpaidDays,
+        hourly_rate: Number(user.hourly_rate),
+        manual_adjustment: manualAdjByUser.get(user.id) ?? 0,
+      }, Number(org?.tax_rate) || 0, Number(org?.pension_rate) || 0);
+
+      const fields = {
+        regular_hours: totals.regular_hours, overtime_hours: totals.overtime_hours,
+        hourly_rate: Number(user.hourly_rate), base_pay: totals.base_pay,
+        overtime_pay: totals.overtime_pay, unpaid_deduction: totals.unpaid_deduction,
+        gross_pay: totals.gross_pay, tax_deduction: totals.tax_deduction,
+        pension_deduction: totals.pension_deduction, net_pay: totals.net_pay,
+        is_incomplete: Number(user.hourly_rate) === 0,
+      };
       await prisma.payrollRecord.upsert({
         where: { user_id_period_month_period_year: { user_id: user.id, period_month: m, period_year: y } },
-        update: { regular_hours: regularHours, overtime_hours: overtimeHours, hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay, unpaid_deduction: deduction, gross_pay: grossPay, tax_deduction: taxDeduction, pension_deduction: pensionDeduct, net_pay: netPay, is_incomplete: Number(user.hourly_rate) === 0 },
-        create: {
-          user_id: user.id, org_id: req.user!.org_id, period_month: m, period_year: y,
-          regular_hours: regularHours, overtime_hours: overtimeHours,
-          hourly_rate: hourlyRate, base_pay: basePay, overtime_pay: overtimePay,
-          unpaid_deduction: deduction, gross_pay: grossPay,
-          tax_deduction: taxDeduction, pension_deduction: pensionDeduct, net_pay: netPay,
-          is_incomplete: Number(user.hourly_rate) === 0,
-        },
+        update: fields,
+        create: { user_id: user.id, org_id: req.user!.org_id, period_month: m, period_year: y, ...fields },
       });
       created.push(user.name);
     }
 
-    ok(res, { generated: created.length, incomplete: incomplete.length, incomplete_users: incomplete, month: m, year: y });
+    ok(res, {
+      generated: created.length, incomplete: incomplete.length, incomplete_users: incomplete,
+      skipped_processed: skippedProcessed.length, skipped_processed_users: skippedProcessed,
+      month: m, year: y,
+    });
   } catch (e) { next(e); }
 });
 
@@ -139,7 +157,7 @@ router.get('/:id', requirePermission('payroll.view'), async (req, res, next) => 
 });
 
 // ─── PUT /payroll/:id/adjust ───────────────────────────
-router.put('/:id/adjust', requirePermission('payroll.manage'), async (req, res, next) => {
+router.put('/:id/adjust', requirePermission('payroll.manage'), validate({ body: payrollAdjustSchema }), async (req, res, next) => {
   try {
     const { field, value, reason } = req.body;
     if (!field || value === undefined || !reason) throw new ValidationError('field, value and reason required');
@@ -158,27 +176,21 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), async (req, res, 
     else if (field === 'adjustments') updateData.manual_adjustment = value;
 
     // Recalculate gross pay
-    const rh  = Number(field === 'regular_hours'  ? value : record.regular_hours);
-    const oh  = Number(field === 'overtime_hours' ? value : record.overtime_hours);
-    const adj = Number(field === 'adjustments'    ? value : record.manual_adjustment);
-    const grossPay = Math.max(0,
-      rh * Number(record.hourly_rate) +
-      oh * Number(record.hourly_rate) * 1.5 -
-      Number(record.unpaid_deduction) +
-      adj
-    );
     const org = await prisma.organisation.findUnique({
       where: { id: record.org_id },
       select: { tax_rate: true, pension_rate: true },
     });
-    const taxRate     = (Number(org?.tax_rate)     || 0) / 100;
-    const pensionRate = (Number(org?.pension_rate) || 0) / 100;
-    const taxDeduction     = grossPay * taxRate;
-    const pensionDeduction = grossPay * pensionRate;
-    updateData.gross_pay          = grossPay;
-    updateData.tax_deduction      = taxDeduction;
-    updateData.pension_deduction  = pensionDeduction;
-    updateData.net_pay            = Math.max(0, grossPay - taxDeduction - pensionDeduction);
+    const totals = recalcPayrollTotals({
+      regular_hours:     Number(field === 'regular_hours'  ? value : record.regular_hours),
+      overtime_hours:    Number(field === 'overtime_hours' ? value : record.overtime_hours),
+      manual_adjustment: Number(field === 'adjustments'    ? value : record.manual_adjustment),
+      hourly_rate:       Number(record.hourly_rate),
+      unpaid_deduction:  Number(record.unpaid_deduction),
+    }, Number(org?.tax_rate) || 0, Number(org?.pension_rate) || 0);
+    updateData.gross_pay          = totals.gross_pay;
+    updateData.tax_deduction      = totals.tax_deduction;
+    updateData.pension_deduction  = totals.pension_deduction;
+    updateData.net_pay            = totals.net_pay;
 
     const updated = await prisma.payrollRecord.update({
       where: { id: req.params.id as string },
@@ -190,6 +202,40 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), async (req, res, 
       action: 'payroll.adjust', entityType: 'payroll_record', entityId: record.id,
       before: { field, value: record[field === 'adjustments' ? 'manual_adjustment' : field as 'regular_hours' | 'overtime_hours'], gross_pay: record.gross_pay, net_pay: record.net_pay },
       after: { field, value, gross_pay: updated.gross_pay, net_pay: updated.net_pay },
+      reason,
+    });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+// ─── POST /payroll/:id/recall ──────────────────────────
+// Controlled reopen of a processed record: status → 'recalled' so it can be
+// adjusted and re-processed. The stale payslip stops being served (payslip
+// endpoints gate on status === 'processed') and the recall is audited.
+router.post('/:id/recall', requirePermission('payroll.process'), validate({ body: payrollRecallSchema }), async (req, res, next) => {
+  try {
+    const { reason } = req.body;
+
+    const record = await prisma.payrollRecord.findFirst({
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
+      include: RECORD_INCLUDE,
+    });
+    if (!record) throw new NotFoundError('Payroll record');
+    if (record.status !== 'processed') {
+      throw new AppError('Only processed payroll can be recalled', 400, 'NOT_PROCESSED');
+    }
+
+    const updated = await prisma.payrollRecord.update({
+      where: { id: record.id },
+      data: { status: 'recalled', adjustment_reason: reason },
+      include: RECORD_INCLUDE,
+    });
+
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'payroll.recall', entityType: 'payroll_record', entityId: record.id,
+      before: { status: 'processed', processed_at: record.processed_at, net_pay: record.net_pay },
+      after: { status: 'recalled' },
       reason,
     });
     ok(res, updated);
@@ -210,7 +256,7 @@ router.get('/payslips/:id', async (req, res, next) => {
 
 // ─── POST /payroll/process-with-payslips ──────────────
 // Full process: generate PDFs, upload to S3, email employees
-router.post('/process-full', requirePermission('payroll.process'), async (req, res, next) => {
+router.post('/process-full', requirePermission('payroll.process'), validate({ body: payrollPeriodSchema }), async (req, res, next) => {
   try {
     const { month, year } = req.body;
     const m = month || new Date().getMonth() + 1;

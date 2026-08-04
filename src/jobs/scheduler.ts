@@ -1,4 +1,3 @@
-// @ts-nocheck
 import cron from 'node-cron';
 import redis from '../utils/redis';
 import { jobLogger } from '../utils/logger';
@@ -12,6 +11,7 @@ import {
   minutesOfDayInTz, hhmmToMins, lateThresholdFor, earlyOutMinutes, adherenceScore, dateOnlyInTz, scheduledWindow, scheduledInstant, shiftAutoCheckoutDue
 } from '../utils/shift';
 import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, updateAttendanceBreakSummary } from '../utils/attendance';
+import { isPushConfigured, sendPresenceChallenge } from '../services/pushChallenge';
 
 // Resolve the shift-end instant for overtime math: prefer the value persisted at
 // check-in (correct for overnight shifts), else recompute the window from checkOut.
@@ -199,11 +199,18 @@ export function startAbsentDetector() {
   scheduledJob('startAbsentDetector', '0 * * * *', async () => {
     const now = new Date();
     try {
-      const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
+      const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true, late_policy: true } });
       for (const org of orgs) {
         const tz = org.timezone || 'UTC';
         const orgToday = dateOnlyInTz(now, tz);
         const weekday = toZonedTime(now, tz).getDay();
+        // Org-configurable no-show window (late_policy.absent_after_mins), default 2h
+        const { parseLatePolicy, DEFAULT_ABSENT_AFTER_MINS } = await import('../services/latePolicy');
+        const absentAfterMins = parseLatePolicy(org.late_policy)?.absent_after_mins ?? DEFAULT_ABSENT_AFTER_MINS;
+
+        // Public holidays are not workdays — never mark anyone absent on them.
+        const { isOrgHoliday } = await import('../services/holidays');
+        if (await isOrgHoliday(org.id, orgToday)) continue;
 
         const employees = await prisma.user.findMany({
           where: { org_id: org.id, is_active: true, deleted_at: null },
@@ -234,7 +241,7 @@ export function startAbsentDetector() {
           let diffMins = nowMins - shiftStartMins;
           if (diffMins < -720) diffMins += 1440;
 
-          if (diffMins < 120 || diffMins >= 720) continue;
+          if (diffMins < absentAfterMins || diffMins >= 720) continue;
 
           const record = recordMap.get(user.id);
           if (!record || !record.check_in_at) {
@@ -328,6 +335,35 @@ export function startHeartbeatExpiryMonitor() {
           if (now < breakGraceDue) continue;
         }
 
+        // ─── FCM presence challenge (roadmap #24) ─────────
+        // Before auto-checking-out, ping the device with a high-priority FCM
+        // data message. High-priority pushes punch through Android Doze, so a
+        // phone still on office WiFi wakes and answers via its normal
+        // heartbeat — which refreshes last_heartbeat_at and drops the record
+        // out of the expired set. A challenge answered by a later heartbeat
+        // is treated as consumed, so a fresh loss of signal gets a fresh
+        // challenge instead of an instant checkout.
+        if (isPushConfigured() && record.user.fcm_token) {
+          const challengeSentAt =
+            record.challenge_sent_at && record.last_heartbeat_at! > record.challenge_sent_at
+              ? null // heartbeat arrived after the challenge — it was answered
+              : record.challenge_sent_at;
+
+          if (!challengeSentAt) {
+            const sent = await sendPresenceChallenge(record.user_id).catch(() => false);
+            if (sent) {
+              await prisma.attendanceRecord.update({
+                where: { id: record.id },
+                data: { challenge_sent_at: now },
+              }).catch(() => {});
+              continue; // grace tick: give the device a chance to respond
+            }
+          } else if (now.getTime() - challengeSentAt.getTime() < 5 * 60_000) {
+            continue; // challenge pending — wait up to 5 minutes for a reply
+          }
+          // Challenge sent 5+ minutes ago with no heartbeat → proceed with checkout.
+        }
+
         const checkOut = breakDueAt && breakDueAt > record.last_heartbeat_at!
           ? breakDueAt
           : record.last_heartbeat_at!;
@@ -356,6 +392,7 @@ export function startHeartbeatExpiryMonitor() {
             early_out_minutes: earlyMins,
             ...(score != null && { adherence_score: score }),
             last_heartbeat_at: null,
+            challenge_sent_at: null,
           },
         });
         await notifyCheckOut(record.user.org_id, record.user.name, formatTime12h(checkOut)).catch(() => {});
@@ -527,25 +564,49 @@ export function startPayrollAutoGenerate() {
         const end = endOfMonth(year, month);
 
         const users = await prisma.user.findMany({ where: { org_id: org.id, is_active: true, deleted_at: null } });
-        const taxRate = (org.tax_rate || 0) / 100;
-        const pensionRate = (org.pension_rate || 0) / 100;
+
+        // Same shared computation as POST /payroll/generate — unpaid-leave
+        // deduction, per-shift overtime multiplier and manual_adjustment
+        // preservation must never drift between the route and this cron.
+        const { computePeriodPayroll } = await import('../utils/payroll');
 
         for (const user of users) {
-          const attendance = await prisma.attendanceRecord.findMany({ where: { user_id: user.id, date: { gte: start, lte: end } } });
-          const regHours = attendance.reduce((s, r) => s + Number(r.net_hours_worked ?? r.hours_worked ?? 0), 0);
-          const otHours = attendance.reduce((s, r) => s + Number(r.overtime_hours || 0), 0);
-          const rate = Number(user.hourly_rate);
-          const base = regHours * rate;
-          const otPay = otHours * rate * 1.5;
-          const gross = base + otPay;
-          const tax = gross * taxRate;
-          const pension = gross * pensionRate;
-          const net = gross - tax - pension;
+          const attendance = await prisma.attendanceRecord.findMany({
+            where: { user_id: user.id, date: { gte: start, lte: end } },
+            include: { shift: { select: { overtime_multiplier: true } } },
+          });
+          const unpaidLeave = await prisma.leaveRequest.findMany({
+            where: {
+              user_id: user.id, status: 'approved', leave_type: 'unpaid',
+              start_date: { lte: end }, end_date: { gte: start },
+            },
+            select: { working_days: true },
+          });
+          const unpaidDays = unpaidLeave.reduce((s, l) => s + l.working_days, 0);
+          const existing = await prisma.payrollRecord.findFirst({
+            where: { user_id: user.id, period_month: month, period_year: year },
+            select: { manual_adjustment: true },
+          });
 
+          const rate = Number(user.hourly_rate);
+          const totals = computePeriodPayroll({
+            attendance,
+            unpaid_leave_days: unpaidDays,
+            hourly_rate: rate,
+            manual_adjustment: Number(existing?.manual_adjustment) || 0,
+          }, Number(org.tax_rate) || 0, Number(org.pension_rate) || 0);
+
+          const fields = {
+            regular_hours: totals.regular_hours, overtime_hours: totals.overtime_hours,
+            hourly_rate: rate, base_pay: totals.base_pay, overtime_pay: totals.overtime_pay,
+            unpaid_deduction: totals.unpaid_deduction, gross_pay: totals.gross_pay,
+            tax_deduction: totals.tax_deduction, pension_deduction: totals.pension_deduction,
+            net_pay: totals.net_pay, is_incomplete: rate === 0,
+          };
           await prisma.payrollRecord.upsert({
             where: { user_id_period_month_period_year: { user_id: user.id, period_month: month, period_year: year } },
-            update: { regular_hours: regHours, overtime_hours: otHours, hourly_rate: rate, base_pay: base, overtime_pay: otPay, gross_pay: gross, tax_deduction: tax, pension_deduction: pension, net_pay: net, is_incomplete: rate === 0 },
-            create: { user_id: user.id, org_id: org.id, period_month: month, period_year: year, regular_hours: regHours, overtime_hours: otHours, hourly_rate: rate, base_pay: base, overtime_pay: otPay, gross_pay: gross, tax_deduction: tax, pension_deduction: pension, net_pay: net, is_incomplete: rate === 0 },
+            update: fields,
+            create: { user_id: user.id, org_id: org.id, period_month: month, period_year: year, ...fields },
           });
         }
       }
@@ -677,7 +738,7 @@ export function startTrialExpiryMonitor() {
         data: { subscription_status: 'inactive' },
       });
     } catch (err) {
-      console.error('[trial-expiry] Error:', err.message);
+      console.error('[trial-expiry] Error:', err instanceof Error ? err.message : err);
     }
   });
 }
@@ -709,8 +770,66 @@ export function startDailyRemoteNudgeJob() {
   console.log('🏠 Daily remote nudge job started (08:00 UTC)');
 }
 
+// ─── Job: Monthly Leave Accrual ───────────────────────
+// ─── Job: Late Pattern Scan ───────────────────────────
+// Nightly: rolling lateness points per user (org late_policy tiers);
+// alerts manager + HR when someone crosses the org's threshold.
+export function startLatePatternScanJob() {
+  scheduledJob('startLatePatternScanJob', '30 2 * * *', async () => {
+    const { runLatePatternScan } = await import('../services/latePolicy');
+    await runLatePatternScan();
+  });
+  console.log('⏰ Late pattern scan job started (daily, 02:30 UTC)');
+}
+
+// ─── Job: Document Expiry Scan ────────────────────────
+// Daily: employee documents expiring in exactly 30 or 7 days notify the
+// owner + uploader (deduped via the notifications table).
+export function startDocumentExpiryScan() {
+  scheduledJob('startDocumentExpiryScan', '0 3 * * *', async () => {
+    const { runDocumentExpiryScan } = await import('../services/documents');
+    await runDocumentExpiryScan();
+  });
+  console.log('📄 Document expiry scan started (daily, 03:00 UTC)');
+}
+
+// ─── Job: Announcement Publisher ──────────────────────
+// Every 5 minutes: fan out scheduled announcements whose time has come.
+export function startAnnouncementPublisher() {
+  scheduledJob('startAnnouncementPublisher', '*/5 * * * *', async () => {
+    const { publishDueAnnouncements } = await import('../services/announcements');
+    await publishDueAnnouncements();
+  });
+  console.log('📣 Announcement publisher started (every 5 min)');
+}
+
+export function startLeaveAccrualJob() {
+  scheduledJob('startLeaveAccrualJob', '0 2 1 * *', async () => {
+    const { runMonthlyAccrual } = await import('../services/leaveAccrual');
+    await runMonthlyAccrual();
+  });
+  console.log('🌴 Leave accrual job started (1st of month, 02:00 UTC)');
+}
+
+// ─── Job: Refresh-Token Purge ─────────────────────────
+// Daily: delete expired tokens and revoked/rotated ones older than 30 days
+// (kept that long for reuse-detection forensics). Without this the
+// refresh_tokens table accretes forever — rotation only sets revoked_at.
+export function startRefreshTokenPurgeJob() {
+  scheduledJob('startRefreshTokenPurgeJob', '30 3 * * *', async () => {
+    const { purgeRefreshTokens } = await import('../services/refreshTokens');
+    const purged = await purgeRefreshTokens();
+    jobLogger.info({ purged }, 'refresh token purge complete');
+  });
+  console.log('🔑 Refresh-token purge job started (daily, 03:30 UTC)');
+}
+
 export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
+  startLeaveAccrualJob();
+  startLatePatternScanJob();
+  startDocumentExpiryScan();
+  startAnnouncementPublisher();
   startLateArrivalDetector();
   startAbsentDetector();
   startHeartbeatExpiryMonitor();
@@ -722,5 +841,6 @@ export function startAllJobs() {
   startPayrollAutoGenerate();
   startShiftBreakAutoManager();
   startTrialExpiryMonitor();
+  startRefreshTokenPurgeJob();
   console.log('✅ All background jobs running\n');
 }

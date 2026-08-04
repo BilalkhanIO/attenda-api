@@ -1,4 +1,3 @@
-// @ts-nocheck
 jest.mock('../../services/s3', () => ({
   isS3Configured: () => false,
   S3Keys: { reportCsv: () => 'test-key' },

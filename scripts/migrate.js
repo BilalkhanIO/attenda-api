@@ -178,7 +178,21 @@ async function run() {
       'prisma/migrations/20260620000000_departments_user_org_details/migration.sql',
       'prisma/migrations/20260621000000_heartbeat_grace/migration.sql',
       'prisma/migrations/20260622000000_refresh_token_rotation/migration.sql',
+      'prisma/migrations/20260622000000_wa_log_error/migration.sql',
       'prisma/migrations/20260623000000_audit_logs/migration.sql',
+      'prisma/migrations/20260624000000_fcm_presence_challenge/migration.sql',
+      'prisma/migrations/20260625000000_leave_accrual/migration.sql',
+      'prisma/migrations/20260626000000_late_policy/migration.sql',
+      'prisma/migrations/20260627000000_org_holidays/migration.sql',
+      'prisma/migrations/20260628000000_attendance_corrections/migration.sql',
+      'prisma/migrations/20260629000000_expense_claims/migration.sql',
+      'prisma/migrations/20260630000000_org_webhooks/migration.sql',
+      'prisma/migrations/20260701000000_employee_documents/migration.sql',
+      'prisma/migrations/20260702000000_announcements/migration.sql',
+      'prisma/migrations/20260703000000_onboarding/migration.sql',
+      'prisma/migrations/20260704000000_kudos/migration.sql',
+      'prisma/migrations/20260705000000_leave_balance_decimal/migration.sql',
+      'prisma/migrations/20260706000000_hot_path_indexes/migration.sql',
     ];
 
     for (const relPath of incrementalMigrations) {
@@ -523,6 +537,8 @@ Schedule a demo or start your free trial to see Attenda's shift management in ac
       ['platform.plans.manage', 'Manage plan definitions'],
       ['platform.blog.manage',  'Manage blog posts'],
       ['platform.users.manage', 'Manage platform admin users'],
+      ['platform.audit.view',   'View platform admin activity logs'],
+      ['platform.broadcast.send', 'Broadcast announcements to organisations'],
     ];
     for (const [key, description] of platformPerms) {
       await client.query(

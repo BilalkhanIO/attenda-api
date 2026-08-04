@@ -1,8 +1,9 @@
 name: CI
 on:
   push:
-    branches: [main]
+    branches: [main, 'claude/**']
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -15,5 +16,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npx prisma generate
+      - name: Forbid @ts-nocheck
+        run: |
+          if grep -rn "@ts-nocheck" src/; then
+            echo "::error::@ts-nocheck is not allowed — fix the types instead"
+            exit 1
+          fi
       - run: npm run build
       - run: npm test

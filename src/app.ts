@@ -7,6 +7,7 @@ import cookieParser from 'cookie-parser';
 import { randomUUID } from 'node:crypto';
 import { pinoHttp } from 'pino-http';
 import { logger, requestContext } from './utils/logger';
+import { metricsMiddleware, metricsHandler } from './utils/metrics';
 import redis from './utils/redis';
 
 import authRouter       from './routes/auth';
@@ -17,11 +18,18 @@ import shiftsRouter     from './routes/shifts';
 import payrollRouter    from './routes/payroll';
 import departmentsRouter from './routes/departments';
 import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './routes/misc';
+import holidaysRouter from './routes/holidays';
+import correctionsRouter from './routes/corrections';
+import expensesRouter from './routes/expenses';
+import documentsRouter from './routes/documents';
 import orgRbacRouter from './routes/org-rbac';
+import orgWebhooksRouter from './routes/org-webhooks';
 import webhooksRouter from './routes/webhooks';
 import adminRouter         from './routes/admin';
 import adminPlatformUsersRouter from './routes/admin-platform-users';
 import overtimeRouter      from './routes/overtime';
+import onboardingRouter    from './routes/onboarding';
+import kudosRouter         from './routes/kudos';
 import notificationsRouter from './routes/notifications';
 import publicRouter        from './routes/public';
 import { errorHandler, notFound } from './middleware/errorHandler';
@@ -97,32 +105,62 @@ const authLimiter = rateLimit({
 
 app.use(globalLimiter);
 
-// ─── Health check ─────────────────────────────────────
+// ─── Health check & metrics ───────────────────────────
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString(), version: '1.0.0' });
 });
+app.get('/metrics', metricsHandler);
+app.use(metricsMiddleware);
 
 // ─── API Routes ───────────────────────────────────────
 const API = '/api/v1';
 
-app.use(`${API}/auth`,        authLimiter, authRouter);
-app.use(`${API}/users`,       usersRouter);
-app.use(`${API}/attendance`,  attendanceRouter);
-app.use(`${API}/leave`,       leaveRouter);
-app.use(`${API}/shifts`,      shiftsRouter);
-app.use(`${API}/payroll`,     payrollRouter);
-app.use(`${API}/performance`, performanceRouter);
-app.use(`${API}/analytics`,   analyticsRouter);
-app.use(`${API}/org/departments`, departmentsRouter);
-app.use(`${API}/org`,         orgRouter);
-app.use(`${API}/org`,         orgRbacRouter);
-app.use(`${API}/reports`,      reportsRouter);
-app.use(`${API}/webhooks`,    webhooksRouter);
-app.use(`${API}/admin/users`, adminPlatformUsersRouter);
-app.use(`${API}/admin`,      adminRouter);
-app.use(`${API}/overtime`,       overtimeRouter);
-app.use(`${API}/notifications`, notificationsRouter);
-app.use(`${API}/public`,       publicRouter);
+// The mount table doubles as the OpenAPI generator's route source —
+// add new routers here and they appear in /api/v1/openapi.json.
+const MOUNTS: Array<[string, express.Router]> = [
+  [`${API}/auth`,            authRouter],
+  [`${API}/users`,           usersRouter],
+  // corrections mounts before the attendance router so its paths are not
+  // swallowed by /attendance/:userId
+  [`${API}/attendance/corrections`, correctionsRouter],
+  [`${API}/attendance`,      attendanceRouter],
+  [`${API}/leave`,           leaveRouter],
+  [`${API}/shifts`,          shiftsRouter],
+  [`${API}/payroll`,         payrollRouter],
+  [`${API}/expenses`,        expensesRouter],
+  [`${API}/documents`,       documentsRouter],
+  [`${API}/onboarding`,      onboardingRouter],
+  [`${API}/kudos`,           kudosRouter],
+  [`${API}/performance`,     performanceRouter],
+  [`${API}/analytics`,       analyticsRouter],
+  [`${API}/org/departments`, departmentsRouter],
+  [`${API}/org/holidays`,    holidaysRouter],
+  // outbound-webhooks mounts before the generic /org routers so its paths
+  // are not swallowed by their parameterised routes
+  [`${API}/org/outbound-webhooks`, orgWebhooksRouter],
+  [`${API}/org`,             orgRouter],
+  [`${API}/org`,             orgRbacRouter],
+  [`${API}/reports`,         reportsRouter],
+  [`${API}/webhooks`,        webhooksRouter],
+  [`${API}/admin/users`,     adminPlatformUsersRouter],
+  [`${API}/admin`,           adminRouter],
+  [`${API}/overtime`,        overtimeRouter],
+  [`${API}/notifications`,   notificationsRouter],
+  [`${API}/public`,          publicRouter],
+];
+
+app.use(`${API}/auth`, authLimiter);
+for (const [prefix, router] of MOUNTS) app.use(prefix, router);
+
+// ─── OpenAPI spec (generated once, on first request) ──
+let openApiDoc: Record<string, unknown> | null = null;
+app.get(`${API}/openapi.json`, (_req, res) => {
+  if (!openApiDoc) {
+    const { buildOpenApiDoc } = require('./services/openapi') as typeof import('./services/openapi');
+    openApiDoc = buildOpenApiDoc(MOUNTS);
+  }
+  res.json(openApiDoc);
+});
 
 // ─── 404 & Error handler ──────────────────────────────
 app.use(notFound);

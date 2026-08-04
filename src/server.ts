@@ -2,6 +2,7 @@ import 'dotenv/config';
 import app from './app';
 import prisma from './utils/prisma';
 import { startAllJobs } from './jobs/scheduler';
+import { registerWebhookFanout } from './services/webhookDelivery';
 import { logger } from './utils/logger';
 
 const PORT = parseInt(process.env.PORT || '5000');
@@ -21,6 +22,7 @@ async function main() {
     // Start background jobs
     if (process.env.NODE_ENV !== 'test') {
       startAllJobs();
+      registerWebhookFanout();
 
       // Self-heal RBAC seed data. Production deployments run SQL migrations
       // only (scripts/migrate.js) and never the demo seed, so the permission

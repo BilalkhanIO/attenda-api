@@ -1,8 +1,8 @@
-// @ts-nocheck
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
 import { ok, NotFoundError } from '../utils/response';
 import { verifyAccessToken } from '../utils/auth';
+import { subscribeOrgEvents } from '../services/notifications';
 import prisma from '../utils/prisma';
 
 const router = Router();
@@ -47,8 +47,18 @@ router.get('/stream', async (req: Request, res: Response) => {
   await send();
   const interval = setInterval(send, 15_000);
 
+  // Invalidation push: mutation handlers emit coarse org-scoped events
+  // (see services/notifications emitOrgEvent); forward them so clients can
+  // refetch the affected resource without waiting for a poll cycle.
+  const unsubscribe = subscribeOrgEvents(orgId, (scope) => {
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'invalidate', scope })}\n\n`);
+    } catch { /* connection is tearing down */ }
+  });
+
   req.on('close', () => {
     clearInterval(interval);
+    unsubscribe();
     res.end();
   });
 });

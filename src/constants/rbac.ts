@@ -65,6 +65,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'org.qr.manage', module: 'org', description: 'Manage check-in QR codes' },
   { key: 'org.departments.manage', module: 'org', description: 'Manage departments and sub-departments' },
   { key: 'org.roles.manage', module: 'org', description: 'Manage custom org roles' },
+  { key: 'org.announcements.send', module: 'org', description: 'Send org announcements and view read receipts' },
   { key: 'org.permissions.grant', module: 'org', description: 'Grant per-user permission overrides' },
   // Analytics & reports
   { key: 'analytics.view', module: 'analytics', description: 'View analytics dashboards' },
@@ -81,6 +82,15 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'whatsapp.logs.view', module: 'whatsapp', description: 'View WhatsApp notification logs' },
   // Overtime
   { key: 'overtime.manage', module: 'overtime', description: 'Manage overtime rules' },
+  // Expenses
+  { key: 'expenses.view', module: 'expenses', description: 'View team expense claims' },
+  { key: 'expenses.manage', module: 'expenses', description: 'Approve and reimburse expense claims' },
+  // Documents
+  { key: 'documents.view_team', module: 'documents', description: 'View team member documents' },
+  { key: 'documents.manage', module: 'documents', description: 'Upload and manage employee documents' },
+  // Onboarding
+  { key: 'onboarding.manage', module: 'onboarding', description: 'Manage onboarding templates and assignments' },
+  { key: 'onboarding.view_team', module: 'onboarding', description: 'View team onboarding progress' },
   // Platform (cross-tenant)
   { key: 'platform.orgs.view', module: 'platform', description: 'View organisations' },
   { key: 'platform.orgs.manage', module: 'platform', description: 'Manage organisation subscriptions' },
@@ -88,6 +98,8 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'platform.plans.manage', module: 'platform', description: 'Manage plan definitions' },
   { key: 'platform.blog.manage', module: 'platform', description: 'Manage blog posts' },
   { key: 'platform.users.manage', module: 'platform', description: 'Manage platform admin users' },
+  { key: 'platform.audit.view', module: 'platform', description: 'View platform admin activity logs' },
+  { key: 'platform.broadcast.send', module: 'platform', description: 'Broadcast announcements to organisations' },
 ];
 
 const allKeys = () => PERMISSION_CATALOG.map(p => p.key);

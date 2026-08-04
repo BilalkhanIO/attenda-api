@@ -1,10 +1,10 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
-import { createUserSchema, updateUserSchema } from '../schemas';
+import { createUserSchema, updateUserSchema, deviceTokenSchema } from '../schemas';
 import { getUserCapabilities, resolveUserPermissions, can } from '../services/authorization';
 import { hashPassword, generateToken } from '../utils/auth';
-import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
+import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { PERMISSION_CATALOG } from '../constants/rbac';
 import prisma from '../utils/prisma';
 
@@ -67,6 +67,20 @@ router.put('/me', async (req: Request, res: Response, next: NextFunction) => {
       select: USER_SELECT,
     });
     ok(res, user);
+  } catch (e) { next(e); }
+});
+
+// ─── PUT /users/me/device-token ────────────────────────
+// Registers the caller's FCM device token so the server can send
+// presence-challenge pushes before auto-checkout (see services/pushChallenge).
+router.put('/me/device-token', validate({ body: deviceTokenSchema }), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { token } = req.body as { token: string };
+    await prisma.user.update({
+      where: { id: req.user!.sub },
+      data: { fcm_token: token, fcm_token_updated_at: new Date() },
+    });
+    ok(res, { message: 'Device token updated' });
   } catch (e) { next(e); }
 });
 
@@ -177,9 +191,10 @@ router.get('/meta/departments', async (req: Request, res: Response, next: NextFu
 // ─── GET /users ────────────────────────────────────────
 router.get('/', requirePermission('employees.view', 'employees.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { page = '1', limit = '50', department, role, status, search } = req.query as Record<string, string>;
+    const { page = '1', limit = '50', department, role, status, search, q, sort, order } = req.query as Record<string, string>;
     const pg = Math.max(1, parseInt(page));
     const lm = Math.min(100, parseInt(limit));
+    const term = q || search; // q is the cross-endpoint contract; search kept for old clients
 
     const where: Record<string, unknown> = {
       org_id: req.user!.org_id,
@@ -188,10 +203,15 @@ router.get('/', requirePermission('employees.view', 'employees.view_team'), asyn
     if (department) where.department = department;
     if (role)       where.role       = role;
     if (status)     where.is_active  = status === 'active';
-    if (search)     where.OR         = [
-      { name: { contains: search, mode: 'insensitive' } },
-      { email: { contains: search, mode: 'insensitive' } },
+    if (term)       where.OR         = [
+      { name: { contains: term, mode: 'insensitive' } },
+      { email: { contains: term, mode: 'insensitive' } },
     ];
+
+    // Whitelisted sort fields only — never feed raw query strings to Prisma.
+    const SORTABLE = new Set(['name', 'email', 'department', 'job_title', 'joined_at', 'created_at']);
+    const sortField = SORTABLE.has(sort) ? sort : 'name';
+    const sortDir = order === 'desc' ? 'desc' as const : 'asc' as const;
 
     // Org-wide list needs employees.view; team-level viewers (managers or
     // custom roles with only employees.view_team) see their direct reports.
@@ -200,7 +220,7 @@ router.get('/', requirePermission('employees.view', 'employees.view_team'), asyn
     }
 
     const [users, total] = await Promise.all([
-      prisma.user.findMany({ where, select: USER_SELECT, skip: (pg - 1) * lm, take: lm, orderBy: { name: 'asc' } }),
+      prisma.user.findMany({ where, select: USER_SELECT, skip: (pg - 1) * lm, take: lm, orderBy: { [sortField]: sortDir } }),
       prisma.user.count({ where }),
     ]);
 
@@ -236,6 +256,17 @@ router.post('/', requirePermission('employees.create'), validate({ body: createU
     const inviteExpires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
 
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
+
+    // Seats metering: when the platform has set a seats_limit, block
+    // creation beyond the active head-count.
+    if (org?.seats_limit && org.seats_limit > 0) {
+      const activeCount = await prisma.user.count({
+        where: { org_id: req.user!.org_id, is_active: true, deleted_at: null },
+      });
+      if (activeCount >= org.seats_limit) {
+        throw new AppError(`Organisation seat limit reached (${org.seats_limit} seats). Contact support to add seats.`, 400, 'SEATS_LIMIT');
+      }
+    }
 
     // Structured department wins; sync the legacy free-text column from it
     let departmentName = department ?? null;
@@ -307,6 +338,11 @@ router.post('/', requirePermission('employees.create'), validate({ body: createU
       })),
       skipDuplicates: true,
     });
+
+    // Auto-assign the org's default onboarding checklist. Best-effort:
+    // a failed assignment must never fail user creation (logged inside).
+    const { autoAssignDefaultTemplate } = await import('../services/onboarding');
+    await autoAssignDefaultTemplate(req.user!.org_id, user.id);
 
     created(res, user);
   } catch (e) { next(e); }
@@ -470,7 +506,43 @@ router.post('/import', requirePermission('employees.import'), async (req: Reques
     const results = { created: 0, skipped: 0, errors: [] as string[] };
     const year = new Date().getFullYear();
 
+    // Same role safeguards as POST /users: whitelist + role-management gate
+    // for admin-tier roles (prevents employees.import holders from
+    // mass-creating super_admin users).
+    const VALID_ROLES = ['employee', 'manager', 'hr_admin', 'super_admin'];
+    const canAssignAdminRoles = !!req.permissions?.has('org.roles.manage');
+
+    // Seats metering: same rule as POST /users, applied across the batch.
+    const seatsLimit = org?.seats_limit && org.seats_limit > 0 ? org.seats_limit : null;
+    let activeCount = seatsLimit === null ? 0 : await prisma.user.count({
+      where: { org_id: req.user!.org_id, is_active: true, deleted_at: null },
+    });
+    if (seatsLimit !== null && activeCount >= seatsLimit) {
+      throw new AppError(`Organisation seat limit reached (${seatsLimit} seats). Contact support to add seats.`, 400, 'SEATS_LIMIT');
+    }
+
     for (const u of users) {
+      const role = u.role || 'employee';
+      if (!u?.name || !u?.email) {
+        results.skipped++;
+        results.errors.push(`${u?.email || '(missing email)'}: name and email are required`);
+        continue;
+      }
+      if (!VALID_ROLES.includes(role)) {
+        results.skipped++;
+        results.errors.push(`${u.email}: invalid role "${u.role}"`);
+        continue;
+      }
+      if (!canAssignAdminRoles && !['employee', 'manager'].includes(role)) {
+        results.skipped++;
+        results.errors.push(`${u.email}: org.roles.manage permission required to assign role "${role}"`);
+        continue;
+      }
+      if (seatsLimit !== null && activeCount >= seatsLimit) {
+        results.skipped++;
+        results.errors.push(`${u.email}: SEATS_LIMIT — organisation seat limit reached (${seatsLimit} seats)`);
+        continue;
+      }
       try {
         const token   = generateToken();
         const expires = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
@@ -478,10 +550,11 @@ router.post('/import', requirePermission('employees.import'), async (req: Reques
           data: {
             org_id: req.user!.org_id, name: u.name, email: u.email,
             password_hash: await hashPassword(token),
-            role: u.role || 'employee', department: u.department || null,
+            role, department: u.department || null,
             invite_token: token, invite_expires: expires,
           },
         });
+        activeCount++;
         await prisma.leaveBalance.createMany({
           data: ['annual', 'sick', 'wfh', 'unpaid'].map(lt => ({
             user_id: user.id, org_id: req.user!.org_id, leave_type: lt, year,
@@ -492,9 +565,8 @@ router.post('/import', requirePermission('employees.import'), async (req: Reques
         });
 
         // Seed UserOrgRole for imported user
-        const importedRole = u.role || 'employee';
         const orgRoleForImport = await prisma.orgRole.findUnique({
-          where: { org_id_slug: { org_id: req.user!.org_id, slug: importedRole } },
+          where: { org_id_slug: { org_id: req.user!.org_id, slug: role } },
         });
         if (orgRoleForImport) {
           await prisma.userOrgRole.upsert({

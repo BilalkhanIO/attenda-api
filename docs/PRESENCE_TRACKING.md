@@ -78,13 +78,60 @@ Recommended: grace ≥ 2× the worst-case doze wake interval (≈ 9 min) — hen
 Orgs with strict presence requirements can lower it; orgs with aggressive OEM
 fleets (Xiaomi/Huawei) may want 30.
 
+## FCM presence challenge (server half — shipped)
+
+Before the heartbeat-expiry job auto-checks a user out, it gives the device
+one last chance to prove presence via a high-priority FCM data message —
+high-priority pushes punch through Android Doze even when normal background
+work is suspended.
+
+Flow, per expired record (grace window already elapsed):
+
+1. If push is configured **and** the user has a registered `fcm_token`
+   **and** no unanswered challenge exists for this record: send
+   `{ type: 'presence_challenge' }` (data-only, `android.priority: high`),
+   stamp `attendance_records.challenge_sent_at`, and **skip checkout this
+   tick** (the job runs every 5 minutes — that is the device's grace tick).
+2. The mobile app, woken by the push, runs its normal WiFi check and posts
+   `POST /attendance/heartbeat`. A fresh heartbeat refreshes
+   `last_heartbeat_at`, so the record drops out of the expired set —
+   checkout cancelled. A heartbeat newer than `challenge_sent_at` marks the
+   challenge as answered, so a *later* signal loss gets a fresh challenge.
+3. If the challenge is 5+ minutes old and no heartbeat arrived, the checkout
+   proceeds exactly as before (checkout at last heartbeat, breaks settled,
+   `challenge_sent_at` cleared).
+
+When Firebase is **not** configured, the whole layer is inert: the job
+behaves exactly as documented above and a single startup log line notes that
+challenges are disabled.
+
+### Setup
+
+1. Create a Firebase project and a service account
+   (Project settings → Service accounts → Generate new private key).
+2. Set the env var to the JSON key **as a string**:
+
+   ```bash
+   FIREBASE_SERVICE_ACCOUNT='{"type":"service_account","project_id":"…","private_key":"-----BEGIN PRIVATE KEY-----\n…","client_email":"…"}'
+   ```
+
+3. The mobile client registers its token via
+   `PUT /users/me/device-token` `{ "token": "<fcm-registration-token>" }`
+   (authenticated; stored on `users.fcm_token` / `fcm_token_updated_at`).
+
+Server pieces live in `src/services/pushChallenge.ts` (lazy firebase-admin
+init, `isPushConfigured()`, `sendPresenceChallenge(userId)`) and the
+heartbeat-expiry job in `src/jobs/scheduler.ts`. The mobile half (FCM wiring
++ answering the challenge from a killed app) is roadmap #24.
+
 ## Future hardening (researched, not yet implemented)
 
 See `ATTENDANCE_RESEARCH.md` for the full analysis. The highest-value next
 steps are:
 1. AlarmManager-driven heartbeats (`setExactAndAllowWhileIdle`) as a floor
    under the in-process timer.
-2. FCM high-priority "presence challenge" before any auto-checkout.
+2. Mobile FCM wiring for the presence challenge (server half shipped — see
+   above).
 3. A per-OEM reliability-check screen in the app (dontkillmyapp patterns).
 4. Heartbeat telemetry (`screen_on`, `battery_saver`, `device_model`) to
    drive adaptive grace windows.

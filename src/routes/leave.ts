@@ -1,20 +1,19 @@
-// @ts-nocheck
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
 import { leaveRequestSchema } from '../schemas';
-import { ok, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
-import { calculateWorkingDays } from '../utils/auth';
+import { ok, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
+import { emitOrgEvent } from '../services/notifications';
 
 const router = Router();
 router.use(authenticate);
 
 const LEAVE_INCLUDE = {
-  user: { select: { id: true, name: true, avatar_url: true, department: true } },
+  user: { select: { id: true, name: true, avatar_url: true, department: true, email: true } },
   reviewer: { select: { id: true, name: true } },
-};
+} as const;
 
 // ─── GET /leave/requests/me ────────────────────────────
 router.get('/requests/me', async (req, res, next) => {
@@ -47,14 +46,32 @@ router.get('/requests/team', requirePermission('leave.view_team', 'leave.approve
 // ─── GET /leave/requests ───────────────────────────────
 router.get('/requests', requirePermission('leave.view_all'), async (req, res, next) => {
   try {
-    const { status, department } = req.query as Record<string, string>;
+    const { status, department, q, page, limit, sort, order } = req.query as Record<string, string>;
     const where: Record<string, unknown> = { org_id: req.user!.org_id };
     if (status) where.status = status;
     if (department) {
       const deptUsers = await prisma.user.findMany({ where: { org_id: req.user!.org_id, department }, select: { id: true } });
       where.user_id = { in: deptUsers.map(u => u.id) };
     }
-    const requests = await prisma.leaveRequest.findMany({ where, include: LEAVE_INCLUDE, orderBy: { created_at: 'desc' } });
+    if (q) where.user = { name: { contains: q, mode: 'insensitive' } };
+
+    const SORTABLE = new Set(['created_at', 'start_date', 'end_date', 'status', 'leave_type']);
+    const orderBy = { [SORTABLE.has(sort) ? sort : 'created_at']: order === 'asc' ? 'asc' as const : 'desc' as const };
+
+    // Pagination is opt-in: without page/limit the full list is returned,
+    // matching what existing clients expect.
+    if (page || limit) {
+      const pg = Math.max(1, parseInt(page || '1'));
+      const lm = Math.min(100, Math.max(1, parseInt(limit || '25')));
+      const [requests, total] = await Promise.all([
+        prisma.leaveRequest.findMany({ where, include: LEAVE_INCLUDE, orderBy, skip: (pg - 1) * lm, take: lm }),
+        prisma.leaveRequest.count({ where }),
+      ]);
+      paginated(res, requests, total, pg, lm);
+      return;
+    }
+
+    const requests = await prisma.leaveRequest.findMany({ where, include: LEAVE_INCLUDE, orderBy });
     ok(res, requests);
   } catch (e) { next(e); }
 });
@@ -97,9 +114,11 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
       }
     }
 
+    // Working days exclude weekends AND the org's public holidays.
+    const { workingDaysForOrg } = await import('../services/holidays');
     const working_days = hasTimeWindow
       ? Math.max(0.1, Math.round((((leave_end_time.split(':').map(Number)[0] * 60 + leave_end_time.split(':').map(Number)[1]) - (leave_start_time.split(':').map(Number)[0] * 60 + leave_start_time.split(':').map(Number)[1])) / (8 * 60)) * 100) / 100)
-      : is_half_day ? 0.5 : calculateWorkingDays(start, end);
+      : is_half_day ? 0.5 : await workingDaysForOrg(req.user!.org_id, start, end);
 
     // Check leave balance (skip for unpaid leave)
     if (leave_type !== 'unpaid') {
@@ -108,7 +127,8 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
         where: { user_id: req.user!.sub, leave_type, year },
       });
       if (balance) {
-        const available = balance.total_days - balance.used_days;
+        const { availableDays } = await import('../services/leaveAccrual');
+        const available = availableDays(balance.total_days, balance.used_days);
         if (working_days > available) {
           throw new ValidationError(`Insufficient ${leave_type} leave balance. Available: ${available} days, requested: ${working_days} days`);
         }
@@ -166,6 +186,7 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
       }
     }
 
+    emitOrgEvent(req.user!.org_id, 'leave_changed');
     ok(res, request, 201);
   } catch (e) { next(e); }
 });
@@ -174,11 +195,11 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
 router.delete('/requests/:id', async (req, res, next) => {
   try {
     const request = await prisma.leaveRequest.findFirst({
-      where: { id: req.params.id, user_id: req.user!.sub },
+      where: { id: String(req.params.id), user_id: req.user!.sub },
     });
     if (!request) throw new NotFoundError('Leave request');
     if (request.status !== 'pending') throw new ValidationError('Only pending requests can be cancelled');
-    await prisma.leaveRequest.update({ where: { id: req.params.id }, data: { status: 'cancelled' } });
+    await prisma.leaveRequest.update({ where: { id: String(req.params.id) }, data: { status: 'cancelled' } });
     ok(res, { message: 'Leave request cancelled' });
   } catch (e) { next(e); }
 });
@@ -187,7 +208,7 @@ router.delete('/requests/:id', async (req, res, next) => {
 router.put('/requests/:id/approve', requirePermission('leave.approve'), async (req, res, next) => {
   try {
     const request = await prisma.leaveRequest.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
+      where: { id: String(req.params.id), org_id: req.user!.org_id, status: 'pending' },
     });
     if (!request) throw new NotFoundError('Leave request');
 
@@ -202,7 +223,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
 
     await prisma.$transaction(async (tx) => {
       await tx.leaveRequest.update({
-        where: { id: req.params.id },
+        where: { id: String(req.params.id) },
         data: { status: 'approved', reviewed_by: req.user!.sub, reviewed_at: new Date() },
       });
       // Deduct from leave balance
@@ -244,7 +265,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
       }
     });
 
-    const updated = await prisma.leaveRequest.findUnique({ where: { id: req.params.id }, include: LEAVE_INCLUDE });
+    const updated = await prisma.leaveRequest.findUnique({ where: { id: String(req.params.id) }, include: LEAVE_INCLUDE });
 
     // Email + WhatsApp notification
     if (updated?.user) {
@@ -270,6 +291,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
         actionType: 'leave_request', actionId: updated.id,
       }).catch(console.error);
     }
+    emitOrgEvent(req.user!.org_id, 'leave_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -281,7 +303,7 @@ router.put('/requests/:id/reject', requirePermission('leave.approve'), async (re
     if (!reason) throw new ValidationError('Rejection reason required');
 
     const request = await prisma.leaveRequest.findFirst({
-      where: { id: req.params.id, org_id: req.user!.org_id, status: 'pending' },
+      where: { id: String(req.params.id), org_id: req.user!.org_id, status: 'pending' },
     });
     if (!request) throw new NotFoundError('Leave request');
 
@@ -295,7 +317,7 @@ router.put('/requests/:id/reject', requirePermission('leave.approve'), async (re
     }
 
     const updated = await prisma.leaveRequest.update({
-      where: { id: req.params.id },
+      where: { id: String(req.params.id) },
       data: { status: 'rejected', reviewed_by: req.user!.sub, reviewed_at: new Date(), rejection_reason: reason },
       include: LEAVE_INCLUDE,
     });
@@ -323,6 +345,7 @@ router.put('/requests/:id/reject', requirePermission('leave.approve'), async (re
       }).catch(console.error);
     }
 
+    emitOrgEvent(req.user!.org_id, 'leave_changed');
     ok(res, updated);
   } catch (e) { next(e); }
 });
@@ -334,7 +357,24 @@ router.get('/balance/me', async (req, res, next) => {
     const balances = await prisma.leaveBalance.findMany({
       where: { user_id: req.user!.sub, year },
     });
-    ok(res, balances);
+
+    // Annotate rows with the org's accrual policy (additive — clients that
+    // don't know the field ignore it) so employees can see how balances grow.
+    const { parseAccrualConfig, monthlyIncrement, toDays } = await import('../services/leaveAccrual');
+    const org = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: { leave_accrual: true },
+    });
+    const accrual = parseAccrualConfig(org?.leave_accrual);
+    const annotated = balances.map(b => {
+      const policy = accrual?.[b.leave_type];
+      // Decimal columns serialize as strings — clients expect numbers
+      const row = { ...b, total_days: toDays(b.total_days), used_days: toDays(b.used_days) };
+      return policy
+        ? { ...row, accrual: { days_per_year: policy.days_per_year, monthly: monthlyIncrement(policy), carry_over_max: policy.carry_over_max ?? 0 } }
+        : row;
+    });
+    ok(res, annotated);
   } catch (e) { next(e); }
 });
 
@@ -343,13 +383,14 @@ router.get('/balance/:userId', requirePermission('leave.view_team', 'leave.balan
   try {
     const year = parseInt((req.query.year as string) || String(new Date().getFullYear()));
     const targetUser = await prisma.user.findFirst({
-      where: { id: req.params.userId, org_id: req.user!.org_id },
+      where: { id: String(req.params.userId), org_id: req.user!.org_id },
     });
     if (!targetUser) throw new NotFoundError('User');
     const balances = await prisma.leaveBalance.findMany({
-      where: { user_id: req.params.userId, year },
+      where: { user_id: String(req.params.userId), year },
     });
-    ok(res, balances);
+    const { toDays } = await import('../services/leaveAccrual');
+    ok(res, balances.map(b => ({ ...b, total_days: toDays(b.total_days), used_days: toDays(b.used_days) })));
   } catch (e) { next(e); }
 });
 
@@ -358,25 +399,35 @@ router.put('/balance/:userId', requirePermission('leave.balance.manage'), async 
   try {
     const { leave_type, adjustment, reason } = req.body;
     if (!leave_type || adjustment === undefined || !reason) throw new ValidationError('leave_type, adjustment and reason required');
+    const adj = Number(adjustment);
+    if (!Number.isFinite(adj)) throw new ValidationError('adjustment must be a number');
+
+    // Org scoping: the target user must belong to the caller's org
+    const targetUser = await prisma.user.findFirst({
+      where: { id: String(req.params.userId), org_id: req.user!.org_id },
+      select: { id: true },
+    });
+    if (!targetUser) throw new NotFoundError('User');
 
     const year = new Date().getFullYear();
     const balance = await prisma.leaveBalance.findFirst({
-      where: { user_id: req.params.userId, leave_type, year },
+      where: { user_id: String(req.params.userId), org_id: req.user!.org_id, leave_type, year },
     });
     if (!balance) throw new NotFoundError('Leave balance');
 
+    const { toDays, accruedTotal } = await import('../services/leaveAccrual');
     const updated = await prisma.leaveBalance.update({
       where: { id: balance.id },
-      data: { total_days: balance.total_days + adjustment },
+      data: { total_days: accruedTotal(balance.total_days, adj) },
     });
     recordAudit({
       orgId: req.user!.org_id, actorId: req.user!.sub,
       action: 'leave.balance.update', entityType: 'leave_balance', entityId: balance.id,
-      before: { total_days: balance.total_days },
-      after: { total_days: updated.total_days, adjustment },
+      before: { total_days: toDays(balance.total_days) },
+      after: { total_days: toDays(updated.total_days), adjustment: adj },
       reason,
     });
-    ok(res, updated);
+    ok(res, { ...updated, total_days: toDays(updated.total_days), used_days: toDays(updated.used_days) });
   } catch (e) { next(e); }
 });
 

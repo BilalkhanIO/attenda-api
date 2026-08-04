@@ -26,6 +26,8 @@ model Organisation {
   late_threshold     Int      @default(15)
   heartbeat_grace_mins Int    @default(20)
   gap_forgiveness_mins Int    @default(15)
+  leave_accrual      Json?
+  late_policy        Json?
   plan               String   @db.VarChar(50) @default("trial")
   status             String   @db.VarChar(20) @default("active")
   subscription_status String  @db.VarChar(30) @default("active")
@@ -48,6 +50,7 @@ model Organisation {
 
   users               User[]
   attendance_records  AttendanceRecord[]
+  attendance_corrections AttendanceCorrection[]
   leave_requests      LeaveRequest[]
   leave_balances      LeaveBalance[]
   shifts              Shift[]
@@ -61,6 +64,14 @@ model Organisation {
   org_roles             OrgRole[]
   user_permission_grants UserPermissionGrant[]
   departments           Department[]
+  holidays              OrgHoliday[]
+  expense_claims        ExpenseClaim[]
+  outbound_webhooks     OrgWebhook[]
+  employee_documents    EmployeeDocument[]
+  announcements         Announcement[]
+  onboarding_templates  OnboardingTemplate[]
+  onboarding_tasks      OnboardingTask[]
+  kudos                 Kudos[]
 
   @@map("organisations")
 }
@@ -101,6 +112,8 @@ model User {
   employment_type      String?   @db.VarChar(30)
   joined_at            DateTime? @db.Date
   national_id          String?   @db.VarChar(100)
+  fcm_token            String?
+  fcm_token_updated_at DateTime?
   created_at     DateTime  @default(now())
   deleted_at     DateTime?
 
@@ -109,6 +122,19 @@ model User {
   manager                 User?               @relation("UserManager", fields: [manager_id], references: [id])
   direct_reports          User[]              @relation("UserManager")
   attendance_records      AttendanceRecord[]
+  corrections_requested   AttendanceCorrection[] @relation("CorrectionUser")
+  corrections_reviewed    AttendanceCorrection[] @relation("CorrectionReviewer")
+  expense_claims          ExpenseClaim[]         @relation("ExpenseClaimant")
+  expenses_reviewed       ExpenseClaim[]         @relation("ExpenseReviewer")
+  documents               EmployeeDocument[]     @relation("DocumentOwner")
+  documents_uploaded      EmployeeDocument[]     @relation("DocumentUploader")
+  announcements_authored  Announcement[]         @relation("AnnouncementAuthor")
+  announcement_receipts   AnnouncementReceipt[]
+  onboarding_templates_created OnboardingTemplate[] @relation("OnboardingTemplateCreator")
+  onboarding_tasks             OnboardingTask[]     @relation("OnboardingHire")
+  onboarding_tasks_assigned    OnboardingTask[]     @relation("OnboardingAssignee")
+  kudos_given                  Kudos[]              @relation("KudosGiver")
+  kudos_received               Kudos[]              @relation("KudosRecipient")
   leave_requests          LeaveRequest[]
   leave_balances          LeaveBalance[]
   reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
@@ -129,7 +155,67 @@ model User {
   refresh_tokens          RefreshToken[]
   platform_role_assignments PlatformUserRole[]
 
+  @@index([org_id])
   @@map("users")
+}
+
+model AttendanceCorrection {
+  id                  String    @id @default(uuid())
+  user_id             String
+  org_id              String
+  attendance_id       String?
+  date                DateTime  @db.Date
+  requested_check_in  DateTime?
+  requested_check_out DateTime?
+  reason              String
+  status              String    @default("pending")
+  reviewed_by         String?
+  review_note         String?
+  reviewed_at         DateTime?
+  created_at          DateTime  @default(now())
+
+  user       User              @relation("CorrectionUser", fields: [user_id], references: [id])
+  reviewer   User?             @relation("CorrectionReviewer", fields: [reviewed_by], references: [id])
+  org        Organisation      @relation(fields: [org_id], references: [id])
+  attendance AttendanceRecord? @relation(fields: [attendance_id], references: [id])
+
+  @@index([org_id, status])
+  @@map("attendance_corrections")
+}
+
+model OrgHoliday {
+  id         String   @id @default(uuid())
+  org_id     String
+  date       DateTime @db.Date
+  name       String   @db.VarChar(120)
+  recurring  Boolean  @default(false)
+  created_at DateTime @default(now())
+
+  org Organisation @relation(fields: [org_id], references: [id])
+
+  @@unique([org_id, date])
+  @@map("org_holidays")
+}
+
+// Outbound webhook endpoints: per-org HTTPS receivers of coarse org events
+// (same event types the SSE bus emits). Deliveries are HMAC-SHA256 signed
+// with the per-hook secret; 20 consecutive failures auto-disable the hook.
+model OrgWebhook {
+  id              String    @id @default(uuid())
+  org_id          String
+  url             String
+  secret          String
+  events          String[]  @default([])
+  is_active       Boolean   @default(true)
+  last_success_at DateTime?
+  last_failure_at DateTime?
+  failure_count   Int       @default(0)
+  created_at      DateTime  @default(now())
+
+  org Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@index([org_id])
+  @@map("org_webhooks")
 }
 
 model Department {
@@ -140,9 +226,10 @@ model Department {
   created_at DateTime @default(now())
 
   org      Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
-  parent   Department?  @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: Cascade)
-  children Department[] @relation("DepartmentParent")
-  users    User[]
+  parent        Department?    @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: Cascade)
+  children      Department[]   @relation("DepartmentParent")
+  users         User[]
+  announcements Announcement[]
 
   @@unique([org_id, name, parent_id])
   @@index([org_id])
@@ -162,6 +249,7 @@ model RefreshToken {
 
   @@index([user_id])
   @@index([family_id])
+  @@index([expires_at])
   @@map("refresh_tokens")
 }
 
@@ -219,6 +307,7 @@ model AttendanceRecord {
   is_on_approved_leave Boolean @default(false)
   last_heartbeat_at    DateTime?
   last_heartbeat_ssid  String?   @db.VarChar(100)
+  challenge_sent_at    DateTime?
 
   user           User               @relation(fields: [user_id], references: [id])
   org            Organisation       @relation(fields: [org_id], references: [id])
@@ -226,9 +315,11 @@ model AttendanceRecord {
   late_notice    LateArrivalNotice? @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
   remote_session RemoteSession?
   break_records  BreakRecord[]
+  corrections   AttendanceCorrection[]
   overtime_request OvertimeRequest?
 
   @@unique([user_id, date])
+  @@index([org_id, date])
   @@map("attendance_records")
 }
 
@@ -315,6 +406,7 @@ model LeaveRequest {
   org      Organisation @relation(fields: [org_id], references: [id])
   reviewer User?        @relation("LeaveReviewer", fields: [reviewed_by], references: [id])
 
+  @@index([user_id, status, start_date, end_date])
   @@map("leave_requests")
 }
 
@@ -324,8 +416,8 @@ model LeaveBalance {
   org_id     String
   leave_type String   @db.VarChar(50)
   year       Int
-  total_days Int
-  used_days  Int      @default(0)
+  total_days Decimal  @db.Decimal(6, 2)
+  used_days  Decimal  @default(0) @db.Decimal(6, 2)
   updated_at DateTime @default(now()) @updatedAt
 
   user User         @relation(fields: [user_id], references: [id])
@@ -478,9 +570,65 @@ model PayrollRecord {
   user      User         @relation(fields: [user_id], references: [id])
   org       Organisation @relation(fields: [org_id], references: [id])
   processor User?        @relation("PayrollProcessor", fields: [processed_by], references: [id])
+  reimbursed_expenses ExpenseClaim[]
 
   @@unique([user_id, period_month, period_year])
+  @@index([org_id, period_year, period_month])
   @@map("payroll_records")
+}
+
+// Employee expense claims: submit → approve/reject → reimburse through the
+// existing payroll manual-adjustment machinery (recall/adjust flow).
+model ExpenseClaim {
+  id                       String    @id @default(uuid())
+  user_id                  String
+  org_id                   String
+  amount                   Decimal   @db.Decimal(12, 2)
+  currency                 String    @db.VarChar(10)
+  category                 String    @db.VarChar(50)
+  description              String
+  expense_date             DateTime  @db.Date
+  receipt_url              String?
+  status                   String    @default("pending") // pending | approved | rejected | reimbursed
+  reviewed_by              String?
+  review_note              String?
+  reviewed_at              DateTime?
+  reimbursed_in_payroll_id String?
+  created_at               DateTime  @default(now())
+
+  user          User           @relation("ExpenseClaimant", fields: [user_id], references: [id])
+  reviewer      User?          @relation("ExpenseReviewer", fields: [reviewed_by], references: [id])
+  org           Organisation   @relation(fields: [org_id], references: [id])
+  reimbursed_in PayrollRecord? @relation(fields: [reimbursed_in_payroll_id], references: [id])
+
+  @@index([org_id, status])
+  @@map("expense_claims")
+}
+
+// Employee document vault: HR/self-uploaded files (contracts, IDs, visas,
+// certificates) stored in S3 under documents/<org>/<user>/. Rows are
+// soft-deleted (deleted_at) so the audit trail keeps pointing at real data.
+model EmployeeDocument {
+  id          String    @id @default(uuid())
+  user_id     String
+  org_id      String
+  title       String    @db.VarChar(200)
+  category    String    @db.VarChar(50) // contract | id | visa | certificate | other
+  file_key    String
+  file_name   String
+  file_size   Int
+  mime_type   String    @db.VarChar(100)
+  expires_at  DateTime? @db.Date
+  uploaded_by String
+  created_at  DateTime  @default(now())
+  deleted_at  DateTime?
+
+  owner    User         @relation("DocumentOwner", fields: [user_id], references: [id])
+  uploader User         @relation("DocumentUploader", fields: [uploaded_by], references: [id])
+  org      Organisation @relation(fields: [org_id], references: [id])
+
+  @@index([org_id, user_id])
+  @@map("employee_documents")
 }
 
 model OvertimeRule {
@@ -599,6 +747,125 @@ model LateArrivalNotice {
 
   @@unique([user_id, date])
   @@map("late_arrival_notices")
+}
+
+// Announcements 2.0: persisted announcements (previously a pure notification
+// fan-out) with optional publish scheduling and department targeting.
+// published_at null ⇒ waiting for the 5-min publisher job.
+model Announcement {
+  id            String    @id @default(uuid())
+  org_id        String
+  title         String    @db.VarChar(255)
+  body          String    @db.Text
+  department_id String?   // null ⇒ org-wide
+  scheduled_for DateTime? // null ⇒ published immediately on create
+  published_at  DateTime?
+  created_by    String
+  created_at    DateTime  @default(now())
+
+  org        Organisation          @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  author     User                  @relation("AnnouncementAuthor", fields: [created_by], references: [id])
+  department Department?           @relation(fields: [department_id], references: [id], onDelete: SetNull)
+  receipts   AnnouncementReceipt[]
+
+  @@index([org_id, published_at])
+  @@map("announcements")
+}
+
+// Onboarding checklists: a template holds ordered items; assigning it to a
+// hire materializes each item as an OnboardingTask (denormalized title/desc
+// so later template edits never rewrite in-flight checklists). Items owned
+// by 'manager' resolve to the hire's manager at assignment time, falling
+// back to the hire when they have no manager.
+model OnboardingTemplate {
+  id         String    @id @default(uuid())
+  org_id     String
+  name       String    @db.VarChar(120)
+  is_default Boolean   @default(false) // auto-assigned to every new user
+  created_by String
+  created_at DateTime  @default(now())
+  deleted_at DateTime?
+
+  org     Organisation             @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  creator User                     @relation("OnboardingTemplateCreator", fields: [created_by], references: [id])
+  items   OnboardingTemplateItem[]
+  tasks   OnboardingTask[]
+
+  @@index([org_id])
+  @@map("onboarding_templates")
+}
+
+model OnboardingTemplateItem {
+  id            String  @id @default(uuid())
+  template_id   String
+  title         String  @db.VarChar(200)
+  description   String?
+  due_days      Int?    // days after assignment the item is due
+  sort_order    Int     @default(0)
+  assignee_role String  @default("employee") @db.VarChar(20) // employee | manager
+
+  template OnboardingTemplate @relation(fields: [template_id], references: [id], onDelete: Cascade)
+
+  @@map("onboarding_template_items")
+}
+
+model OnboardingTask {
+  id               String    @id @default(uuid())
+  org_id           String
+  user_id          String // the new hire
+  item_title       String    @db.VarChar(200)
+  item_description String?
+  assignee_id      String // resolved at assignment: the hire or their manager
+  due_date         DateTime? @db.Date
+  status           String    @default("pending") @db.VarChar(20) // pending | done | skipped
+  completed_at     DateTime?
+  completed_by     String?
+  template_id      String?
+  created_at       DateTime  @default(now())
+
+  org      Organisation        @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user     User                @relation("OnboardingHire", fields: [user_id], references: [id], onDelete: Cascade)
+  assignee User                @relation("OnboardingAssignee", fields: [assignee_id], references: [id])
+  template OnboardingTemplate? @relation(fields: [template_id], references: [id], onDelete: SetNull)
+
+  @@index([org_id, user_id])
+  @@index([assignee_id, status])
+  @@map("onboarding_tasks")
+}
+
+// Kudos / recognition feed: any org member can publicly thank another.
+// Soft-deleted (author or org.settings.update) so moderation keeps the
+// audit trail intact. Capped at 20 per giver per day in the router.
+model Kudos {
+  id           String    @id @default(uuid())
+  org_id       String
+  from_user_id String
+  to_user_id   String
+  message      String
+  emoji        String?   @db.VarChar(20)
+  created_at   DateTime  @default(now())
+  deleted_at   DateTime?
+
+  org       Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  giver     User         @relation("KudosGiver", fields: [from_user_id], references: [id])
+  recipient User         @relation("KudosRecipient", fields: [to_user_id], references: [id])
+
+  @@index([org_id, created_at])
+  @@map("kudos")
+}
+
+// Read receipts: one row per (announcement, reader), upserted idempotently.
+model AnnouncementReceipt {
+  id              String   @id @default(uuid())
+  announcement_id String
+  user_id         String
+  read_at         DateTime @default(now())
+
+  announcement Announcement @relation(fields: [announcement_id], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([announcement_id, user_id])
+  @@map("announcement_receipts")
 }
 
 model PlanDefinition {

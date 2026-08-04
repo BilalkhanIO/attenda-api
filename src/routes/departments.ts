@@ -1,5 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { validate } from '../middleware/validate';
+import { departmentSchema, updateDepartmentSchema } from '../schemas';
 import { ok, created, NotFoundError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
 
@@ -64,7 +66,7 @@ router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ─── POST /org/departments ─────────────────────────────
-router.post('/', requirePermission('org.departments.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('org.departments.manage'), validate({ body: departmentSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, parent_id } = req.body as { name?: string; parent_id?: string | null };
     if (!name?.trim()) throw new ValidationError('name is required');
@@ -90,7 +92,7 @@ router.post('/', requirePermission('org.departments.manage'), async (req: Reques
 });
 
 // ─── PUT /org/departments/:id ──────────────────────────
-router.put('/:id', requirePermission('org.departments.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', requirePermission('org.departments.manage'), validate({ body: updateDepartmentSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, parent_id } = req.body as { name?: string; parent_id?: string | null };
     const department = await prisma.department.findFirst({
