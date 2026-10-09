@@ -54,6 +54,7 @@ const HR_ADMIN_PERMS = [
   'reports.view',
   'reports.export',
   'analytics.advanced',
+  'analytics.ai_chat',
   'overtime.manage',
   'expenses.manage',
   'documents.manage',

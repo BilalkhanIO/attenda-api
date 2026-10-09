@@ -17,7 +17,7 @@ import leaveRouter      from './routes/leave';
 import shiftsRouter     from './routes/shifts';
 import payrollRouter    from './routes/payroll';
 import departmentsRouter from './routes/departments';
-import { performanceRouter, analyticsRouter, orgRouter, reportsRouter } from './routes/misc';
+import { performanceRouter, analyticsRouter, aiRouter, orgRouter, reportsRouter } from './routes/misc';
 import holidaysRouter from './routes/holidays';
 import correctionsRouter from './routes/corrections';
 import expensesRouter from './routes/expenses';
@@ -133,6 +133,7 @@ const MOUNTS: Array<[string, express.Router]> = [
   [`${API}/kudos`,           kudosRouter],
   [`${API}/performance`,     performanceRouter],
   [`${API}/analytics`,       analyticsRouter],
+  [`${API}/ai`,              aiRouter],
   [`${API}/org/departments`, departmentsRouter],
   [`${API}/org/holidays`,    holidaysRouter],
   // outbound-webhooks mounts before the generic /org routers so its paths

@@ -70,6 +70,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   // Analytics & reports
   { key: 'analytics.view', module: 'analytics', description: 'View analytics dashboards' },
   { key: 'analytics.advanced', module: 'analytics', description: 'Advanced analytics and anomalies' },
+  { key: 'analytics.ai_chat', module: 'analytics', description: 'AI chat assistant' },
   { key: 'reports.view', module: 'reports', description: 'View HR reports' },
   { key: 'reports.export', module: 'reports', description: 'Export reports' },
   // Performance

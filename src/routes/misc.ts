@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { aiRouter } from "./ai"; export { aiRouter };
 import { authenticate, requireOrgFeature, requirePermission } from '../middleware/auth';
 import { resolveUserPermissions } from '../services/authorization';
 import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
