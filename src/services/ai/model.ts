@@ -40,7 +40,7 @@ export class ModelWrapper {
         role: m.role,
         content: m.content,
       })),
-      system: agent.buildSystemPrompt(tools),
+      system: await agent.buildSystemPrompt(tools),
       tools: tools,
     };
 
@@ -100,7 +100,7 @@ export class ModelWrapper {
             role: m.role,
             content: m.content,
           })),
-          system: agent.buildSystemPrompt(tools),
+          system: await agent.buildSystemPrompt(tools),
           tools: tools,
         };
 

@@ -1,6 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate } from '../middleware/auth';
-import { issueRefreshToken, rotateRefreshToken, revokeAllForUser } from '../services/refreshTokens';
+import { issueRefreshToken, rotateRefreshToken, revokeAllForUser, revokeOtherSessionsForUser, revokeSession, listActiveSessions } from '../services/refreshTokens';
 import { validate } from '../middleware/validate';
 import {
   loginSchema, registerSchema, refreshSchema, forgotPasswordSchema,
@@ -20,6 +20,27 @@ import crypto from 'crypto';
 const router = Router();
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+
+function requestSessionMetadata(req: Request) {
+  const userAgent = String(req.headers['user-agent'] || '').slice(0, 1000);
+  const deviceName = /android/i.test(userAgent) ? 'Android device'
+    : /iphone|ipad|ipod/i.test(userAgent) ? 'Apple mobile device'
+    : /windows/i.test(userAgent) ? 'Windows browser'
+    : /macintosh|mac os/i.test(userAgent) ? 'Mac browser'
+    : /linux/i.test(userAgent) ? 'Linux browser'
+    : userAgent ? 'Web or mobile device' : 'Unknown device';
+  return { device_name: deviceName, user_agent: userAgent || undefined, ip_address: req.ip?.slice(0, 64) };
+}
+
+async function issueSessionTokens(user: { id: string; org_id: string; role: string; name: string; email: string }, req: Request) {
+  const refreshToken = await issueRefreshToken(user.id, undefined, requestSessionMetadata(req));
+  const claims = jwt.decode(refreshToken) as { fam: string };
+  const accessToken = signAccessToken({
+    sub: user.id, org_id: user.org_id, role: user.role,
+    name: user.name, email: user.email, sid: claims.fam,
+  });
+  return { accessToken, refreshToken };
+}
 
 function isValidIanaTz(tz: string): boolean {
   try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; }
@@ -97,8 +118,7 @@ router.post('/register', validate({ body: registerSchema }), async (req: Request
       } catch { /* silent */ }
     }
 
-    const accessToken  = signAccessToken({ sub: user.id, org_id: org.id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = await issueRefreshToken(user.id);
+    const { accessToken, refreshToken } = await issueSessionTokens({ ...user, org_id: org.id }, req);
 
     ok(res, { access_token: accessToken, refresh_token: refreshToken, user: { id: user.id, name, email, role: user.role, org_id: org.id } }, 201);
   } catch (e) { next(e); }
@@ -117,26 +137,25 @@ router.post('/login', validate({ body: loginSchema }), async (req: Request, res:
     const isCurrentlyLocked = user.locked_until && user.locked_until > new Date();
     if (isCurrentlyLocked) {
       // Still increment attempts while locked (for escalation tracking)
-      const attempts = user.login_attempts + 1;
       await prisma.user.update({
         where: { id: user.id },
-        data: { login_attempts: attempts },
+        data: { login_attempts: { increment: 1 } },
+        select: { login_attempts: true },
       });
       throw new AppError('Account locked. Try again later.', 423, 'ACCOUNT_LOCKED');
     }
 
+    // Bound repeated password verification work per account/IP as attempts rise.
+    if (user.login_attempts > 0) await new Promise(resolve => setTimeout(resolve, Math.min(2_000, 100 * 2 ** Math.min(user.login_attempts, 5))));
     const valid = await comparePassword(password, user.password_hash);
     if (!valid) {
-      const attempts = user.login_attempts + 1;
-      const lockUntil = attempts >= 5 ? new Date(Date.now() + 30 * 60 * 1000) : user.locked_until;
-
-      await prisma.user.update({
+      const changed = await prisma.user.update({
         where: { id: user.id },
-        data: {
-          login_attempts: attempts,
-          locked_until: lockUntil,
-        },
+        data: { login_attempts: { increment: 1 } },
+        select: { login_attempts: true },
       });
+      const attempts = changed.login_attempts;
+      if (attempts >= 5) await prisma.user.update({ where: { id: user.id }, data: { locked_until: new Date(Date.now() + 30 * 60 * 1000) } });
 
       // At exactly 5 attempts: lock + notify org super_admins
       if (attempts === 5) {
@@ -211,8 +230,7 @@ router.post('/login', validate({ body: loginSchema }), async (req: Request, res:
     // Full success — reset attempts
     await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
-    const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = await issueRefreshToken(user.id);
+    const { accessToken, refreshToken } = await issueSessionTokens(user, req);
 
     ok(res, {
       access_token: accessToken,
@@ -223,12 +241,32 @@ router.post('/login', validate({ body: loginSchema }), async (req: Request, res:
 });
 
 // ─── POST /auth/logout ─────────────────────────────────
+router.get('/sessions', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const sessions = await listActiveSessions(req.user!.sub);
+    ok(res, sessions.map(session => ({ ...session, is_current: session.id === req.user!.sid })));
+  } catch (e) { next(e); }
+});
+
+router.delete('/sessions/:sessionId', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const sessionId = String(req.params.sessionId);
+    const revoked = await revokeSession(req.user!.sub, sessionId);
+    if (!revoked) throw new AppError('Session not found or already revoked', 404, 'NOT_FOUND');
+    if (sessionId === req.user!.sid) {
+      await blacklistToken(req.user!.jti, Number((req.user as unknown as { exp: number }).exp));
+    }
+    ok(res, { revoked: true, session_id: sessionId });
+  } catch (e) { next(e); }
+});
+
 router.post('/logout', authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const jti = req.user!.jti;
     const exp = (req.user as unknown as { exp: number }).exp;
     await blacklistToken(jti, exp as unknown as number);
-    await revokeAllForUser(req.user!.sub);
+    if (req.user!.sid) await revokeSession(req.user!.sub, req.user!.sid);
+    else await revokeAllForUser(req.user!.sub); // access token issued before session IDs were added
     ok(res, { message: 'Logged out successfully' });
   } catch (e) { next(e); }
 });
@@ -241,11 +279,11 @@ router.post('/refresh', validate({ body: refreshSchema }), async (req: Request, 
 
     // Rotation: the presented token is consumed and a successor is returned.
     // Reusing a consumed token revokes its whole family (leak detection).
-    const { userId, refreshToken } = await rotateRefreshToken(refresh_token);
+    const { userId, refreshToken, sessionId } = await rotateRefreshToken(refresh_token);
     const user = await prisma.user.findUnique({ where: { id: userId } });
     if (!user || !user.is_active) throw new UnauthorizedError('User not found');
 
-    const accessToken = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
+    const accessToken = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email, sid: sessionId });
     ok(res, { access_token: accessToken, refresh_token: refreshToken });
   } catch (e) { next(e); }
 });
@@ -287,6 +325,7 @@ router.post('/reset-password', validate({ body: resetPasswordSchema }), async (r
       where: { id: user.id },
       data: { password_hash: hash, reset_token: null, reset_expires: null, login_attempts: 0 },
     });
+    await revokeAllForUser(user.id);
     ok(res, { message: 'Password reset successfully' });
   } catch (e) { next(e); }
 });
@@ -308,8 +347,7 @@ router.post('/setup-account', validate({ body: setupAccountSchema }), async (req
       data: { password_hash: hash, invite_token: null, invite_expires: null, setup_complete: true },
     });
 
-    const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = await issueRefreshToken(user.id);
+    const { accessToken, refreshToken } = await issueSessionTokens(user, req);
     ok(res, { access_token: accessToken, refresh_token: refreshToken });
   } catch (e) { next(e); }
 });
@@ -332,7 +370,9 @@ router.put('/change-password', authenticate, validate({ body: changePasswordSche
     const hash = await hashPassword(new_password);
     await prisma.user.update({ where: { id: user.id }, data: { password_hash: hash } });
 
-    // Invalidate current session
+    // Password changes revoke every device. This request's access token is
+    // invalidated below as well, so the user signs in again with the new secret.
+    await revokeAllForUser(user.id);
     const jti = req.user!.jti;
     const exp = (req.user as unknown as { exp: number }).exp;
     await blacklistToken(jti, exp);
@@ -390,8 +430,7 @@ router.post('/2fa/authenticate', validate({ body: totpAuthenticateSchema }), asy
     try { await redis.del(attemptsKey); } catch { /* ignore */ }
     await prisma.user.update({ where: { id: user.id }, data: { login_attempts: 0, locked_until: null } });
 
-    const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = await issueRefreshToken(user.id);
+    const { accessToken, refreshToken } = await issueSessionTokens(user, req);
     ok(res, {
       access_token: accessToken,
       refresh_token: refreshToken,
@@ -431,6 +470,7 @@ router.post('/2fa/verify', authenticate, validate({ body: totpVerifySchema }), a
     if (!result.valid) throw new ValidationError('Invalid TOTP code');
 
     await prisma.user.update({ where: { id: user.id }, data: { totp_enabled: true } });
+    await revokeOtherSessionsForUser(user.id, req.user!.sid);
     ok(res, { message: '2FA enabled successfully' });
   } catch (e) { next(e); }
 });
@@ -445,6 +485,7 @@ router.delete('/2fa', authenticate, validate({ body: totpVerifySchema }), async 
     const result = verifySync({ secret: user.totp_secret!, token: String(code) });
     if (!result.valid) throw new AppError('Invalid verification code', 400, 'INVALID_CODE');
     await prisma.user.update({ where: { id: req.user!.sub }, data: { totp_enabled: false, totp_secret: null } });
+    await revokeOtherSessionsForUser(req.user!.sub, req.user!.sid);
     ok(res, { message: '2FA disabled' });
   } catch (e) { next(e); }
 });
@@ -502,8 +543,7 @@ router.get('/sso/google/callback', async (req: Request, res: Response, next: Nex
     }
     if (!user.is_active) throw new AppError('Account is deactivated', 403, 'ACCOUNT_INACTIVE');
 
-    const accessToken  = signAccessToken({ sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email });
-    const refreshToken = await issueRefreshToken(user.id);
+    const { accessToken, refreshToken } = await issueSessionTokens(user, req);
 
     // Store tokens in Redis with a 60-second one-time code
     const onetimeCode = crypto.randomBytes(32).toString('hex');

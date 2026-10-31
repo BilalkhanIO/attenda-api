@@ -11,10 +11,10 @@ export interface AttendanceToolInput {
 export async function attendanceTool(
   prisma: PrismaClient,
   orgId: string,
-  user: { id: string; org_id: string },
-  input: AttendanceToolInput
+  user?: { id: string; org_id: string },
+  input?: AttendanceToolInput
 ) {
-  const { userId, start, end, type } = input;
+  const { userId, start, end, type } = input || {};
   const where: any = { org_id: orgId };
   if (userId) where.user_id = userId;
   if (start) where.date = { gte: new Date(start) };

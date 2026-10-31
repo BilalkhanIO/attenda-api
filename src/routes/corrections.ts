@@ -26,55 +26,8 @@ const CORRECTION_INCLUDE = {
 // ─── POST /attendance/corrections ──────────────────────
 router.post('/', validate({ body: correctionRequestSchema }), async (req, res, next) => {
   try {
-    const { date, requested_check_in, requested_check_out, reason } = req.body;
-    if (!requested_check_in && !requested_check_out) {
-      throw new ValidationError('Provide at least one of requested_check_in / requested_check_out');
-    }
-    const day = new Date(`${date}T00:00:00.000Z`);
-    if (isNaN(day.getTime())) throw new ValidationError('Invalid date');
-    if (day > new Date()) throw new ValidationError('Cannot request a correction for a future date');
-
-    const checkIn = requested_check_in ? new Date(requested_check_in) : null;
-    const checkOut = requested_check_out ? new Date(requested_check_out) : null;
-    if (checkIn && checkOut && checkOut <= checkIn) {
-      throw new ValidationError('requested_check_out must be after requested_check_in');
-    }
-
-    const pending = await prisma.attendanceCorrection.findFirst({
-      where: { user_id: req.user!.sub, date: day, status: 'pending' },
-    });
-    if (pending) throw new AppError('You already have a pending correction for this date', 400, 'DUPLICATE');
-
-    const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: day } },
-    });
-
-    const correction = await prisma.attendanceCorrection.create({
-      data: {
-        user_id: req.user!.sub, org_id: req.user!.org_id,
-        attendance_id: record?.id ?? null, date: day,
-        requested_check_in: checkIn, requested_check_out: checkOut,
-        reason,
-      },
-      include: CORRECTION_INCLUDE,
-    });
-
-    // Notify the manager (falls back silently when the user has none —
-    // HR admins see the queue via GET /attendance/corrections).
-    const submitter = await prisma.user.findUnique({
-      where: { id: req.user!.sub },
-      select: { name: true, manager_id: true },
-    });
-    if (submitter?.manager_id) {
-      createNotification({
-        userId: submitter.manager_id, orgId: req.user!.org_id,
-        type: 'correction_request',
-        title: 'Attendance correction requested',
-        body: `${submitter.name} requested a correction for ${date}`,
-        actionType: 'attendance_correction', actionId: correction.id,
-      }).catch(() => {});
-    }
-    emitOrgEvent(req.user!.org_id, 'attendance_changed');
+    const { submitAttendanceCorrection } = await import('../services/attendance-correction-request');
+    const correction = await submitAttendanceCorrection(req.user!.sub, req.user!.org_id, req.body);
     created(res, correction);
   } catch (e) { next(e); }
 });

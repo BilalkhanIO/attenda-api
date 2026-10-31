@@ -42,6 +42,46 @@ router.get('/', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// Recent per-endpoint delivery outcomes for diagnostics and dead-letter review.
+router.get('/:id/deliveries', async (req, res, next) => {
+  try {
+    const hook = await prisma.orgWebhook.findFirst({
+      where: { id: String(req.params.id), org_id: req.user!.org_id },
+      select: { id: true },
+    });
+    if (!hook) throw new NotFoundError('Webhook');
+    const parsedLimit = Number.parseInt(String(req.query.limit ?? '50'), 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 50;
+    const deliveries = await prisma.orgWebhookDelivery.findMany({
+      where: { org_id: req.user!.org_id, webhook_id: hook.id },
+      orderBy: { created_at: 'desc' }, take: limit,
+      select: {
+        id: true, event: true, status: true, attempts: true,
+        next_attempt_at: true, last_attempt_at: true, delivered_at: true,
+        response_status: true, last_error: true, created_at: true,
+      },
+    });
+    ok(res, { items: deliveries, limit });
+  } catch (e) { next(e); }
+});
+
+router.post('/:id/deliveries/:deliveryId/replay', async (req, res, next) => {
+  try {
+    const webhookId = String(req.params.id);
+    const deliveryId = String(req.params.deliveryId);
+    const replayed = await import('../services/webhookDelivery').then(({ replayWebhookDelivery }) =>
+      replayWebhookDelivery(req.user!.org_id, webhookId, deliveryId),
+    );
+    if (!replayed) throw new NotFoundError('Dead-letter webhook delivery');
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'org.webhook.delivery.replay', entityType: 'org_webhook_delivery', entityId: deliveryId,
+      after: { webhook_id: webhookId },
+    });
+    ok(res, { replayed: true, delivery_id: deliveryId });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /org/outbound-webhooks ───────────────────────
 router.post('/', validate({ body: orgWebhookSchema }), async (req, res, next) => {
   try {

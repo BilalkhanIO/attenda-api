@@ -7,6 +7,7 @@ import { hashPassword, generateToken } from '../utils/auth';
 import { ok, created, paginated, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { PERMISSION_CATALOG } from '../constants/rbac';
 import prisma from '../utils/prisma';
+import { revokeAllForUser } from '../services/refreshTokens';
 
 const router = Router();
 router.use(authenticate);
@@ -456,6 +457,7 @@ router.put('/:id', requirePermission('employees.update'), validate({ body: updat
     if (role !== undefined && role !== user.role) {
       const { upsertUserOrgRole } = await import('../utils/rbac-seed');
       await upsertUserOrgRole(id, req.user!.org_id, role);
+      await revokeAllForUser(id);
     }
 
     ok(res, updated);
@@ -471,7 +473,8 @@ router.patch('/:id/deactivate', requirePermission('employees.deactivate'), async
     const user = await prisma.user.findFirst({ where: { id, org_id: req.user!.org_id, deleted_at: null } });
     if (!user) throw new NotFoundError('User');
 
-    await prisma.user.update({ where: { id }, data: { is_active: false } });
+    await revokeAllForUser(id);
+    await prisma.user.update({ where: { id }, data: { is_active: false, fcm_token: null, fcm_token_updated_at: null } });
 
     // Send deactivation email
     const { sendDeactivationEmail } = await import('../services/email');

@@ -7,8 +7,10 @@ import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
 import { Prisma } from '@prisma/client';
 import { validate } from '../middleware/validate';
-import { orgSettingsSchema, announcementSchema } from '../schemas';
+import { orgSettingsSchema, announcementSchema, attendanceSecuritySchema } from '../schemas';
 import { isScheduledForLater, publishAnnouncement, announcementAudienceWhere } from '../services/announcements';
+import { generateGeminiJson } from '../services/ai/gemini-json';
+import { recordAudit } from '../services/audit';
 
 // ─── PERFORMANCE ──────────────────────────────────────
 export const performanceRouter = Router();
@@ -501,9 +503,6 @@ analyticsRouter.get('/payroll-cost', requirePermission('analytics.advanced'), as
 // ─── AI: GET /analytics/anomalies ─────────────────────
 analyticsRouter.get('/anomalies', requirePermission('analytics.advanced'), async (req, res, next) => {
   try {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
-
     const days = 30;
     const since = new Date(); since.setDate(since.getDate() - days);
 
@@ -524,22 +523,11 @@ analyticsRouter.get('/anomalies', requirePermission('analytics.advanced'), async
       ip: r.ip_detected,
     }));
 
-    const axios = (await import('axios')).default;
-    const res2 = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      {
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        messages: [{
-          role: 'user',
-          content: `You are an HR analytics AI. Analyze this attendance data from the last 30 days and identify anomalies: unusual hours, IP address inconsistencies, sudden schedule changes, suspicious patterns, excessive overtime, or concerning absenteeism.\n\nData:\n${JSON.stringify(summary, null, 2)}\n\nReturn a JSON array of anomalies with fields: user_name, type (e.g. "excessive_overtime", "ip_mismatch", "unusual_hours", "frequent_absence"), severity ("low","medium","high"), description, date.`,
-        }],
-      },
-      { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } },
+    const anomalies = await generateGeminiJson<unknown[]>(
+      `You are an HR analytics assistant. Review the following attendance records from the last 30 days. Identify evidence-based anomalies such as unusually long hours, IP inconsistencies, excessive overtime, or repeated absences. Do not infer misconduct from a single anomaly. Return only a JSON array with fields user_name, type, severity (low, medium, high), description, and date. If nothing is unusual, return [].\n\nAttendance data:\n${JSON.stringify(summary)}`,
+      2048,
     );
-    const text = res2.data.content?.[0]?.text || '[]';
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    const anomalies = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+    if (!Array.isArray(anomalies)) throw new AppError('Gemini returned an invalid attendance analysis.', 502, 'AI_INVALID_RESPONSE');
     ok(res, { anomalies, analyzed_records: records.length, period_days: days });
   } catch (e) { next(e); }
 });
@@ -547,9 +535,6 @@ analyticsRouter.get('/anomalies', requirePermission('analytics.advanced'), async
 // ─── AI: GET /analytics/payroll-anomalies ─────────────
 analyticsRouter.get('/payroll-anomalies', requirePermission('analytics.advanced'), async (req, res, next) => {
   try {
-    const apiKey = process.env.ANTHROPIC_API_KEY;
-    if (!apiKey) throw new AppError('AI service not configured', 503, 'AI_NOT_CONFIGURED');
-
     const records = await prisma.payrollRecord.findMany({
       where: { org_id: req.user!.org_id },
       include: { user: { select: { name: true, department: true } } },
@@ -567,22 +552,12 @@ analyticsRouter.get('/payroll-anomalies', requirePermission('analytics.advanced'
       adjustments: Number(r.manual_adjustment),
     }));
 
-    const axios = (await import('axios')).default;
-    const aiRes = await axios.post(
-      'https://api.anthropic.com/v1/messages',
-      {
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1024,
-        messages: [{
-          role: 'user',
-          content: `You are an HR payroll AI. Analyze this payroll data and flag anomalies: unusual overtime, significant pay deviations from the same employee's history, unexplained manual adjustments, or outliers compared to peers.\n\nData:\n${JSON.stringify(summary, null, 2)}\n\nReturn a JSON array with fields: user_name, type, severity ("low","medium","high"), description, month.`,
-        }],
-      },
-      { headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01', 'content-type': 'application/json' } },
+    const anomalies = await generateGeminiJson<unknown[]>(
+      `You are an HR payroll analytics assistant. Review these payroll records for unusual overtime, significant deviations from the same employee's history, unexplained adjustments, or clear peer outliers. Use only evidence in the data and avoid unsupported conclusions. Return only a JSON array with user_name, type, severity (low, medium, high), description, and month. If no anomalies are supported, return [].\n\nPayroll data:\n${JSON.stringify(summary)}`,
+      2048,
     );
-    const text = aiRes.data.content?.[0]?.text || '[]';
-    const jsonMatch = text.match(/\[[\s\S]*\]/);
-    ok(res, { anomalies: jsonMatch ? JSON.parse(jsonMatch[0]) : [] });
+    if (!Array.isArray(anomalies)) throw new AppError('Gemini returned an invalid payroll analysis.', 502, 'AI_INVALID_RESPONSE');
+    ok(res, { anomalies });
   } catch (e) { next(e); }
 });
 
@@ -787,21 +762,39 @@ orgRouter.get('/whos-out', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-orgRouter.get('/audit-logs', requirePermission('org.settings.update'), async (req, res, next) => {
+orgRouter.get('/audit-logs', requirePermission('org.audit.view'), async (req, res, next) => {
   try {
-    const page  = Math.max(1, parseInt(String(req.query.page  ?? '1')));
-    const limit = Math.min(100, parseInt(String(req.query.limit ?? '50')));
     const where: Record<string, unknown> = { org_id: req.user!.org_id };
     if (req.query.action)      where.action = String(req.query.action);
     if (req.query.entity_type) where.entity_type = String(req.query.entity_type);
 
-    const [items, total] = await Promise.all([
+    const cursorMode = req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string';
+    const parsedLimit = Number.parseInt(String(req.query.limit ?? (cursorMode ? '50' : '50')), 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 50;
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+    if (cursorMode && cursor) {
+      const anchor = await prisma.auditLog.findFirst({
+        where: { ...where, id: cursor },
+        select: { id: true },
+      });
+      if (!anchor) throw new ValidationError('Invalid audit log cursor');
+    }
+
+    const page  = Math.max(1, parseInt(String(req.query.page  ?? '1')));
+    const [rows, total] = await Promise.all([
       prisma.auditLog.findMany({
-        where, orderBy: { created_at: 'desc' },
-        skip: (page - 1) * limit, take: limit,
+        where,
+        ...(cursorMode
+          ? (cursor ? { cursor: { id: cursor }, skip: 1 } : {})
+          : { skip: (page - 1) * limit }),
+        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+        take: cursorMode ? limit + 1 : limit,
       }),
-      prisma.auditLog.count({ where }),
+      cursorMode ? Promise.resolve(0) : prisma.auditLog.count({ where }),
     ]);
+
+    const hasMore = cursorMode && rows.length > limit;
+    const items = hasMore ? rows.slice(0, limit) : rows;
 
     // Resolve actor names in one query
     const actorIds = [...new Set(items.map(i => i.actor_id))];
@@ -809,10 +802,10 @@ orgRouter.get('/audit-logs', requirePermission('org.settings.update'), async (re
       where: { id: { in: actorIds } }, select: { id: true, name: true },
     });
     const nameById = new Map(actors.map(a => [a.id, a.name]));
-    ok(res, {
-      items: items.map(i => ({ ...i, actor_name: nameById.get(i.actor_id) ?? 'Unknown' })),
-      total, page, limit,
-    });
+    const outputItems = items.map(i => ({ ...i, actor_name: nameById.get(i.actor_id) ?? 'Unknown' }));
+    ok(res, cursorMode
+      ? { items: outputItems, next_cursor: hasMore ? items[items.length - 1]?.id ?? null : null, has_more: hasMore, limit }
+      : { items: outputItems, total, page, limit });
   } catch (e) { next(e); }
 });
 
@@ -830,6 +823,56 @@ orgRouter.get('/office-ips', requirePermission('org.office.update'), async (req,
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
     ok(res, { ips: org?.office_ips || [], ssids: org?.office_ssids || [] });
+  } catch (e) { next(e); }
+});
+
+orgRouter.get('/wifi-attendance', requirePermission('org.office.update'), async (req, res, next) => {
+  try {
+    const org = await prisma.organisation.findUniqueOrThrow({ where: { id: req.user!.org_id }, select: { wifi_auto_checkin_enabled: true, wifi_auto_checkout_enabled: true, heartbeat_grace_mins: true, gap_forgiveness_mins: true } });
+    ok(res, org);
+  } catch (e) { next(e); }
+});
+
+orgRouter.put('/wifi-attendance', requirePermission('org.office.update'), async (req, res, next) => {
+  try {
+    const { wifi_auto_checkin_enabled, wifi_auto_checkout_enabled, heartbeat_grace_mins, gap_forgiveness_mins } = req.body;
+    if (typeof wifi_auto_checkin_enabled !== 'boolean' || typeof wifi_auto_checkout_enabled !== 'boolean' || !Number.isInteger(heartbeat_grace_mins) || heartbeat_grace_mins < 10 || heartbeat_grace_mins > 120 || !Number.isInteger(gap_forgiveness_mins) || gap_forgiveness_mins < 0 || gap_forgiveness_mins > 90) throw new ValidationError('Invalid Wi-Fi attendance settings');
+    const org = await prisma.organisation.update({ where: { id: req.user!.org_id }, data: { wifi_auto_checkin_enabled, wifi_auto_checkout_enabled, heartbeat_grace_mins, gap_forgiveness_mins } });
+    if (!wifi_auto_checkout_enabled) await prisma.attendanceRecord.updateMany({ where: { org_id: req.user!.org_id, check_out_at: null, ip_checkout_pending_at: { not: null } }, data: { ip_checkout_pending_at: null } });
+    ok(res, { wifi_auto_checkin_enabled: org.wifi_auto_checkin_enabled, wifi_auto_checkout_enabled: org.wifi_auto_checkout_enabled, heartbeat_grace_mins: org.heartbeat_grace_mins, gap_forgiveness_mins: org.gap_forgiveness_mins });
+  } catch (e) { next(e); }
+});
+
+orgRouter.get('/attendance-security', requirePermission('org.office.update'), async (req, res, next) => {
+  try {
+    const org = await prisma.organisation.findUniqueOrThrow({ where: { id: req.user!.org_id }, select: { attendance_security: true } });
+    const policy = (org.attendance_security && typeof org.attendance_security === 'object' ? org.attendance_security : {}) as Record<string, unknown>;
+    ok(res, {
+      geofence_enabled: policy.geofence_enabled === true,
+      latitude: typeof policy.latitude === 'number' ? policy.latitude : null,
+      longitude: typeof policy.longitude === 'number' ? policy.longitude : null,
+      radius_m: typeof policy.radius_m === 'number' ? policy.radius_m : 150,
+      enforcement: policy.enforcement === 'block' ? 'block' : 'warn',
+      require_location: policy.require_location === true,
+      block_mock_location: policy.block_mock_location === true,
+    });
+  } catch (e) { next(e); }
+});
+
+orgRouter.put('/attendance-security', requirePermission('org.office.update'), validate({ body: attendanceSecuritySchema }), async (req, res, next) => {
+  try {
+    const before = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { attendance_security: true } });
+    const updated = await prisma.organisation.update({
+      where: { id: req.user!.org_id },
+      data: { attendance_security: req.body },
+      select: { attendance_security: true },
+    });
+    recordAudit({
+      orgId: req.user!.org_id, actorId: req.user!.sub,
+      action: 'org.attendance_security.update', entityType: 'organisation', entityId: req.user!.org_id,
+      before: before?.attendance_security, after: updated.attendance_security,
+    });
+    ok(res, updated.attendance_security);
   } catch (e) { next(e); }
 });
 

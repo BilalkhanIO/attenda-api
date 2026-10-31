@@ -4,6 +4,7 @@ import { ok, created, NotFoundError, ValidationError, ForbiddenError } from '../
 import prisma from '../utils/prisma';
 import { PERMISSION_CATALOG } from '../constants/rbac';
 import { seedOrgRbacForOrganisation, seedRbacCatalog } from '../utils/rbac-seed';
+import { revokeAllForUser } from '../services/refreshTokens';
 
 const router = Router();
 router.use(authenticate);
@@ -110,8 +111,6 @@ router.put('/roles/:id/permissions', requirePermission('org.roles.manage'), asyn
       where: { id: roleId, org_id: req.user!.org_id },
     });
     if (!role) throw new NotFoundError('Role');
-    if (role.is_system) throw new ForbiddenError('System role permissions are managed by seed');
-
     const { permission_keys } = req.body as { permission_keys?: string[] };
     if (!Array.isArray(permission_keys)) throw new ValidationError('permission_keys must be an array');
 
@@ -183,6 +182,9 @@ router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (
     if (sync_legacy_role !== false && SYSTEM_SLUGS.has(orgRole.slug)) {
       await prisma.user.update({ where: { id: target.id }, data: { role: orgRole.slug } });
     }
+    // Role changes can remove access immediately; invalidate bearer sessions
+    // so old claims and cached clients cannot continue under the prior role.
+    await revokeAllForUser(target.id);
 
     ok(res, { user_id: target.id, org_role_id: orgRole.id, slug: orgRole.slug });
   } catch (e) { next(e); }

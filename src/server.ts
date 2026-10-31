@@ -3,6 +3,7 @@ import app from './app';
 import prisma from './utils/prisma';
 import { startAllJobs } from './jobs/scheduler';
 import { registerWebhookFanout } from './services/webhookDelivery';
+import { startOrgEventBus, stopOrgEventBus } from './services/notifications';
 import { logger } from './utils/logger';
 
 const PORT = parseInt(process.env.PORT || '5000');
@@ -12,6 +13,15 @@ async function main() {
     // Test DB connection
     await prisma.$connect();
     console.log('✅ Database connected');
+
+    if (process.env.NODE_ENV !== 'test') {
+      // Complete safe, non-destructive RBAC bootstrap before accepting traffic.
+      // Permission checks are DB-driven; requests must not race role seeding.
+      const { seedAllRbac } = await import('./utils/rbac-seed');
+      await seedAllRbac();
+      logger.info('RBAC catalog, role defaults, and missing assignments verified');
+      await startOrgEventBus();
+    }
 
     const server = app.listen(PORT, '0.0.0.0', () => {
       console.log(`🚀 Attenda API running on http://0.0.0.0:${PORT}`);
@@ -23,24 +33,13 @@ async function main() {
     if (process.env.NODE_ENV !== 'test') {
       startAllJobs();
       registerWebhookFanout();
-
-      // Self-heal RBAC seed data. Production deployments run SQL migrations
-      // only (scripts/migrate.js) and never the demo seed, so the permission
-      // catalog, platform roles, and platform-admin role assignments can be
-      // missing — which makes every permission-gated /admin route 403 for
-      // legitimate platform admins. All three seeders are idempotent upserts.
-      (async () => {
-        const { seedRbacCatalog, seedPlatformUserRoles } = await import('./utils/rbac-seed');
-        await seedRbacCatalog();
-        await seedPlatformUserRoles();
-        logger.info('RBAC catalog + platform role assignments verified');
-      })().catch(err => logger.error({ err }, 'RBAC self-heal failed'));
     }
 
     // ─── Graceful shutdown ─────────────────────────────
     const shutdown = async (signal: string) => {
       console.log(`\n${signal} received. Shutting down gracefully...`);
       server.close(async () => {
+        await stopOrgEventBus();
         await prisma.$disconnect();
         console.log('Database disconnected. Server closed.');
         process.exit(0);

@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import { verifyAccessToken, JwtPayload } from '../utils/auth';
 import { UnauthorizedError, ForbiddenError } from '../utils/response';
 import redis from '../utils/redis';
+import prisma from '../utils/prisma';
 import {
   can,
   hasFeature,
@@ -40,6 +41,20 @@ async function isBlacklisted(jti: string): Promise<boolean> {
   }
 }
 
+async function isSessionRevoked(sessionId: string): Promise<boolean> {
+  try {
+    if ((await redis.get(`sid:${sessionId}`)) !== null) return true;
+    // Redis is the hot-path marker; the session row is durable truth when a
+    // revocation had to commit during a Redis outage.
+    const session = await prisma.userSession.findUnique({ where: { id: sessionId }, select: { revoked_at: true, expires_at: true } });
+    if (!session?.revoked_at) return false;
+    await redis.setex(`sid:${sessionId}`, Math.max(1, Math.ceil((session.expires_at.getTime() - Date.now()) / 1000)), '1');
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 // ─── Authenticate ─────────────────────────────────────
 export async function authenticate(req: Request, _res: Response, next: NextFunction) {
   try {
@@ -53,6 +68,9 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
     if (await isBlacklisted(payload.jti)) {
       throw new UnauthorizedError('Token has been revoked');
     }
+    if (payload.sid && await isSessionRevoked(payload.sid)) {
+      throw new UnauthorizedError('Session has been revoked');
+    }
 
     req.user = payload;
     next();
@@ -62,10 +80,11 @@ export async function authenticate(req: Request, _res: Response, next: NextFunct
     next(new UnauthorizedError(message.includes('expired') ? 'Token expired' : 'Invalid token'));
   }
 }
+Object.assign(authenticate, { __openapi: { auth: 'required' as const } });
 
 // ─── Require role (route-level access control) ────────
 export function requireRole(...roles: string[]) {
-  return (req: Request, _res: Response, next: NextFunction) => {
+  const middleware = (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user) return next(new UnauthorizedError());
     if (req.user.role === 'platform_admin' && !roles.includes('platform_admin')) {
       return next(new ForbiddenError());
@@ -77,6 +96,8 @@ export function requireRole(...roles: string[]) {
     if (!hasAccess) return next(new ForbiddenError());
     next();
   };
+  Object.assign(middleware, { __openapi: { auth: 'required' as const, roles } });
+  return middleware;
 }
 
 // ─── At least manager ─────────────────────────────────
@@ -86,7 +107,7 @@ export const requireSuperAdmin = requireRole('super_admin');
 
 // ─── Permission gating (dynamic RBAC only) ────────────
 export function requirePermission(...permissionKeys: string[]) {
-  return async (req: Request, _res: Response, next: NextFunction) => {
+  const middleware = async (req: Request, _res: Response, next: NextFunction) => {
     try {
       if (!req.user) return next(new UnauthorizedError());
 
@@ -110,11 +131,13 @@ export function requirePermission(...permissionKeys: string[]) {
       next(e);
     }
   };
+  Object.assign(middleware, { __openapi: { auth: 'required' as const, permissions: permissionKeys } });
+  return middleware;
 }
 
 // ─── Org plan feature gating ──────────────────────────
 export function requireOrgFeature(...featureKeys: string[]) {
-  return async (req: Request, _res: Response, next: NextFunction) => {
+  const middleware = async (req: Request, _res: Response, next: NextFunction) => {
     try {
       if (!req.user) return next(new UnauthorizedError());
       if (req.user.role === 'platform_admin') return next(new ForbiddenError());
@@ -126,6 +149,8 @@ export function requireOrgFeature(...featureKeys: string[]) {
       next(e);
     }
   };
+  Object.assign(middleware, { __openapi: { auth: 'required' as const, features: featureKeys } });
+  return middleware;
 }
 
 // ─── Org scoping helper ───────────────────────────────
@@ -153,3 +178,4 @@ export async function optionalAuth(req: Request, _res: Response, next: NextFunct
   } catch { /* ignore — treat as unauthenticated */ }
   next();
 }
+Object.assign(optionalAuth, { __openapi: { auth: 'optional' as const } });

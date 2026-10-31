@@ -15,18 +15,18 @@ export async function leaveBalancesTool(
   if (userId) where.user_id = userId;
   if (leaveType) where.leave_type = leaveType;
 
-  const balances = await prisma.leave_balance.findMany({
+  const balances = await prisma.leaveBalance.findMany({
     where,
     include: { user: { select: { id: true, name: true, email: true } } },
   });
 
-  return balances.map(b => ({
+return balances.map(b => ({
     userId: b.user_id,
     userName: b.user?.name,
     email: b.user?.email,
     leaveType: b.leave_type,
-    totalDays: b.total_days,
-    usedDays: b.used_days,
-    balance: b.total_days - b.used_days,
+    totalDays: Number(b.total_days ?? 0),
+    usedDays: Number(b.used_days ?? 0),
+    balance: Number(b.total_days ?? 0) - Number(b.used_days ?? 0),
   }));
 }

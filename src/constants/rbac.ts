@@ -33,6 +33,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'attendance.override', module: 'attendance', description: 'Override attendance records' },
   { key: 'attendance.export', module: 'attendance', description: 'Export attendance reports' },
   { key: 'attendance.late_notices.manage', module: 'attendance', description: 'Acknowledge late arrival notices' },
+  { key: 'attendance.review_flags', module: 'attendance', description: 'Review flagged attendance check-ins' },
   // Leave
   { key: 'leave.view_team', module: 'leave', description: 'View team leave requests' },
   { key: 'leave.approve', module: 'leave', description: 'Approve or reject leave requests' },
@@ -43,8 +44,11 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'shifts.manage', module: 'shifts', description: 'Create and edit shift templates' },
   { key: 'shifts.assign', module: 'shifts', description: 'Assign shifts to employees' },
   { key: 'shifts.breaks.manage', module: 'shifts', description: 'Manage shift breaks' },
+  { key: 'shifts.checkpoints.manage', module: 'shifts', description: 'Create and manage on-site safety checkpoints' },
   { key: 'shifts.swaps.approve', module: 'shifts', description: 'Approve shift swaps' },
   { key: 'shifts.ai_schedule', module: 'shifts', description: 'Use AI scheduling' },
+  { key: 'shifts.availability.manage', module: 'shifts', description: 'Review employee availability requests' },
+  { key: 'shifts.coverage.manage', module: 'shifts', description: 'Set shift coverage requirements' },
   // Payroll
   { key: 'payroll.view', module: 'payroll', description: 'View payroll records' },
   { key: 'payroll.manage', module: 'payroll', description: 'Generate and adjust payroll' },
@@ -60,6 +64,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   // Org settings
   { key: 'org.settings.view', module: 'org', description: 'View org settings' },
   { key: 'org.settings.update', module: 'org', description: 'Update org settings' },
+  { key: 'org.audit.view', module: 'org', description: 'View organization audit history' },
   { key: 'org.office.update', module: 'org', description: 'Manage office IPs and SSIDs' },
   { key: 'org.whatsapp.update', module: 'org', description: 'Configure WhatsApp integration' },
   { key: 'org.qr.manage', module: 'org', description: 'Manage check-in QR codes' },
@@ -76,6 +81,10 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   // Performance
   { key: 'performance.view', module: 'performance', description: 'View performance reviews' },
   { key: 'performance.manage', module: 'performance', description: 'Submit reviews and goals' },
+  // Projects
+  { key: 'projects.view', module: 'projects', description: 'View assigned projects and tasks' },
+  { key: 'projects.manage', module: 'projects', description: 'Create and manage projects and members' },
+  { key: 'projects.tasks.manage', module: 'projects', description: 'Create and assign project tasks' },
   // Remote work
   { key: 'remote.approve', module: 'remote', description: 'Approve remote work sessions' },
   // WhatsApp
@@ -101,6 +110,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'platform.users.manage', module: 'platform', description: 'Manage platform admin users' },
   { key: 'platform.audit.view', module: 'platform', description: 'View platform admin activity logs' },
   { key: 'platform.broadcast.send', module: 'platform', description: 'Broadcast announcements to organisations' },
+  { key: 'platform.roles.manage', module: 'platform', description: 'Manage platform roles and permissions' },
 ];
 
 const allKeys = () => PERMISSION_CATALOG.map(p => p.key);

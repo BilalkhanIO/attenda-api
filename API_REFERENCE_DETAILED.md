@@ -1,5 +1,7 @@
 # Attenda Exhaustive API Reference (Detailed)
 
+> **Current documentation:** This older endpoint reference is incomplete. Use [BACKEND_API_AND_LOGIC.md](BACKEND_API_AND_LOGIC.md) for the current mounted routes, permissions, workflows, and operational logic.
+
 This document provides the exact technical contract for Frontend and Mobile developers.
 
 ---

@@ -18,8 +18,8 @@ interface AuditEntry {
  * auditing must never fail the business operation, but failures are logged
  * loudly because a silent audit gap is itself an incident.
  */
-export function recordAudit(entry: AuditEntry): void {
-  prisma.auditLog
+export function recordAudit(entry: AuditEntry): Promise<void> {
+  return prisma.auditLog
     .create({
       data: {
         org_id: entry.orgId,
@@ -32,5 +32,6 @@ export function recordAudit(entry: AuditEntry): void {
         reason: entry.reason ?? null,
       },
     })
-    .catch(err => logger.error({ err, action: entry.action, entity: entry.entityId }, 'audit write failed'));
+    .then(() => undefined)
+    .catch(err => { logger.error({ err, action: entry.action, entity: entry.entityId }, 'audit write failed'); });
 }

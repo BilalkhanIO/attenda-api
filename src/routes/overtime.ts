@@ -12,38 +12,8 @@ router.use(authenticate);
 // ─── POST /overtime/requests ──────────────────────────
 router.post('/requests', validate({ body: overtimeRequestSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { attendance_id, reason } = req.body;
-    if (!attendance_id) throw new ValidationError('attendance_id required');
-
-    const record = await prisma.attendanceRecord.findFirst({
-      where: { id: attendance_id, user_id: req.user!.sub, org_id: req.user!.org_id },
-      include: { shift: true },
-    });
-    if (!record) throw new NotFoundError('Attendance record');
-    if (!record.shift?.overtime_enabled) throw new ValidationError('Overtime is not enabled for this shift');
-    if (!record.shift.overtime_requires_approval) throw new ValidationError('This shift counts overtime automatically');
-    if ((record.extra_office_minutes ?? 0) <= 0) throw new ValidationError('No extra office time available to request');
-
-    const request = await prisma.overtimeRequest.upsert({
-      where: { attendance_id: record.id },
-      update: {
-        requested_minutes: record.extra_office_minutes,
-        reason: reason?.trim() || null,
-        status: 'pending',
-        reviewed_by: null,
-        reviewed_at: null,
-        rejection_reason: null,
-      },
-      create: {
-        attendance_id: record.id,
-        user_id: req.user!.sub,
-        org_id: req.user!.org_id,
-        requested_minutes: record.extra_office_minutes,
-        reason: reason?.trim() || null,
-      },
-    });
-
-    emitOrgEvent(req.user!.org_id, 'overtime_changed');
+    const { submitOvertimeRequest } = await import('../services/overtime-request');
+    const request = await submitOvertimeRequest(req.user!.sub, req.user!.org_id, req.body);
     created(res, request);
   } catch (e) { next(e); }
 });

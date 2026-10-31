@@ -13,7 +13,7 @@ const ROLE_DISPLAY_NAMES: Record<string, string> = {
 };
 
 // Permission sets defined inline (formerly LEGACY_ROLE_PERMISSIONS in constants/rbac.ts)
-const EMPLOYEE_PERMS: string[] = [];
+const EMPLOYEE_PERMS: string[] = ['projects.view'];
 
 const MANAGER_PERMS = [
   ...EMPLOYEE_PERMS,
@@ -21,13 +21,20 @@ const MANAGER_PERMS = [
   'attendance.view_team',
   'attendance.override',
   'attendance.late_notices.manage',
+  'attendance.review_flags',
   'leave.view_team',
   'leave.approve',
   'shifts.view',
+  'shifts.assign',
+  'shifts.availability.manage',
+  'shifts.coverage.manage',
   'shifts.breaks.manage',
+  'shifts.checkpoints.manage',
   'shifts.swaps.approve',
   'performance.view',
   'performance.manage',
+  'projects.manage',
+  'projects.tasks.manage',
   'analytics.view',
   'remote.approve',
   'expenses.view',
@@ -71,6 +78,7 @@ const HR_ADMIN_PERMS = [
 
 const SUPER_ADMIN_PERMS = [
   ...HR_ADMIN_PERMS,
+  'org.audit.view',
   'org.settings.update',
   'org.office.update',
   'org.whatsapp.update',
@@ -97,21 +105,22 @@ export async function seedRbacCatalog() {
   }
 
   for (const role of PLATFORM_ROLE_DEFS) {
-    await prisma.platformRole.upsert({
-      where: { slug: role.slug },
-      update: { name: role.name, description: role.description },
-      create: { slug: role.slug, name: role.name, description: role.description },
-    });
-    for (const key of role.permissions) {
-      await prisma.platformRolePermission.upsert({
-        where: {
-          platform_role_slug_permission_key: {
-            platform_role_slug: role.slug,
-            permission_key: key,
-          },
+    const existing = await prisma.platformRole.findUnique({ where: { slug: role.slug } });
+    if (!existing) {
+      await prisma.platformRole.create({
+        data: {
+          slug: role.slug,
+          name: role.name,
+          description: role.description,
+          permissions: { create: role.permissions.map(permission_key => ({ permission_key })) },
         },
-        update: {},
-        create: { platform_role_slug: role.slug, permission_key: key },
+      });
+    } else {
+      // Role permission assignments are administrator-managed data. Keep
+      // startup seeding from restoring permissions that an admin removed.
+      await prisma.platformRole.update({
+        where: { slug: role.slug },
+        data: { name: role.name, description: role.description },
       });
     }
   }
@@ -122,10 +131,13 @@ export async function seedRbacCatalog() {
 export async function seedOrgRbacForOrganisation(orgId: string) {
   for (const slug of SYSTEM_ORG_ROLE_SLUGS) {
     const permKeys = [...(SYSTEM_ROLE_PERMISSIONS[slug] ?? [])];
-    const orgRole = await prisma.orgRole.upsert({
+    const existing = await prisma.orgRole.findUnique({
       where: { org_id_slug: { org_id: orgId, slug } },
-      update: { name: ROLE_DISPLAY_NAMES[slug] ?? slug, is_system: true },
-      create: {
+    });
+    if (existing) continue;
+
+    const orgRole = await prisma.orgRole.create({
+      data: {
         org_id: orgId,
         slug,
         name: ROLE_DISPLAY_NAMES[slug] ?? slug,
@@ -133,7 +145,6 @@ export async function seedOrgRbacForOrganisation(orgId: string) {
       },
     });
 
-    await prisma.orgRolePermission.deleteMany({ where: { org_role_id: orgRole.id } });
     if (permKeys.length) {
       await prisma.orgRolePermission.createMany({
         data: permKeys.map(permission_key => ({ org_role_id: orgRole.id, permission_key })),
@@ -169,14 +180,19 @@ export async function backfillUserOrgRoles(orgId: string): Promise<void> {
   });
 
   for (const u of users) {
-    await upsertUserOrgRole(u.id, orgId, u.role);
+    const existing = await prisma.userOrgRole.findUnique({ where: { user_id: u.id }, select: { id: true } });
+    if (!existing) await upsertUserOrgRole(u.id, orgId, u.role);
   }
 }
 
 /** Link platform_admin users to platform_admin role */
 export async function seedPlatformUserRoles() {
   const platformUsers = await prisma.user.findMany({
-    where: { role: 'platform_admin', deleted_at: null },
+    where: {
+      role: 'platform_admin',
+      deleted_at: null,
+      platform_role_assignments: { none: {} },
+    },
     select: { id: true },
   });
 

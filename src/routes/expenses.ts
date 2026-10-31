@@ -84,7 +84,7 @@ router.get('/me', async (req, res, next) => {
 });
 
 // ─── GET /expenses ─────────────────────────────────────
-router.get('/', requirePermission('expenses.view'), async (req, res, next) => {
+router.get('/', requirePermission('expenses.view', 'expenses.manage'), async (req, res, next) => {
   try {
     const { status = 'pending' } = req.query as Record<string, string>;
     if (status !== 'all' && !EXPENSE_STATUSES.includes(status as typeof EXPENSE_STATUSES[number])) {

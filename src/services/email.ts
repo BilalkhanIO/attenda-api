@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import { BrevoClient } from '@getbrevo/brevo';
 
 interface MailOptions {
   to:      string;
@@ -28,8 +29,24 @@ function getTransporter() {
 
 // ─── Send wrapper ─────────────────────────────────────
 export async function sendEmail(opts: MailOptions): Promise<void> {
+  const brevoApiKey = process.env.BREVO_API_KEY?.trim();
+  if (brevoApiKey) {
+    const client = new BrevoClient({ apiKey: brevoApiKey });
+    await client.transactionalEmails.sendTransacEmail({
+      sender: {
+        name: process.env.BREVO_FROM_NAME || 'Attenda',
+        email: process.env.BREVO_FROM_EMAIL || process.env.SMTP_FROM || 'noreply@attenda.app',
+      },
+      to: [{ email: opts.to }],
+      subject: opts.subject,
+      htmlContent: opts.html,
+      textContent: opts.text || opts.html.replace(/<[^>]*>/g, ''),
+    });
+    return;
+  }
+
   const transporter = getTransporter();
-  const info = await transporter.sendMail({
+  await transporter.sendMail({
     from:    `"Attenda" <${process.env.SMTP_FROM || 'noreply@attenda.app'}>`,
     to:      opts.to,
     subject: opts.subject,

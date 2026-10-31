@@ -1,0 +1,2 @@
+ALTER TABLE "project_tasks"
+ADD COLUMN IF NOT EXISTS "is_milestone" BOOLEAN NOT NULL DEFAULT false;

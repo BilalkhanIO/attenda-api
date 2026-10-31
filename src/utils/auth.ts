@@ -12,6 +12,7 @@ export interface JwtPayload {
   name:   string;
   email:  string;
   jti:    string;
+  sid?:  string;
 }
 
 // ─── JWT ──────────────────────────────────────────────

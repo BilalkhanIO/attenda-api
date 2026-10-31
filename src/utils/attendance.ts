@@ -12,14 +12,18 @@ export interface BreakSettlement {
 export async function calculateBreakTotals(attendanceId: string): Promise<BreakSettlement> {
   const all = await prisma.breakRecord.findMany({
     where: { attendance_id: attendanceId, break_end: { not: null } },
+    include: { shift_break: true },
   });
 
-  const paidMins = all
-    .filter(b => b.is_paid)
-    .reduce((sum, b) => sum + (b.duration_mins || 0), 0);
-  const unpaidMins = all
-    .filter(b => !b.is_paid)
-    .reduce((sum, b) => sum + (b.duration_mins || 0), 0);
+  let paidMins = 0;
+  let unpaidMins = 0;
+  for (const b of all) {
+    const duration = b.duration_mins || 0;
+    const paid = !b.is_paid ? 0 : b.shift_break?.deduct_extra_time && !b.counted_as_extra
+      ? Math.min(duration, b.shift_break.break_minutes) : duration;
+    paidMins += paid;
+    unpaidMins += duration - paid;
+  }
 
   return { paidMins, unpaidMins, totalMins: paidMins + unpaidMins };
 }
@@ -85,7 +89,7 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
     const lateReturnMins = calcLateReturnMins(b.shift_break as any, at, orgTimezone, mins);
     await prisma.breakRecord.update({
       where: { id: b.id },
-      data:  { break_end: at, duration_mins: mins, auto_ended: true, late_return_minutes: lateReturnMins, wifi_on_at_end: false } as any,
+      data:  { break_end: at, duration_mins: mins, auto_ended: true, late_return_minutes: lateReturnMins, wifi_on_at_end: null } as any,
     });
   }
 
@@ -93,8 +97,9 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
     where: { attendance_id: attendanceId, break_end: { not: null } },
   });
 
-  const paidMins = all.filter(b => b.is_paid).reduce((s, b) => s + (b.duration_mins || 0), 0);
-  let unpaidMins = all.filter(b => !b.is_paid).reduce((s, b) => s + (b.duration_mins || 0), 0);
+  const totals = await calculateBreakTotals(attendanceId);
+  const paidMins = totals.paidMins;
+  let unpaidMins = totals.unpaidMins;
 
   // Auto-deduct any mandatory flexible shift breaks that the employee missed taking.
   const attendance = await prisma.attendanceRecord.findUnique({
@@ -107,6 +112,10 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
     let missingUnpaid = 0;
 
     for (const shiftBreak of (attendance.shift.breaks as any[])) {
+      const date = attendance.date;
+      const days = shiftBreak.applies_days ?? [];
+      const dates = shiftBreak.exception_dates ?? [];
+      if ((days.length && !days.includes(date.getUTCDay())) || (dates.length && !dates.includes(date.toISOString().slice(0, 10)))) continue;
       if (shiftBreak.break_kind === 'flexible') continue;
       const deductIfSkipped = (shiftBreak as any).deduct_if_skipped ?? true;
       if (!deductIfSkipped) continue;
@@ -123,13 +132,29 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
         localEnd.setHours(h, m, 0, 0);
         const breakEndUtc = fromZonedTime(localEnd, orgTimezone);
         if (at <= breakEndUtc) continue; // break window hasn't passed yet — don't deduct
+        const breakStartUtc = new Date(breakEndUtc.getTime() - shiftBreak.break_minutes * 60000);
+        const workStart = attendance.scheduled_start && attendance.scheduled_start > attendance.check_in_at ? attendance.scheduled_start : attendance.check_in_at;
+        const workEnd = attendance.scheduled_end && attendance.scheduled_end < at ? attendance.scheduled_end : at;
+        if (workStart >= breakEndUtc || workEnd <= breakStartUtc) continue;
       } else {
         if (minutesSinceCheckIn <= shiftBreak.after_minutes) continue;
       }
       const takenForTemplate = all
         .filter(b => b.shift_break_id === shiftBreak.id)
         .reduce((s, b) => s + (b.duration_mins || 0), 0);
-      const templateMissing = Math.max(0, shiftBreak.break_minutes - takenForTemplate);
+      let eligibleMinutes = shiftBreak.break_minutes;
+      if (shiftBreak.break_end_time) {
+        const { fromZonedTime, toZonedTime } = require('date-fns-tz');
+        const [h, m] = shiftBreak.break_end_time.split(':').map(Number);
+        const localEnd = toZonedTime(at, orgTimezone);
+        localEnd.setHours(h, m, 0, 0);
+        const end = fromZonedTime(localEnd, orgTimezone);
+        const start = new Date(end.getTime() - shiftBreak.break_minutes * 60000);
+        const workStart = attendance.scheduled_start && attendance.scheduled_start > attendance.check_in_at ? attendance.scheduled_start : attendance.check_in_at;
+        const workEnd = attendance.scheduled_end && attendance.scheduled_end < at ? attendance.scheduled_end : at;
+        eligibleMinutes = Math.max(0, Math.round((Math.min(end.getTime(), workEnd.getTime()) - Math.max(start.getTime(), workStart.getTime())) / 60000));
+      }
+      const templateMissing = Math.max(0, eligibleMinutes - takenForTemplate);
       if (templateMissing <= 0) continue;
 
       const compStart = new Date(at.getTime() - templateMissing * 60000);
@@ -172,10 +197,13 @@ export async function netExtraMinutesAfterShift(
   const end = scheduledEnd;
   if (checkOutAt <= end) return 0;
   const breaks = await prisma.breakRecord.findMany({
-    where: { attendance_id: attendanceId, is_paid: false, break_end: { not: null } },
+    where: { attendance_id: attendanceId, break_end: { not: null } },
+    include: { shift_break: true },
   });
   const unpaidOverlap = breaks.reduce((sum, b) => {
-    const start = b.break_start > end ? b.break_start : end;
+    const paidMinutes = b.is_paid ? (b.shift_break?.deduct_extra_time && !b.counted_as_extra ? Math.min(b.duration_mins || 0, b.shift_break.break_minutes) : (b.duration_mins || 0)) : 0;
+    const unpaidStart = new Date(b.break_start.getTime() + paidMinutes * 60000);
+    const start = unpaidStart > end ? unpaidStart : end;
     const stop = b.break_end && b.break_end < checkOutAt ? b.break_end : checkOutAt;
     return stop > start ? sum + Math.round((stop.getTime() - start.getTime()) / 60000) : sum;
   }, 0);

@@ -66,8 +66,18 @@ function expressPathToOpenApi(path: string): { path: string; params: string[] } 
   return { path: converted, params };
 }
 
-type TaggedHandler = { __validationSchemas?: ValidationSchemas };
+type OpenApiMetadata = {
+  auth?: 'required' | 'optional';
+  permissions?: string[];
+  features?: string[];
+  roles?: string[];
+};
+type TaggedHandler = {
+  __validationSchemas?: ValidationSchemas;
+  __openapi?: OpenApiMetadata;
+};
 interface RouteLayer {
+  handle?: TaggedHandler;
   route?: {
     path: string;
     methods: Record<string, boolean>;
@@ -81,10 +91,26 @@ export function buildOpenApiDoc(mounts: Array<[string, Router]>): Record<string,
   for (const [prefix, router] of mounts) {
     const tag = prefix.split('/').filter(Boolean).pop() || 'root';
     const stack = (router as unknown as { stack: RouteLayer[] }).stack ?? [];
+    // Router.use() middleware applies to every route in that router. Route
+    // middleware is then merged in below for routes with per-operation guards.
+    const routerMetadata = stack
+      .filter(layer => !layer.route)
+      .map(layer => layer.handle?.__openapi)
+      .filter((metadata): metadata is OpenApiMetadata => !!metadata);
 
     for (const layer of stack) {
       if (!layer.route) continue;
       const { path, params } = expressPathToOpenApi(`${prefix}${layer.route.path === '/' ? '' : layer.route.path}`);
+      const routeMetadata = layer.route.stack.flatMap(item => {
+        const metadata = item.handle.__openapi;
+        return metadata ? [metadata] : [];
+      });
+      const metadata = [...routerMetadata, ...routeMetadata];
+      const requiresAuth = metadata.some(item => item.auth === 'required');
+      const allowsOptionalAuth = metadata.some(item => item.auth === 'optional') && !requiresAuth;
+      const permissions = [...new Set(metadata.flatMap(item => item.permissions ?? []))].sort();
+      const features = [...new Set(metadata.flatMap(item => item.features ?? []))].sort();
+      const roles = [...new Set(metadata.flatMap(item => item.roles ?? []))].sort();
       const schemas = layer.route.stack
         .map(s => s.handle.__validationSchemas)
         .find(Boolean);
@@ -95,12 +121,34 @@ export function buildOpenApiDoc(mounts: Array<[string, Router]>): Record<string,
           summary: `${method.toUpperCase()} ${path}`,
           tags: [tag],
           responses: ENVELOPE_RESPONSES,
-          security: [{ bearerAuth: [] }],
         };
+        if (requiresAuth) op.security = [{ bearerAuth: [] }];
+        else if (allowsOptionalAuth) op.security = [{}, { bearerAuth: [] }];
+        if (permissions.length) {
+          (op as OperationObject & Record<string, unknown>)['x-required-permissions'] = permissions;
+          (op as OperationObject & Record<string, unknown>)['x-permission-match'] = 'any';
+        }
+        if (features.length) {
+          (op as OperationObject & Record<string, unknown>)['x-required-features'] = features;
+          (op as OperationObject & Record<string, unknown>)['x-feature-match'] = 'all';
+        }
+        if (roles.length) (op as OperationObject & Record<string, unknown>)['x-required-roles'] = roles;
         if (params.length) {
           op.parameters = params.map(name => ({
             name, in: 'path', required: true, schema: { type: 'string' },
           }));
+        }
+        if (schemas?.query) {
+          const querySchema = toJsonSchema(schemas.query);
+          const properties = querySchema.properties as Record<string, Record<string, unknown>> | undefined;
+          const required = new Set(Array.isArray(querySchema.required) ? querySchema.required as string[] : []);
+          const queryParameters = Object.entries(properties ?? {}).map(([name, schema]) => ({
+            name,
+            in: 'query',
+            required: required.has(name),
+            schema,
+          }));
+          op.parameters = [...(op.parameters ?? []), ...queryParameters];
         }
         if (schemas?.body && ['post', 'put', 'patch'].includes(method)) {
           op.requestBody = {

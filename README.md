@@ -20,10 +20,9 @@ cp .env.example .env
 # 2. Install
 npm install
 
-# 3. Set up database
-npm run db:push        # Push schema to DB (dev)
-# OR
-npm run db:migrate     # Run migrations (production)
+# 3. Apply committed migrations
+npx prisma migrate deploy
+# For local migration authoring only, use: npm run db:migrate
 
 # 4. Seed demo data
 npm run db:seed
@@ -36,6 +35,8 @@ The API will be live at `http://localhost:5000`.
 
 ## API Base URL
 All routes prefixed with `/api/v1`
+
+For the current route catalogue, authorization model, response contract, and detailed business workflows, see [Backend API and Logic](BACKEND_API_AND_LOGIC.md). That document reflects the active router mounts; this README's older route summary is retained for quick orientation only.
 
 ## Authentication
 All protected endpoints require:

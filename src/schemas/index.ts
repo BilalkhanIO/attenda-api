@@ -112,9 +112,40 @@ export const checkinSchema = z.object({
   type: z.enum(['manual', 'qr', 'remote']).optional(),
   qr_code: z.string().optional(),
   duration_type: z.string().max(30).optional(),
+  idempotency_key: z.string().min(16).max(100).optional(),
+  client_event_at: z.string().datetime().optional(),
+  offline: z.boolean().optional(),
+  device_uptime_ms: z.number().nonnegative().optional(),
+  server_anchor_uptime_ms: z.number().nonnegative().optional(),
+  clock_epoch: z.string().min(8).max(80).optional(),
+  server_anchor_epoch: z.string().min(8).max(80).optional(),
+  attendance_clock_anchor: z.string().min(40).max(1000).optional(),
+  latitude: z.coerce.number().min(-90).max(90).optional(),
+  longitude: z.coerce.number().min(-180).max(180).optional(),
+  accuracy_m: z.coerce.number().min(0).max(10000).optional(),
+  is_mocked: z.boolean().optional(),
   count_away_as_break: z.boolean().optional(),
   away_shift_break_id: z.string().optional(),
 }).passthrough();
+
+export const attendanceSecuritySchema = z.object({
+  geofence_enabled: z.boolean(),
+  latitude: z.number().min(-90).max(90).nullable(),
+  longitude: z.number().min(-180).max(180).nullable(),
+  radius_m: z.number().int().min(25).max(5000),
+  enforcement: z.enum(['block', 'warn']),
+  require_location: z.boolean(),
+  block_mock_location: z.boolean(),
+}).superRefine((value, ctx) => {
+  if (value.geofence_enabled && (value.latitude === null || value.longitude === null)) {
+    ctx.addIssue({ code: 'custom', message: 'Set the office latitude and longitude before enabling the geofence' });
+  }
+});
+
+export const attendanceReviewResolveSchema = z.object({
+  decision: z.enum(['approve', 'reject', 'request_recheck']),
+  note: z.string().trim().min(5).max(2000),
+});
 
 export const checkoutSchema = z.object({
   extra_office_minutes: z.coerce.number().int().min(0).optional(),
@@ -360,6 +391,7 @@ export const WEBHOOK_EVENT_TYPES = [
   'remote_changed',
   'swap_changed',
   'expense_changed',
+  'shift_changed',
 ] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
 

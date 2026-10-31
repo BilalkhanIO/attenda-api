@@ -1,5 +1,6 @@
 import prisma from '../utils/prisma';
 import { jobLogger } from '../utils/logger';
+import { toZonedTime } from 'date-fns-tz';
 
 export interface AccrualPolicy {
   days_per_year: number;
@@ -59,68 +60,85 @@ export function carryOver(policy: AccrualPolicy, priorTotal: number, priorUsed: 
 }
 
 /**
- * Monthly accrual run (scheduled on the 1st). For each org with a policy,
- * for each active user and configured type:
- * - January: create this year's balance seeded with capped carry-over from
- *   last year, plus this month's increment.
- * - Other months: increment total_days on this year's row (creating it
- *   pro-rata-empty first if the user joined mid-year).
- * Idempotence: the scheduler's Redis tick-lock prevents double runs per
- * minute; the job itself runs once per month by schedule.
+ * Apply one monthly accrual per organization-local calendar period. A unique
+ * (org, year, month) run row and the balance mutations share a transaction,
+ * so duplicate schedulers either commit the full run once or roll back.
  */
-export async function runMonthlyAccrual(now = new Date()): Promise<{ orgs: number; balances: number }> {
-  const year = now.getUTCFullYear();
-  const month = now.getUTCMonth() + 1;
+export async function runMonthlyAccrual(
+  now = new Date(),
+  onlyOrgIds?: string[],
+): Promise<{ orgs: number; balances: number; skipped: number }> {
   let orgsProcessed = 0;
   let balancesTouched = 0;
+  let skipped = 0;
 
   const orgs = await prisma.organisation.findMany({
-    where: { leave_accrual: { not: undefined } },
-    select: { id: true, leave_accrual: true },
+    where: { ...(onlyOrgIds?.length ? { id: { in: onlyOrgIds } } : {}) },
+    select: { id: true, timezone: true, leave_accrual: true },
   });
 
   for (const org of orgs) {
     const config = parseAccrualConfig(org.leave_accrual);
     if (!config) continue;
-    orgsProcessed++;
+    const localNow = toZonedTime(now, org.timezone || 'UTC');
+    const year = localNow.getFullYear();
+    const month = localNow.getMonth() + 1;
 
-    const users = await prisma.user.findMany({
-      where: { org_id: org.id, is_active: true, deleted_at: null },
-      select: { id: true },
-    });
-
-    for (const user of users) {
-      for (const [type, policy] of Object.entries(config)) {
-        const inc = monthlyIncrement(policy);
-        const existing = await prisma.leaveBalance.findFirst({
-          where: { user_id: user.id, leave_type: type, year },
+    try {
+      const result = await prisma.$transaction(async (tx) => {
+        // Unique key is the durable idempotency key. Creating it and updating
+        // balances in one transaction means a crash cannot leave a half-run.
+        await tx.leaveAccrualRun.create({ data: { org_id: org.id, year, month } });
+        const users = await tx.user.findMany({
+          where: { org_id: org.id, is_active: true, deleted_at: null },
+          select: { id: true },
         });
+        let touched = 0;
 
-        if (existing) {
-          await prisma.leaveBalance.update({
-            where: { id: existing.id },
-            data: { total_days: accruedTotal(existing.total_days, inc) },
-          });
-        } else {
-          let seed = inc;
-          if (month === 1) {
-            const prior = await prisma.leaveBalance.findFirst({
-              where: { user_id: user.id, leave_type: type, year: year - 1 },
+        for (const user of users) {
+          for (const [type, policy] of Object.entries(config)) {
+            const inc = monthlyIncrement(policy);
+            const existing = await tx.leaveBalance.findFirst({
+              where: { user_id: user.id, leave_type: type, year },
             });
-            if (prior) seed += carryOver(policy, toDays(prior.total_days), toDays(prior.used_days));
+
+            if (existing) {
+              // Atomic increment preserves concurrent HR adjustments.
+              await tx.leaveBalance.update({
+                where: { id: existing.id },
+                data: { total_days: { increment: inc } },
+              });
+            } else {
+              let seed = inc;
+              if (month === 1) {
+                const prior = await tx.leaveBalance.findFirst({
+                  where: { user_id: user.id, leave_type: type, year: year - 1 },
+                });
+                if (prior) seed += carryOver(policy, toDays(prior.total_days), toDays(prior.used_days));
+              }
+              await tx.leaveBalance.create({
+                data: {
+                  user_id: user.id, org_id: org.id, leave_type: type, year,
+                  total_days: Math.round(seed * 100) / 100, used_days: 0,
+                },
+              });
+            }
+            touched++;
           }
-          await prisma.leaveBalance.create({
-            data: {
-              user_id: user.id, org_id: org.id, leave_type: type, year,
-              total_days: Math.round(seed * 100) / 100, used_days: 0,
-            },
-          });
         }
-        balancesTouched++;
+        return touched;
+      });
+      orgsProcessed++;
+      balancesTouched += result;
+    } catch (error) {
+      if ((error as { code?: string }).code === 'P2002') {
+        skipped++;
+        continue;
       }
+      throw error;
     }
   }
 
-  jobLogger.info({ orgs: orgsProcessed, balances: balancesTouched }, 'monthly leave accrual complete');
-  return { orgs: orgsProcessed, balances: balancesTouched };
+  jobLogger.info({ orgs: orgsProcessed, balances: balancesTouched, skipped }, 'monthly leave accrual complete');
+  return { orgs: orgsProcessed, balances: balancesTouched, skipped };
 }

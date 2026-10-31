@@ -1,5 +1,7 @@
 # Attenda Technical API Specification
 
+> **Current documentation:** This older technical overview contains historical behavior. Use [BACKEND_API_AND_LOGIC.md](BACKEND_API_AND_LOGIC.md) for the current implementation and logic.
+
 This document is designed for developers to understand the deep logic, side effects, and data flows of the Attenda API.
 
 ---

@@ -1,9 +1,10 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
-import { ok, NotFoundError } from '../utils/response';
+import { ok, NotFoundError, ValidationError } from '../utils/response';
 import { verifyAccessToken } from '../utils/auth';
 import { subscribeOrgEvents } from '../services/notifications';
 import prisma from '../utils/prisma';
+import { randomUUID } from 'node:crypto';
 
 const router = Router();
 
@@ -40,24 +41,30 @@ router.get('/stream', async (req: Request, res: Response) => {
       const count = await prisma.inAppNotification.count({
         where: { user_id: userId, read_at: null },
       });
-      res.write(`data: ${JSON.stringify({ type: 'count', count })}\n\n`);
+      res.write(`id: ${randomUUID()}\ndata: ${JSON.stringify({ type: 'count', count })}\n\n`);
     } catch { /* DB may be transiently unavailable */ }
   };
-
-  await send();
-  const interval = setInterval(send, 15_000);
 
   // Invalidation push: mutation handlers emit coarse org-scoped events
   // (see services/notifications emitOrgEvent); forward them so clients can
   // refetch the affected resource without waiting for a poll cycle.
-  const unsubscribe = subscribeOrgEvents(orgId, (scope) => {
+  const unsubscribe = subscribeOrgEvents(orgId, (scope, eventId) => {
     try {
-      res.write(`data: ${JSON.stringify({ type: 'invalidate', scope })}\n\n`);
+      res.write(`id: ${eventId ?? randomUUID()}\ndata: ${JSON.stringify({ type: 'invalidate', scope })}\n\n`);
     } catch { /* connection is tearing down */ }
   });
 
+  // Subscribe before the initial snapshot to close the connect/refetch race.
+  // A reconnect deliberately invalidates all cached resources; pub/sub does not
+  // promise replay while an instance is disconnected from Redis.
+  try { res.write(`id: ${randomUUID()}\ndata: ${JSON.stringify({ type: 'invalidate', scope: 'all' })}\n\n`); } catch { /* ignore closing client */ }
+  await send();
+  const interval = setInterval(send, 15_000);
+  const heartbeat = setInterval(() => { try { res.write(': heartbeat\n\n'); } catch { /* closing client */ } }, 20_000);
+
   req.on('close', () => {
     clearInterval(interval);
+    clearInterval(heartbeat);
     unsubscribe();
     res.end();
   });
@@ -69,13 +76,47 @@ router.use(authenticate);
 // ─── GET /notifications ───────────────────────────────
 router.get('/', async (req, res, next) => {
   try {
+    const unread = req.query.unread === 'true';
+    const baseWhere = { user_id: req.user!.sub, ...(unread ? { read_at: null } : {}) };
+
+    // Cursor mode is opt-in to preserve the existing page-number contract.
+    if (req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string') {
+      const parsedLimit = Number.parseInt(String(req.query.limit ?? '20'), 10);
+      const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(50, parsedLimit)) : 20;
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+      if (cursor) {
+        const anchor = await prisma.inAppNotification.findFirst({
+          where: { id: cursor, ...baseWhere },
+          select: { id: true },
+        });
+        if (!anchor) throw new ValidationError('Invalid notification cursor');
+      }
+
+      const [rows, unreadCount] = await Promise.all([
+        prisma.inAppNotification.findMany({
+          where: baseWhere,
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+          orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+          take: limit + 1,
+        }),
+        prisma.inAppNotification.count({ where: { user_id: req.user!.sub, read_at: null } }),
+      ]);
+      const hasMore = rows.length > limit;
+      const items = hasMore ? rows.slice(0, limit) : rows;
+      ok(res, {
+        items,
+        next_cursor: hasMore ? items[items.length - 1]?.id ?? null : null,
+        has_more: hasMore,
+        unread_count: unreadCount,
+      });
+      return;
+    }
+
     const page     = Math.max(1, parseInt((req.query.page as string) || '1'));
     const limit    = Math.min(50, parseInt((req.query.limit as string) || '20'));
-    const unread   = req.query.unread === 'true';
     const skip     = (page - 1) * limit;
 
-    const where: Record<string, unknown> = { user_id: req.user!.sub };
-    if (unread) where.read_at = null;
+    const where: Record<string, unknown> = baseWhere;
 
     const [items, total, unreadCount] = await Promise.all([
       prisma.inAppNotification.findMany({

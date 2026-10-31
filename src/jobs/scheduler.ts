@@ -12,6 +12,8 @@ import {
 } from '../utils/shift';
 import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, updateAttendanceBreakSummary } from '../utils/attendance';
 import { isPushConfigured, sendPresenceChallenge } from '../services/pushChallenge';
+import { createNotification } from '../services/notifications';
+import { randomUUID } from 'node:crypto';
 
 // Resolve the shift-end instant for overtime math: prefer the value persisted at
 // check-in (correct for overnight shifts), else recompute the window from checkOut.
@@ -46,26 +48,49 @@ function activeBreakDueAt(record: any, tz: string): Date | null {
 // ─── Job: Late Arrival Detector ───────────────────────
 
 // ─── Multi-instance safety ────────────────────────────
-// Every job tick races for a Redis lock keyed by job name + minute bucket,
-// so running 2+ API instances cannot double-fire a job. If Redis is down we
-// run anyway: handlers are idempotent-ish and a duplicate beats a no-show.
-async function acquireTickLock(name: string): Promise<boolean> {
-  const bucket = new Date().toISOString().slice(0, 16); // minute resolution
+// One lease per job, held for the whole execution. A minute-bucket lock only
+// prevents duplicate starts in one minute; a long-running handler could overlap
+// the next bucket. Redis is mandatory coordination: skip when it is unhealthy.
+async function acquireJobLock(name: string): Promise<null | (() => Promise<void>)> {
+  const key = `cronlock:${name}`;
+  const token = randomUUID();
+  const ttlMs = 15 * 60_000;
   try {
-    const res = await redis.set(`cronlock:${name}:${bucket}`, '1', 'EX', 3600, 'NX');
-    return res === 'OK';
-  } catch {
-    return true;
+    const acquired = await redis.set(key, token, 'PX', ttlMs, 'NX');
+    if (acquired !== 'OK') return null;
+
+    const renewal = setInterval(() => {
+      void redis.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
+        1, key, token, ttlMs,
+      ).then(result => {
+        if (result !== 1) jobLogger.warn({ job: name }, 'scheduler lease renewal lost');
+      }).catch(err => jobLogger.error({ err, job: name }, 'scheduler lease renewal failed'));
+    }, Math.floor(ttlMs / 3));
+    renewal.unref();
+    return async () => {
+      clearInterval(renewal);
+      await redis.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        1, key, token,
+      );
+    };
+  } catch (err) {
+    jobLogger.warn({ err, job: name }, 'skipping scheduled job because Redis lock is unavailable');
+    return null;
   }
 }
 
 function scheduledJob(name: string, pattern: string, handler: () => Promise<void>) {
   cron.schedule(pattern, async () => {
-    if (!(await acquireTickLock(name))) return;
+    const release = await acquireJobLock(name);
+    if (!release) return;
     try {
       await handler();
     } catch (err) {
       jobLogger.error({ err, job: name }, 'scheduled job failed');
+    } finally {
+      await release().catch(err => jobLogger.warn({ err, job: name }, 'scheduler lease release failed'));
     }
   });
 }
@@ -308,7 +333,8 @@ export function startHeartbeatExpiryMonitor() {
         where: {
           check_out_at: null,
           status: { in: ['in', 'late'] },
-          last_heartbeat_at: { not: null, lte: new Date(now.getTime() - 10 * 60 * 1000) },
+          last_heartbeat_at: { not: null },
+          user: { org: { wifi_auto_checkout_enabled: true } },
         },
         include: {
           user: { include: { org: { select: { id: true, timezone: true, heartbeat_grace_mins: true } } } },
@@ -335,38 +361,10 @@ export function startHeartbeatExpiryMonitor() {
           if (now < breakGraceDue) continue;
         }
 
-        // ─── FCM presence challenge (roadmap #24) ─────────
-        // Before auto-checking-out, ping the device with a high-priority FCM
-        // data message. High-priority pushes punch through Android Doze, so a
-        // phone still on office WiFi wakes and answers via its normal
-        // heartbeat — which refreshes last_heartbeat_at and drops the record
-        // out of the expired set. A challenge answered by a later heartbeat
-        // is treated as consumed, so a fresh loss of signal gets a fresh
-        // challenge instead of an instant checkout.
-        if (isPushConfigured() && record.user.fcm_token) {
-          const challengeSentAt =
-            record.challenge_sent_at && record.last_heartbeat_at! > record.challenge_sent_at
-              ? null // heartbeat arrived after the challenge — it was answered
-              : record.challenge_sent_at;
-
-          if (!challengeSentAt) {
-            const sent = await sendPresenceChallenge(record.user_id).catch(() => false);
-            if (sent) {
-              await prisma.attendanceRecord.update({
-                where: { id: record.id },
-                data: { challenge_sent_at: now },
-              }).catch(() => {});
-              continue; // grace tick: give the device a chance to respond
-            }
-          } else if (now.getTime() - challengeSentAt.getTime() < 5 * 60_000) {
-            continue; // challenge pending — wait up to 5 minutes for a reply
-          }
-          // Challenge sent 5+ minutes ago with no heartbeat → proceed with checkout.
-        }
-
-        const checkOut = breakDueAt && breakDueAt > record.last_heartbeat_at!
+        const heartbeatExpiry = new Date(record.last_heartbeat_at!.getTime() + graceMins * 60_000);
+        const checkOut = breakDueAt && breakDueAt > heartbeatExpiry
           ? breakDueAt
-          : record.last_heartbeat_at!;
+          : heartbeatExpiry;
         const hoursWorked = (checkOut.getTime() - record.check_in_at!.getTime()) / 3_600_000;
         const breaks = await settleBreaks(record.id, checkOut, tz);
         const rawEarlyMins = earlyOutMinutes(checkOut, record.shift, tz);
@@ -377,8 +375,8 @@ export function startHeartbeatExpiryMonitor() {
         const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
         const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
 
-        await prisma.attendanceRecord.update({
-          where: { id: record.id },
+        const updated = await prisma.attendanceRecord.updateMany({
+          where: { id: record.id, check_out_at: null, last_heartbeat_at: record.last_heartbeat_at, user: { org: { wifi_auto_checkout_enabled: true } } },
           data: {
             check_out_at: checkOut,
             hours_worked: parseFloat(hoursWorked.toFixed(2)),
@@ -393,8 +391,10 @@ export function startHeartbeatExpiryMonitor() {
             ...(score != null && { adherence_score: score }),
             last_heartbeat_at: null,
             challenge_sent_at: null,
+            ip_checkout_pending_at: null,
           },
         });
+        if (!updated.count) continue;
         await notifyCheckOut(record.user.org_id, record.user.name, formatTime12h(checkOut)).catch(() => {});
       }
     } catch (err) {
@@ -496,9 +496,44 @@ export function startShiftReminderJob() {
   });
 }
 
+// Notify task owners at 08:00 in their organisation timezone when a task is due tomorrow.
+export function startProjectTaskDeadlineJob() {
+  scheduledJob('startProjectTaskDeadlineJob', '* * * * *', async () => {
+    const now = new Date();
+    const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
+    for (const org of orgs) {
+      const tz = org.timezone || 'UTC';
+      const localNow = toZonedTime(now, tz);
+      if (localNow.getHours() !== 8 || localNow.getMinutes() !== 0) continue;
+      const today = dateOnlyInTz(now, tz);
+      const todayKey = today.toISOString().slice(0, 10);
+      const tomorrow = new Date(today.getTime() + 24 * 60 * 60 * 1000);
+      const tasks = await prisma.projectTask.findMany({
+        where: { project: { org_id: org.id }, due_date: tomorrow, status: { not: 'done' }, assignee_id: { not: null } },
+        include: { assignee: { select: { id: true } }, project: { select: { name: true } } },
+      });
+      for (const task of tasks) {
+        if (!task.assignee) continue;
+        const sent = await prisma.inAppNotification.findFirst({
+          where: { user_id: task.assignee.id, type: 'project_task_deadline', action_id: task.id, created_at: { gte: today } },
+          select: { id: true },
+        });
+        if (!sent) await createNotification({
+          userId: task.assignee.id, orgId: org.id, type: 'project_task_deadline',
+          title: 'Project task due tomorrow', body: `${task.title} · ${task.project.name}`,
+          actionType: 'project_task', actionId: task.id, metadata: { local_date: todayKey },
+        });
+      }
+    }
+  });
+  console.log('📅 Project task deadline reminders started (08:00 local time)');
+}
+
 // ─── Job: Remote AI Nudges ────────────────────────────
 export function startRemoteNudgeJob() {
-  scheduledJob('startRemoteNudgeJob', '0 * * * *', async () => {
+  // Minute cadence is required because org-local shift starts can be at any
+  // minute (and timezones include half/quarter-hour offsets).
+  scheduledJob('startRemoteNudgeJob', '* * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
@@ -545,25 +580,31 @@ export function startRemoteNudgeJob() {
 
 // ─── Job: Payroll Auto-Generate ───────────────────────
 export function startPayrollAutoGenerate() {
-  scheduledJob('startPayrollAutoGenerate', '0 8 * * *', async () => {
+  scheduledJob('startPayrollAutoGenerate', '* * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany();
       for (const org of orgs) {
         const tz = org.timezone || 'UTC';
         const localNow = toZonedTime(now, tz);
-        if (localNow.getDate() !== org.payroll_day) continue;
+        const configuredDay = Math.max(1, Math.min(31, org.payroll_day));
+        const lastDayOfMonth = new Date(localNow.getFullYear(), localNow.getMonth() + 1, 0).getDate();
+        const payrollDay = Math.min(configuredDay, lastDayOfMonth);
+        if (localNow.getHours() < 8 || localNow.getDate() < payrollDay) continue;
 
         const month = localNow.getMonth() === 0 ? 12 : localNow.getMonth();
         const year = localNow.getMonth() === 0 ? localNow.getFullYear() - 1 : localNow.getFullYear();
-
-        if (await prisma.payrollRecord.findFirst({ where: { org_id: org.id, period_month: month, period_year: year } })) continue;
 
         const { startOfMonth, endOfMonth } = await import('../utils/auth');
         const start = startOfMonth(year, month);
         const end = endOfMonth(year, month);
 
         const users = await prisma.user.findMany({ where: { org_id: org.id, is_active: true, deleted_at: null } });
+        const existingRecords = await prisma.payrollRecord.findMany({
+          where: { org_id: org.id, period_month: month, period_year: year },
+          select: { user_id: true },
+        });
+        const existingByUser = new Map(existingRecords.map(record => [record.user_id, record]));
 
         // Same shared computation as POST /payroll/generate — unpaid-leave
         // deduction, per-shift overtime multiplier and manual_adjustment
@@ -571,6 +612,11 @@ export function startPayrollAutoGenerate() {
         const { computePeriodPayroll } = await import('../utils/payroll');
 
         for (const user of users) {
+          const existing = existingByUser.get(user.id);
+          // A period row is immutable to this cron. Missing rows are created
+          // on retry, so an interrupted partial run can resume without
+          // changing a manually adjusted draft or finalized payroll.
+          if (existing) continue;
           const attendance = await prisma.attendanceRecord.findMany({
             where: { user_id: user.id, date: { gte: start, lte: end } },
             include: { shift: { select: { overtime_multiplier: true } } },
@@ -583,17 +629,12 @@ export function startPayrollAutoGenerate() {
             select: { working_days: true },
           });
           const unpaidDays = unpaidLeave.reduce((s, l) => s + l.working_days, 0);
-          const existing = await prisma.payrollRecord.findFirst({
-            where: { user_id: user.id, period_month: month, period_year: year },
-            select: { manual_adjustment: true },
-          });
-
           const rate = Number(user.hourly_rate);
           const totals = computePeriodPayroll({
             attendance,
             unpaid_leave_days: unpaidDays,
             hourly_rate: rate,
-            manual_adjustment: Number(existing?.manual_adjustment) || 0,
+            manual_adjustment: 0,
           }, Number(org.tax_rate) || 0, Number(org.pension_rate) || 0);
 
           const fields = {
@@ -603,11 +644,14 @@ export function startPayrollAutoGenerate() {
             tax_deduction: totals.tax_deduction, pension_deduction: totals.pension_deduction,
             net_pay: totals.net_pay, is_incomplete: rate === 0,
           };
-          await prisma.payrollRecord.upsert({
-            where: { user_id_period_month_period_year: { user_id: user.id, period_month: month, period_year: year } },
-            update: fields,
-            create: { user_id: user.id, org_id: org.id, period_month: month, period_year: year, ...fields },
-          });
+          try {
+            await prisma.payrollRecord.create({
+              data: { user_id: user.id, org_id: org.id, period_month: month, period_year: year, ...fields },
+            });
+          } catch (error) {
+            // Another worker may have inserted this employee's period row.
+            if ((error as { code?: string }).code !== 'P2002') throw error;
+          }
         }
       }
     } catch (err) {
@@ -694,13 +738,14 @@ export function startShiftBreakAutoManager() {
         // Intentional: ShiftBreaks are children of Shifts. Employees checked in without
         // a resolved shift have no break templates to auto-start. This is correct behavior.
         const openRecords = await prisma.attendanceRecord.findMany({
-          where: { date: orgToday, check_out_at: null, status: { in: ['in', 'late', 'remote'] }, shift_id: { not: null } },
+          where: { org_id: org.id, date: orgToday, check_in_at: { not: null }, check_out_at: null, status: { in: ['in', 'late', 'remote'] }, shift_id: { not: null } },
           include: { shift: { include: { breaks: true } }, break_records: true },
         });
 
         for (const record of openRecords) {
           const nowMins = minutesOfDayInTz(now, tz);
           for (const tmpl of record.shift?.breaks || []) {
+            if ((tmpl.applies_days.length && !tmpl.applies_days.includes(orgToday.getUTCDay())) || (tmpl.exception_dates.length && !tmpl.exception_dates.includes(orgToday.toISOString().slice(0, 10)))) continue;
             if (tmpl.break_kind === 'flexible') continue;
             if (!tmpl.break_start_time || !tmpl.break_end_time) continue;
             const bStart = hhmmToMins(tmpl.break_start_time);
@@ -713,7 +758,7 @@ export function startShiftBreakAutoManager() {
                   data: { attendance_id: record.id, shift_break_id: tmpl.id, break_start: now, break_type: tmpl.name || 'shift_break', is_paid: tmpl.is_paid, auto_started: true, source: 'system' },
                 });
               }
-            } else if (existing && !existing.break_end && nowMins >= bEnd) {
+            } else if (existing && existing.auto_started && !existing.break_end && nowMins >= bEnd) {
               await prisma.breakRecord.update({
                 where: { id: existing.id },
                 data: { break_end: now, duration_mins: Math.max(0, Math.round((now.getTime() - existing.break_start.getTime()) / 60000)), auto_ended: true },
@@ -745,29 +790,52 @@ export function startTrialExpiryMonitor() {
 
 // ─── Job: Daily Remote Nudge ──────────────────────────
 export function startDailyRemoteNudgeJob() {
-  scheduledJob('startDailyRemoteNudgeJob', '0 8 * * *', async () => {
+  scheduledJob('startDailyRemoteNudgeJob', '* * * * *', async () => {
     const now = new Date();
     try {
       const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
       for (const org of orgs) {
         const tz = org.timezone || 'UTC';
+        const localNow = toZonedTime(now, tz);
+        if (localNow.getHours() < 8) continue;
         const orgToday = dateOnlyInTz(now, tz);
 
         const sessions = await prisma.remoteSession.findMany({
-          where: { status: 'approved', attendance: { date: orgToday, org_id: org.id } },
+          where: {
+            status: 'approved',
+            OR: [{ daily_nudge_at: null }, { daily_nudge_at: { lt: orgToday } }],
+            attendance: { date: orgToday, org_id: org.id },
+          },
           include: { user: { select: { id: true, name: true, phone: true } } },
         });
 
         for (const session of sessions) {
           if (!session.user.phone) continue;
-          await sendDailyRemoteNudge(org.id, session.user.name, session.user.phone).catch(() => {});
+          const claimed = await prisma.remoteSession.updateMany({
+            where: {
+              id: session.id,
+              status: 'approved',
+              OR: [{ daily_nudge_at: null }, { daily_nudge_at: { lt: orgToday } }],
+            },
+            data: { daily_nudge_at: orgToday },
+          });
+          if (!claimed.count) continue;
+          try {
+            await sendDailyRemoteNudge(org.id, session.user.name, session.user.phone);
+          } catch (error) {
+            await prisma.remoteSession.updateMany({
+              where: { id: session.id, daily_nudge_at: orgToday },
+              data: { daily_nudge_at: null },
+            });
+            throw error;
+          }
         }
       }
     } catch (err) {
       console.error('[JOB] Daily remote nudge error:', err);
     }
   });
-  console.log('🏠 Daily remote nudge job started (08:00 UTC)');
+  console.log('🏠 Daily remote nudge job started (08:00 local time per organization)');
 }
 
 // ─── Job: Monthly Leave Accrual ───────────────────────
@@ -804,11 +872,30 @@ export function startAnnouncementPublisher() {
 }
 
 export function startLeaveAccrualJob() {
-  scheduledJob('startLeaveAccrualJob', '0 2 1 * *', async () => {
+  scheduledJob('startLeaveAccrualJob', '* * * * *', async () => {
+    const now = new Date();
+    const orgs = await prisma.organisation.findMany({ select: { id: true, timezone: true } });
+    const dueOrgIds = orgs.filter(org => {
+      const localNow = toZonedTime(now, org.timezone || 'UTC');
+      // Retry on later local 02:xx ticks if the 02:00 tick was skipped due to
+      // Redis downtime. The durable unique period row makes reruns harmless.
+      return localNow.getHours() >= 2;
+    }).map(org => org.id);
+    if (!dueOrgIds.length) return;
     const { runMonthlyAccrual } = await import('../services/leaveAccrual');
-    await runMonthlyAccrual();
+    const dueOrgs: string[] = [];
+    for (const orgId of dueOrgIds) {
+      const org = orgs.find(item => item.id === orgId)!;
+      const localNow = toZonedTime(now, org.timezone || 'UTC');
+      const existing = await prisma.leaveAccrualRun.findUnique({
+        where: { org_id_year_month: { org_id: orgId, year: localNow.getFullYear(), month: localNow.getMonth() + 1 } },
+        select: { id: true },
+      });
+      if (!existing) dueOrgs.push(orgId);
+    }
+    if (dueOrgs.length) await runMonthlyAccrual(now, dueOrgs);
   });
-  console.log('🌴 Leave accrual job started (1st of month, 02:00 UTC)');
+  console.log('🌴 Leave accrual job started (monthly, retried during local 02:00 hour)');
 }
 
 // ─── Job: Refresh-Token Purge ─────────────────────────
@@ -824,6 +911,14 @@ export function startRefreshTokenPurgeJob() {
   console.log('🔑 Refresh-token purge job started (daily, 03:30 UTC)');
 }
 
+export function startWebhookDeliveryRetryJob() {
+  scheduledJob('startWebhookDeliveryRetryJob', '* * * * *', async () => {
+    const { retryDueWebhookDeliveries } = await import('../services/webhookDelivery');
+    await retryDueWebhookDeliveries();
+  });
+  console.log('🔁 Outbound webhook retry worker started (every minute)');
+}
+
 export function startAllJobs() {
   console.log('\n🔧 Starting background jobs...');
   startLeaveAccrualJob();
@@ -836,11 +931,13 @@ export function startAllJobs() {
   startShiftAutoCheckoutJob();
   startStaleRecordSweep();
   startShiftReminderJob();
+  startProjectTaskDeadlineJob();
   startRemoteNudgeJob();
   startDailyRemoteNudgeJob();
   startPayrollAutoGenerate();
   startShiftBreakAutoManager();
   startTrialExpiryMonitor();
   startRefreshTokenPurgeJob();
+  startWebhookDeliveryRetryJob();
   console.log('✅ All background jobs running\n');
 }

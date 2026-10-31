@@ -7,153 +7,179 @@ datasource db {
 }
 
 model Organisation {
-  id                 String   @id @default(uuid())
-  name               String   @db.VarChar(255)
-  logo_url           String?
-  timezone           String   @db.VarChar(100)
-  currency           String   @db.VarChar(10) @default("USD")
-  office_ips         String[] @default([])
-  office_ssids       String[] @default([])
-  wa_enabled         Boolean  @default(false)
-  wa_phone_number_id String?
-  wa_access_token    String?
-  wa_groups          Json     @default("[]")
-  wa_events          Json     @default("{}")
-  wa_dept_groups     Json     @default("{}")
-  payroll_day        Int      @default(28)
-  tax_rate           Float    @default(0)
-  pension_rate       Float    @default(0)
-  late_threshold     Int      @default(15)
-  heartbeat_grace_mins Int    @default(20)
-  gap_forgiveness_mins Int    @default(15)
-  leave_accrual      Json?
-  late_policy        Json?
-  plan               String   @db.VarChar(50) @default("trial")
-  status             String   @db.VarChar(20) @default("active")
-  subscription_status String  @db.VarChar(30) @default("active")
-  trial_started_at   DateTime?
-  trial_ends_at      DateTime?
-  seats_limit        Int?
-  features_override  Json?
-  admin_notes        String?  @db.Text
-  billing_email      String?  @db.VarChar(255)
-  contact_name       String?  @db.VarChar(255)
-  contact_email      String?  @db.VarChar(255)
-  company_size       String?  @db.VarChar(50)
-  totp_required      Boolean  @default(false)
-  address            String?  @db.Text
-  phone              String?  @db.VarChar(50)
-  website            String?  @db.VarChar(255)
-  industry           String?  @db.VarChar(100)
-  registration_number String? @db.VarChar(100)
-  created_at         DateTime @default(now())
+  id                         String    @id @default(uuid())
+  name                       String    @db.VarChar(255)
+  logo_url                   String?
+  timezone                   String    @db.VarChar(100)
+  currency                   String    @default("USD") @db.VarChar(10)
+  office_ips                 String[]  @default([])
+  office_ssids               String[]  @default([])
+  wifi_auto_checkin_enabled  Boolean   @default(true)
+  wifi_auto_checkout_enabled Boolean   @default(false)
+  wa_enabled                 Boolean   @default(false)
+  wa_phone_number_id         String?
+  wa_access_token            String?
+  wa_groups                  Json      @default("[]")
+  wa_events                  Json      @default("{}")
+  wa_dept_groups             Json      @default("{}")
+  payroll_day                Int       @default(28)
+  tax_rate                   Float     @default(0)
+  pension_rate               Float     @default(0)
+  late_threshold             Int       @default(15)
+  heartbeat_grace_mins       Int       @default(20)
+  gap_forgiveness_mins       Int       @default(15)
+  attendance_security        Json?
+  leave_accrual              Json?
+  late_policy                Json?
+  plan                       String    @default("trial") @db.VarChar(50)
+  status                     String    @default("active") @db.VarChar(20)
+  subscription_status        String    @default("active") @db.VarChar(30)
+  trial_started_at           DateTime?
+  trial_ends_at              DateTime?
+  seats_limit                Int?
+  features_override          Json?
+  admin_notes                String?   @db.Text
+  billing_email              String?   @db.VarChar(255)
+  contact_name               String?   @db.VarChar(255)
+  contact_email              String?   @db.VarChar(255)
+  company_size               String?   @db.VarChar(50)
+  totp_required              Boolean   @default(false)
+  address                    String?   @db.Text
+  phone                      String?   @db.VarChar(50)
+  website                    String?   @db.VarChar(255)
+  industry                   String?   @db.VarChar(100)
+  registration_number        String?   @db.VarChar(100)
+  created_at                 DateTime  @default(now())
 
-  users               User[]
-  attendance_records  AttendanceRecord[]
+  users                  User[]
+  attendance_records     AttendanceRecord[]
   attendance_corrections AttendanceCorrection[]
-  leave_requests      LeaveRequest[]
-  leave_balances      LeaveBalance[]
-  shifts              Shift[]
-  payroll_records     PayrollRecord[]
-  whatsapp_logs       WhatsappLog[]
-  performance_reviews PerformanceReview[]
-  overtime_rules      OvertimeRule[]
-  overtime_requests   OvertimeRequest[]
-  notifications       InAppNotification[]
-  late_arrival_notices LateArrivalNotice[]
-  org_roles             OrgRole[]
+  leave_requests         LeaveRequest[]
+  leave_balances         LeaveBalance[]
+  shifts                 Shift[]
+  emergency_shift_offers EmergencyShiftOffer[]
+  shift_checkpoints      ShiftCheckpoint[]
+  checkpoint_scans       ShiftCheckpointScan[]
+  shift_availability     ShiftAvailability[]
+  shift_coverage_rules   ShiftCoverageRule[]
+  shift_schedule_events  ShiftScheduleEvent[]
+  payroll_records        PayrollRecord[]
+  whatsapp_logs          WhatsappLog[]
+  performance_reviews    PerformanceReview[]
+  overtime_rules         OvertimeRule[]
+  overtime_requests      OvertimeRequest[]
+  notifications          InAppNotification[]
+  late_arrival_notices   LateArrivalNotice[]
+  org_roles              OrgRole[]
   user_permission_grants UserPermissionGrant[]
-  departments           Department[]
-  holidays              OrgHoliday[]
-  expense_claims        ExpenseClaim[]
-  outbound_webhooks     OrgWebhook[]
-  employee_documents    EmployeeDocument[]
-  announcements         Announcement[]
-  onboarding_templates  OnboardingTemplate[]
-  onboarding_tasks      OnboardingTask[]
-  kudos                 Kudos[]
+  departments            Department[]
+  holidays               OrgHoliday[]
+  expense_claims         ExpenseClaim[]
+  outbound_webhooks      OrgWebhook[]
+  webhook_deliveries     OrgWebhookDelivery[]
+  employee_documents     EmployeeDocument[]
+  announcements          Announcement[]
+  onboarding_templates   OnboardingTemplate[]
+  onboarding_tasks       OnboardingTask[]
+  kudos                  Kudos[]
+  projects               Project[]
+  leave_accrual_runs     LeaveAccrualRun[]
+  outbox_events          OutboxEvent[]
 
   @@map("organisations")
 }
 
 model User {
-  id             String    @id @default(uuid())
-  org_id         String
-  name           String    @db.VarChar(255)
-  email          String    @unique @db.VarChar(255)
-  password_hash  String
-  role           String    @db.VarChar(50)
-  department     String?   @db.VarChar(100)
-  department_id  String?
-  job_title      String?   @db.VarChar(100)
-  phone          String?   @db.VarChar(30)
-  manager_id     String?
-  hourly_rate    Decimal   @default(0) @db.Decimal(10, 2)
-  avatar_url     String?
-  is_active      Boolean   @default(true)
-  setup_complete Boolean   @default(false)
-  invite_token   String?   @unique
-  invite_expires DateTime?
-  reset_token    String?   @unique
-  reset_expires  DateTime?
-  login_attempts Int       @default(0)
-  locked_until   DateTime?
-  totp_secret          String?
-  totp_enabled         Boolean   @default(false)
-  notification_prefs   Json      @default("{\"check_in\":true,\"leave_updates\":true,\"shift_reminders\":true,\"payroll\":true,\"announcements\":true,\"late_alerts\":true}")
-  google_id            String?   @unique
-  date_of_birth        DateTime? @db.Date
-  gender               String?   @db.VarChar(20)
-  address              String?   @db.Text
-  city                 String?   @db.VarChar(100)
-  country              String?   @db.VarChar(100)
-  emergency_contact_name  String? @db.VarChar(255)
-  emergency_contact_phone String? @db.VarChar(50)
-  employment_type      String?   @db.VarChar(30)
-  joined_at            DateTime? @db.Date
-  national_id          String?   @db.VarChar(100)
-  fcm_token            String?
-  fcm_token_updated_at DateTime?
-  created_at     DateTime  @default(now())
-  deleted_at     DateTime?
+  id                      String    @id @default(uuid())
+  org_id                  String
+  name                    String    @db.VarChar(255)
+  email                   String    @unique @db.VarChar(255)
+  password_hash           String
+  role                    String    @db.VarChar(50)
+  department              String?   @db.VarChar(100)
+  department_id           String?
+  job_title               String?   @db.VarChar(100)
+  phone                   String?   @db.VarChar(30)
+  manager_id              String?
+  hourly_rate             Decimal   @default(0) @db.Decimal(10, 2)
+  avatar_url              String?
+  is_active               Boolean   @default(true)
+  setup_complete          Boolean   @default(false)
+  invite_token            String?   @unique
+  invite_expires          DateTime?
+  reset_token             String?   @unique
+  reset_expires           DateTime?
+  login_attempts          Int       @default(0)
+  locked_until            DateTime?
+  totp_secret             String?
+  totp_enabled            Boolean   @default(false)
+  notification_prefs      Json      @default("{\"check_in\":true,\"leave_updates\":true,\"shift_reminders\":true,\"payroll\":true,\"announcements\":true,\"late_alerts\":true}")
+  google_id               String?   @unique
+  date_of_birth           DateTime? @db.Date
+  gender                  String?   @db.VarChar(20)
+  address                 String?   @db.Text
+  city                    String?   @db.VarChar(100)
+  country                 String?   @db.VarChar(100)
+  emergency_contact_name  String?   @db.VarChar(255)
+  emergency_contact_phone String?   @db.VarChar(50)
+  employment_type         String?   @db.VarChar(30)
+  joined_at               DateTime? @db.Date
+  national_id             String?   @db.VarChar(100)
+  fcm_token               String?
+  fcm_token_updated_at    DateTime?
+  created_at              DateTime  @default(now())
+  deleted_at              DateTime?
 
-  org                     Organisation        @relation(fields: [org_id], references: [id])
-  department_ref          Department?         @relation(fields: [department_id], references: [id], onDelete: SetNull)
-  manager                 User?               @relation("UserManager", fields: [manager_id], references: [id])
-  direct_reports          User[]              @relation("UserManager")
-  attendance_records      AttendanceRecord[]
-  corrections_requested   AttendanceCorrection[] @relation("CorrectionUser")
-  corrections_reviewed    AttendanceCorrection[] @relation("CorrectionReviewer")
-  expense_claims          ExpenseClaim[]         @relation("ExpenseClaimant")
-  expenses_reviewed       ExpenseClaim[]         @relation("ExpenseReviewer")
-  documents               EmployeeDocument[]     @relation("DocumentOwner")
-  documents_uploaded      EmployeeDocument[]     @relation("DocumentUploader")
-  announcements_authored  Announcement[]         @relation("AnnouncementAuthor")
-  announcement_receipts   AnnouncementReceipt[]
-  onboarding_templates_created OnboardingTemplate[] @relation("OnboardingTemplateCreator")
-  onboarding_tasks             OnboardingTask[]     @relation("OnboardingHire")
-  onboarding_tasks_assigned    OnboardingTask[]     @relation("OnboardingAssignee")
-  kudos_given                  Kudos[]              @relation("KudosGiver")
-  kudos_received               Kudos[]              @relation("KudosRecipient")
-  leave_requests          LeaveRequest[]
-  leave_balances          LeaveBalance[]
-  reviewed_leaves         LeaveRequest[]      @relation("LeaveReviewer")
-  shift_assignments       ShiftAssignment[]
-  swap_requests_sent      ShiftSwap[]         @relation("SwapRequester")
-  swap_requests_received  ShiftSwap[]         @relation("SwapTarget")
-  payroll_records         PayrollRecord[]
-  processed_payrolls      PayrollRecord[]     @relation("PayrollProcessor")
-  performance_reviews     PerformanceReview[] @relation("ReviewSubject")
-  submitted_reviews       PerformanceReview[] @relation("ReviewSubmitter")
-  performance_goals       PerformanceGoal[]
-  remote_sessions         RemoteSession[]
-  notifications           InAppNotification[]
-  late_arrival_notices    LateArrivalNotice[]
-  overtime_requests       OvertimeRequest[]
-  org_role_assignment     UserOrgRole?
-  permission_grants       UserPermissionGrant[]
-  refresh_tokens          RefreshToken[]
-  platform_role_assignments PlatformUserRole[]
+  org                          Organisation           @relation(fields: [org_id], references: [id])
+  department_ref               Department?            @relation(fields: [department_id], references: [id], onDelete: SetNull)
+  manager                      User?                  @relation("UserManager", fields: [manager_id], references: [id])
+  direct_reports               User[]                 @relation("UserManager")
+  attendance_records           AttendanceRecord[]
+  corrections_requested        AttendanceCorrection[] @relation("CorrectionUser")
+  corrections_reviewed         AttendanceCorrection[] @relation("CorrectionReviewer")
+  expense_claims               ExpenseClaim[]         @relation("ExpenseClaimant")
+  expenses_reviewed            ExpenseClaim[]         @relation("ExpenseReviewer")
+  documents                    EmployeeDocument[]     @relation("DocumentOwner")
+  documents_uploaded           EmployeeDocument[]     @relation("DocumentUploader")
+  announcements_authored       Announcement[]         @relation("AnnouncementAuthor")
+  announcement_receipts        AnnouncementReceipt[]
+  onboarding_templates_created OnboardingTemplate[]   @relation("OnboardingTemplateCreator")
+  onboarding_tasks             OnboardingTask[]       @relation("OnboardingHire")
+  onboarding_tasks_assigned    OnboardingTask[]       @relation("OnboardingAssignee")
+  kudos_given                  Kudos[]                @relation("KudosGiver")
+  kudos_received               Kudos[]                @relation("KudosRecipient")
+  leave_requests               LeaveRequest[]
+  leave_balances               LeaveBalance[]
+  reviewed_leaves              LeaveRequest[]         @relation("LeaveReviewer")
+  shift_assignments            ShiftAssignment[]
+  checkpoint_scans             ShiftCheckpointScan[]
+  emergency_offers_created     EmergencyShiftOffer[]  @relation("EmergencyShiftCreator")
+  emergency_offers_claimed     EmergencyShiftOffer[]  @relation("EmergencyShiftClaimer")
+  shift_availability           ShiftAvailability[]
+  shift_events                 ShiftScheduleEvent[]   @relation("ShiftEventActor")
+  swap_requests_sent           ShiftSwap[]            @relation("SwapRequester")
+  swap_requests_received       ShiftSwap[]            @relation("SwapTarget")
+  payroll_records              PayrollRecord[]
+  processed_payrolls           PayrollRecord[]        @relation("PayrollProcessor")
+  performance_reviews          PerformanceReview[]    @relation("ReviewSubject")
+  submitted_reviews            PerformanceReview[]    @relation("ReviewSubmitter")
+  performance_goals            PerformanceGoal[]
+  remote_sessions              RemoteSession[]
+  notifications                InAppNotification[]
+  late_arrival_notices         LateArrivalNotice[]
+  overtime_requests            OvertimeRequest[]
+  org_role_assignment          UserOrgRole?
+  permission_grants            UserPermissionGrant[]
+  refresh_tokens               RefreshToken[]
+  sessions                     UserSession[]
+  platform_role_assignments    PlatformUserRole[]
+  projects_owned               Project[]              @relation("ProjectOwner")
+  project_memberships          ProjectMember[]
+  project_tasks_assigned       ProjectTask[]          @relation("ProjectTaskAssignee")
+  project_tasks_created        ProjectTask[]          @relation("ProjectTaskCreator")
+  project_attachments          ProjectAttachment[]
+  project_task_comments        ProjectTaskComment[]
+  ai_conversations             AiConversation[]
 
   @@index([org_id])
   @@map("users")
@@ -212,10 +238,63 @@ model OrgWebhook {
   failure_count   Int       @default(0)
   created_at      DateTime  @default(now())
 
-  org Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  org        Organisation         @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  deliveries OrgWebhookDelivery[]
 
   @@index([org_id])
   @@map("org_webhooks")
+}
+
+model OrgWebhookDelivery {
+  id              String    @id @default(uuid())
+  webhook_id      String?
+  outbox_event_id String?
+  org_id          String
+  event           String    @db.VarChar(60)
+  endpoint_url    String
+  payload         String    @db.Text
+  signature       String    @db.VarChar(64)
+  status          String    @default("queued") @db.VarChar(20)
+  attempts        Int       @default(0)
+  next_attempt_at DateTime  @default(now())
+  last_attempt_at DateTime?
+  delivered_at    DateTime?
+  response_status Int?
+  last_error      String?   @db.Text
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  webhook OrgWebhook?  @relation(fields: [webhook_id], references: [id], onDelete: SetNull)
+  outbox_event OutboxEvent? @relation(fields: [outbox_event_id], references: [id], onDelete: SetNull)
+  org     Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@unique([outbox_event_id, webhook_id])
+  @@index([status, next_attempt_at])
+  @@index([webhook_id, created_at(sort: Desc)])
+  @@index([org_id, created_at(sort: Desc)])
+  @@map("org_webhook_deliveries")
+}
+
+model OutboxEvent {
+  id             String    @id @default(uuid())
+  org_id         String
+  event_type     String    @db.VarChar(60)
+  entity_type    String    @db.VarChar(60)
+  entity_id      String
+  payload        Json      @default("{}")
+  created_at     DateTime  @default(now())
+  published_at   DateTime?
+  claimed_at     DateTime?
+  claim_token    String?   @db.VarChar(80)
+  attempts       Int       @default(0)
+  last_error     String?   @db.Text
+
+  org        Organisation         @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  deliveries OrgWebhookDelivery[]
+
+  @@index([published_at, claimed_at, created_at])
+  @@index([org_id, created_at])
+  @@map("outbox_events")
 }
 
 model Department {
@@ -225,7 +304,7 @@ model Department {
   parent_id  String?
   created_at DateTime @default(now())
 
-  org      Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  org           Organisation   @relation(fields: [org_id], references: [id], onDelete: Cascade)
   parent        Department?    @relation("DepartmentParent", fields: [parent_id], references: [id], onDelete: Cascade)
   children      Department[]   @relation("DepartmentParent")
   users         User[]
@@ -237,7 +316,7 @@ model Department {
 }
 
 model RefreshToken {
-  id          String    @id            // jti embedded in the JWT
+  id          String    @id // jti embedded in the JWT
   user_id     String
   family_id   String
   expires_at  DateTime
@@ -245,12 +324,32 @@ model RefreshToken {
   replaced_by String?
   created_at  DateTime  @default(now())
 
-  user User @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  user    User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  session UserSession @relation(fields: [family_id], references: [id], onDelete: Cascade)
 
   @@index([user_id])
   @@index([family_id])
   @@index([expires_at])
   @@map("refresh_tokens")
+}
+
+model UserSession {
+  id           String    @id // Same stable ID as refresh_tokens.family_id
+  user_id      String
+  device_name  String?   @db.VarChar(160)
+  user_agent   String?   @db.Text
+  ip_address   String?   @db.VarChar(64)
+  created_at   DateTime  @default(now())
+  last_seen_at DateTime  @default(now())
+  expires_at   DateTime
+  revoked_at   DateTime?
+
+  user           User           @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  refresh_tokens RefreshToken[]
+
+  @@index([user_id, revoked_at, last_seen_at(sort: Desc)])
+  @@index([expires_at])
+  @@map("user_sessions")
 }
 
 model AuditLog {
@@ -271,74 +370,97 @@ model AuditLog {
 }
 
 model AttendanceRecord {
-  id              String    @id @default(uuid())
-  user_id         String
-  org_id          String
-  date            DateTime  @db.Date
-  check_in_at     DateTime?
-  check_out_at    DateTime?
-  check_in_type   String    @db.VarChar(20)
-  status          String    @db.VarChar(20)
-  hours_worked    Decimal?  @db.Decimal(5, 2)
-  overtime_hours  Decimal   @default(0) @db.Decimal(5, 2)
-  extra_office_minutes Int   @default(0)
-  ip_detected     String?   @db.VarChar(50)
-  is_overridden              Boolean   @default(false)
-  override_by                String?
-  override_reason            String?
-  shift_id                   String?
-  ip_checkout_pending_at     DateTime?
-  created_at                 DateTime  @default(now())
+  id                      String    @id @default(uuid())
+  user_id                 String
+  org_id                  String
+  date                    DateTime  @db.Date
+  check_in_at             DateTime?
+  client_checkin_at       DateTime?
+  checkin_received_at     DateTime?
+  checkin_idempotency_key String?   @db.VarChar(100)
+  checkin_request_hash    String?   @db.VarChar(64)
+  checkin_source          String?   @db.VarChar(20)
+  checkin_requires_review Boolean   @default(false)
+  device_uptime_ms        Float?
+  server_anchor_at        DateTime?
+  server_anchor_uptime_ms Float?
+  clock_epoch             String?   @db.VarChar(80)
+  checkin_reviewed_at     DateTime?
+  checkin_reviewed_by     String?   @db.Text
+  checkin_review_decision String?   @db.VarChar(20)
+  checkin_review_note     String?   @db.Text
+  offline_reconciled      Boolean   @default(false)
+  latitude                Float?
+  longitude               Float?
+  location_accuracy_m     Float?
+  mock_location_detected  Boolean   @default(false)
+  geofence_status         String?   @db.VarChar(20)
+  geofence_distance_m     Float?
+  check_out_at            DateTime?
+  check_in_type           String    @db.VarChar(20)
+  status                  String    @db.VarChar(20)
+  hours_worked            Decimal?  @db.Decimal(5, 2)
+  overtime_hours          Decimal   @default(0) @db.Decimal(5, 2)
+  extra_office_minutes    Int       @default(0)
+  ip_detected             String?   @db.VarChar(50)
+  is_overridden           Boolean   @default(false)
+  override_by             String?
+  override_reason         String?
+  shift_id                String?
+  ip_checkout_pending_at  DateTime?
+  created_at              DateTime  @default(now())
 
-  scheduled_start    DateTime?
-  scheduled_end      DateTime?
-  break_minutes      Int       @default(0)
-  paid_break_minutes Int       @default(0)
-  net_hours_worked   Decimal?  @db.Decimal(5, 2)
+  scheduled_start       DateTime?
+  scheduled_end         DateTime?
+  break_minutes         Int       @default(0)
+  paid_break_minutes    Int       @default(0)
+  net_hours_worked      Decimal?  @db.Decimal(5, 2)
   late_minutes          Int       @default(0)
   early_out_minutes     Int       @default(0)
   early_checkin_minutes Int       @default(0)
-  adherence_score    Int?
-  auto_checked_out   Boolean   @default(false)
-  late_alerted       Boolean   @default(false)
-  hour_alerted       Boolean   @default(false)
-  absent_alerted     Boolean   @default(false)
-  late_notice_id     String?
-  is_on_approved_leave Boolean @default(false)
-  last_heartbeat_at    DateTime?
-  last_heartbeat_ssid  String?   @db.VarChar(100)
-  challenge_sent_at    DateTime?
+  adherence_score       Int?
+  auto_checked_out      Boolean   @default(false)
+  late_alerted          Boolean   @default(false)
+  hour_alerted          Boolean   @default(false)
+  absent_alerted        Boolean   @default(false)
+  late_notice_id        String?
+  is_on_approved_leave  Boolean   @default(false)
+  last_heartbeat_at     DateTime?
+  last_heartbeat_ssid   String?   @db.VarChar(100)
+  challenge_sent_at     DateTime?
 
-  user           User               @relation(fields: [user_id], references: [id])
-  org            Organisation       @relation(fields: [org_id], references: [id])
-  shift          Shift?             @relation(fields: [shift_id], references: [id])
-  late_notice    LateArrivalNotice? @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
-  remote_session RemoteSession?
-  break_records  BreakRecord[]
-  corrections   AttendanceCorrection[]
+  user             User                   @relation(fields: [user_id], references: [id])
+  org              Organisation           @relation(fields: [org_id], references: [id])
+  shift            Shift?                 @relation(fields: [shift_id], references: [id])
+  late_notice      LateArrivalNotice?     @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
+  remote_session   RemoteSession?
+  break_records    BreakRecord[]
+  corrections      AttendanceCorrection[]
   overtime_request OvertimeRequest?
 
   @@unique([user_id, date])
+  @@unique([user_id, checkin_idempotency_key])
   @@index([org_id, date])
+  @@index([org_id, checkin_requires_review, checkin_received_at])
   @@map("attendance_records")
 }
 
 model BreakRecord {
-  id              String    @id @default(uuid())
-  attendance_id   String
-  break_start     DateTime
-  break_end       DateTime?
-  is_paid         Boolean   @default(false)
-  break_type      String    @db.VarChar(50)
-  duration_mins   Int?
-  auto_ended      Boolean   @default(false)
-  auto_started    Boolean   @default(false)
-  shift_break_id  String?
-  limit_exceeded  Boolean   @default(false)
-  counted_as_extra Boolean  @default(false)
-  source          String    @default("manual") @db.VarChar(30)
+  id                  String    @id @default(uuid())
+  attendance_id       String
+  break_start         DateTime
+  break_end           DateTime?
+  is_paid             Boolean   @default(false)
+  break_type          String    @db.VarChar(50)
+  duration_mins       Int?
+  auto_ended          Boolean   @default(false)
+  auto_started        Boolean   @default(false)
+  shift_break_id      String?
+  limit_exceeded      Boolean   @default(false)
+  counted_as_extra    Boolean   @default(false)
+  source              String    @default("manual") @db.VarChar(30)
   late_return_minutes Int?
-  wifi_on_at_end  Boolean   @default(false)
+  wifi_on_at_end      Boolean?
 
   attendance  AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
   shift_break ShiftBreak?      @relation(fields: [shift_break_id], references: [id], onDelete: SetNull)
@@ -351,11 +473,14 @@ model RemoteSession {
   attendance_id    String    @unique
   user_id          String
   approved_by      String?
+  reviewed_at      DateTime?
+  review_note      String?
   status           String    @default("pending")
   duration_type    String    @db.VarChar(20)
   morning_nudge_at DateTime?
   midday_nudge_at  DateTime?
   end_nudge_at     DateTime?
+  daily_nudge_at   DateTime?
   ai_summary       String?
   created_at       DateTime  @default(now())
 
@@ -390,7 +515,7 @@ model LeaveRequest {
   leave_type       String    @db.VarChar(50)
   start_date       DateTime  @db.Date
   end_date         DateTime  @db.Date
-  working_days     Float     // supports 0.5 for half-day
+  working_days     Float // supports 0.5 for half-day
   is_half_day      Boolean   @default(false)
   half_day_period  String?   @db.VarChar(20) // 'morning' | 'afternoon'
   leave_start_time String?   @db.VarChar(10) // optional HH:MM for mid-shift leave
@@ -427,58 +552,74 @@ model LeaveBalance {
   @@map("leave_balances")
 }
 
+model LeaveAccrualRun {
+  id         String   @id @default(uuid())
+  org_id     String
+  year       Int
+  month      Int
+  created_at DateTime @default(now())
+
+  org Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, year, month])
+  @@map("leave_accrual_runs")
+}
+
 model Shift {
-  id           String    @id @default(uuid())
+  id           String   @id @default(uuid())
   org_id       String
-  name         String    @db.VarChar(100)
-  start_time   String    @db.VarChar(10)
-  end_time     String    @db.VarChar(10)
-  color        String    @default("#1D4ED8") @db.VarChar(20)
+  name         String   @db.VarChar(100)
+  start_time   String   @db.VarChar(10)
+  end_time     String   @db.VarChar(10)
+  color        String   @default("#1D4ED8") @db.VarChar(20)
   active_days  Int[]
-  is_published Boolean   @default(false)
-  is_org_wide  Boolean   @default(false)
-  is_default   Boolean   @default(false)
+  is_published Boolean  @default(false)
+  is_org_wide  Boolean  @default(false)
+  is_default   Boolean  @default(false)
   created_by   String?
-  created_at   DateTime  @default(now())
+  created_at   DateTime @default(now())
 
-  overtime_multiplier           Decimal  @default(1.5) @db.Decimal(4, 2)
-  min_rest_hours                Int      @default(11)
-  late_tolerance_mins           Int      @default(15)
-  early_checkout_tolerance_mins Int      @default(15)
-  auto_checkout                 Boolean  @default(true)
-  auto_checkout_buffer_mins     Int      @default(30)
-  overtime_enabled              Boolean  @default(false)
-  overtime_requires_approval    Boolean  @default(true)
-  extra_time_label              String   @default("Extra office time") @db.VarChar(100)
+  overtime_multiplier           Decimal @default(1.5) @db.Decimal(4, 2)
+  min_rest_hours                Int     @default(11)
+  late_tolerance_mins           Int     @default(15)
+  early_checkout_tolerance_mins Int     @default(15)
+  auto_checkout                 Boolean @default(true)
+  auto_checkout_buffer_mins     Int     @default(30)
+  overtime_enabled              Boolean @default(false)
+  overtime_requires_approval    Boolean @default(true)
+  extra_time_label              String  @default("Extra office time") @db.VarChar(100)
 
-  org                Organisation       @relation(fields: [org_id], references: [id])
+  org                Organisation          @relation(fields: [org_id], references: [id])
   assignments        ShiftAssignment[]
   attendance_records AttendanceRecord[]
   breaks             ShiftBreak[]
+  coverage_rules     ShiftCoverageRule[]
+  checkpoints        ShiftCheckpoint[]
+  emergency_offers   EmergencyShiftOffer[]
 
   @@map("shifts")
 }
 
 model ShiftBreak {
-  id               String  @id @default(uuid())
-  shift_id         String
-  name             String  @db.VarChar(100)
-  break_kind       String  @default("fixed") @db.VarChar(20)
-  break_minutes    Int
-  is_paid          Boolean @default(false)
-  after_minutes    Int
-  break_start_time String? @db.VarChar(10)
-  break_end_time   String? @db.VarChar(10)
-  allowed_count_per_shift Int @default(1)
-  paid_within_limit       Boolean @default(true)
-  deduct_extra_time       Boolean @default(true)
-  allow_extra_breaks      Boolean @default(true)
-  applies_days            Int[] @default([])
+  id                      String   @id @default(uuid())
+  shift_id                String
+  name                    String   @db.VarChar(100)
+  break_kind              String   @default("fixed") @db.VarChar(20)
+  break_minutes           Int
+  is_paid                 Boolean  @default(false)
+  after_minutes           Int
+  break_start_time        String?  @db.VarChar(10)
+  break_end_time          String?  @db.VarChar(10)
+  allowed_count_per_shift Int      @default(1)
+  paid_within_limit       Boolean  @default(true)
+  deduct_extra_time       Boolean  @default(true)
+  allow_extra_breaks      Boolean  @default(true)
+  applies_days            Int[]    @default([])
   exception_dates         String[] @default([])
   // Auto-start: fixed breaks only
-  auto_start              Boolean @default(false)
-  reminder_after_mins     Int     @default(30)
-  deduct_if_skipped       Boolean @default(true)
+  auto_start              Boolean  @default(false)
+  reminder_after_mins     Int      @default(30)
+  deduct_if_skipped       Boolean  @default(true)
 
   shift         Shift         @relation(fields: [shift_id], references: [id], onDelete: Cascade)
   break_records BreakRecord[]
@@ -487,32 +628,168 @@ model ShiftBreak {
 }
 
 model ShiftAssignment {
-  id         String   @id @default(uuid())
-  shift_id   String
-  user_id    String
-  date       DateTime @db.Date
-  created_at DateTime @default(now())
+  id           String   @id @default(uuid())
+  shift_id     String
+  user_id      String
+  date         DateTime @db.Date
+  is_published Boolean  @default(false)
+  created_at   DateTime @default(now())
 
-  shift             Shift      @relation(fields: [shift_id], references: [id])
-  user              User       @relation(fields: [user_id], references: [id])
-  swap_as_requester ShiftSwap? @relation("RequesterAssignment")
-  swap_as_target    ShiftSwap? @relation("TargetAssignment")
+  shift             Shift                 @relation(fields: [shift_id], references: [id])
+  user              User                  @relation(fields: [user_id], references: [id])
+  swap_as_requester ShiftSwap?            @relation("RequesterAssignment")
+  swap_as_target    ShiftSwap?            @relation("TargetAssignment")
+  checkpoint_scans  ShiftCheckpointScan[]
+  emergency_offer   EmergencyShiftOffer?  @relation("EmergencyShiftAssignment")
 
   @@unique([user_id, date])
   @@map("shift_assignments")
 }
 
+model ShiftCheckpoint {
+  id                    String   @id @default(uuid())
+  org_id                String
+  shift_id              String
+  name                  String   @db.VarChar(100)
+  instructions          String?  @db.Text
+  sort_order            Int      @default(0)
+  required              Boolean  @default(true)
+  minimum_interval_mins Int      @default(0)
+  qr_token              String   @unique @db.VarChar(64)
+  active                Boolean  @default(true)
+  created_by            String?
+  created_at            DateTime @default(now())
+
+  org   Organisation          @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  shift Shift                 @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+  scans ShiftCheckpointScan[]
+
+  @@index([org_id, shift_id, active, sort_order])
+  @@map("shift_checkpoints")
+}
+
+model ShiftCheckpointScan {
+  id            String   @id @default(uuid())
+  org_id        String
+  checkpoint_id String
+  assignment_id String
+  user_id       String
+  scanned_at    DateTime @default(now())
+  latitude      Float?
+  longitude     Float?
+  accuracy_m    Float?
+
+  org        Organisation    @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  checkpoint ShiftCheckpoint @relation(fields: [checkpoint_id], references: [id], onDelete: Cascade)
+  assignment ShiftAssignment @relation(fields: [assignment_id], references: [id], onDelete: Cascade)
+  user       User            @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([assignment_id, scanned_at])
+  @@index([checkpoint_id, scanned_at])
+  @@index([org_id, user_id, scanned_at])
+  @@map("shift_checkpoint_scans")
+}
+
+model EmergencyShiftOffer {
+  id            String    @id @default(uuid())
+  org_id        String
+  shift_id      String
+  date          DateTime  @db.Date
+  note          String?   @db.VarChar(500)
+  status        String    @default("open") @db.VarChar(20)
+  expires_at    DateTime
+  created_by    String
+  claimed_by    String?
+  claimed_at    DateTime?
+  assignment_id String?   @unique
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  org        Organisation     @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  shift      Shift            @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+  creator    User             @relation("EmergencyShiftCreator", fields: [created_by], references: [id])
+  claimer    User?            @relation("EmergencyShiftClaimer", fields: [claimed_by], references: [id], onDelete: SetNull)
+  assignment ShiftAssignment? @relation("EmergencyShiftAssignment", fields: [assignment_id], references: [id], onDelete: SetNull)
+
+  @@index([org_id, status, expires_at, date])
+  @@index([shift_id, date])
+  @@map("emergency_shift_offers")
+}
+
+model ShiftAvailability {
+  id          String    @id @default(uuid())
+  org_id      String
+  user_id     String
+  date        DateTime? @db.Date
+  weekday     Int?
+  starts_on   DateTime? @db.Date
+  ends_on     DateTime? @db.Date
+  start_time  String?   @db.VarChar(5)
+  end_time    String?   @db.VarChar(5)
+  kind        String    @default("unavailable") @db.VarChar(20)
+  status      String    @default("pending") @db.VarChar(20)
+  note        String?   @db.VarChar(500)
+  reviewed_by String?
+  reviewed_at DateTime?
+  review_note String?   @db.VarChar(500)
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
+
+  org  Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([org_id, status, date])
+  @@index([user_id, status, weekday])
+  @@map("shift_availability")
+}
+
+model ShiftCoverageRule {
+  id             String   @id @default(uuid())
+  org_id         String
+  shift_id       String
+  weekday        Int
+  required_count Int      @default(1)
+  department     String   @default("") @db.VarChar(100)
+  created_at     DateTime @default(now())
+  updated_at     DateTime @updatedAt
+
+  org   Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  shift Shift        @relation(fields: [shift_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, shift_id, weekday, department])
+  @@index([org_id, weekday])
+  @@map("shift_coverage_rules")
+}
+
+model ShiftScheduleEvent {
+  id          String   @id @default(uuid())
+  org_id      String
+  actor_id    String?
+  event_type  String   @db.VarChar(40)
+  entity_type String   @db.VarChar(40)
+  entity_id   String?
+  details     Json     @default("{}")
+  created_at  DateTime @default(now())
+
+  org   Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  actor User?        @relation("ShiftEventActor", fields: [actor_id], references: [id], onDelete: SetNull)
+
+  @@index([org_id, created_at])
+  @@index([org_id, entity_type, entity_id])
+  @@map("shift_schedule_events")
+}
+
 model ShiftSwap {
-  id                   String   @id @default(uuid())
-  requester_id         String
-  target_id            String
-  requester_assign_id  String   @unique
-  target_assign_id     String   @unique
-  status               String   @default("pending")
-  reason               String?
-  manager_id           String?
-  rejection_reason     String?
-  created_at           DateTime @default(now())
+  id                  String   @id @default(uuid())
+  requester_id        String
+  target_id           String
+  requester_assign_id String   @unique
+  target_assign_id    String   @unique
+  status              String   @default("pending")
+  reason              String?
+  manager_id          String?
+  rejection_reason    String?
+  created_at          DateTime @default(now())
 
   requester            User            @relation("SwapRequester", fields: [requester_id], references: [id])
   target               User            @relation("SwapTarget", fields: [target_id], references: [id])
@@ -523,17 +800,17 @@ model ShiftSwap {
 }
 
 model OvertimeRequest {
-  id                String   @id @default(uuid())
-  attendance_id     String   @unique
+  id                String    @id @default(uuid())
+  attendance_id     String    @unique
   user_id           String
   org_id            String
   requested_minutes Int
   reason            String?
-  status            String   @default("pending") @db.VarChar(20)
+  status            String    @default("pending") @db.VarChar(20)
   reviewed_by       String?
   reviewed_at       DateTime?
   rejection_reason  String?
-  created_at        DateTime @default(now())
+  created_at        DateTime  @default(now())
 
   attendance AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
   user       User             @relation(fields: [user_id], references: [id])
@@ -567,9 +844,9 @@ model PayrollRecord {
   processed_by      String?
   created_at        DateTime  @default(now())
 
-  user      User         @relation(fields: [user_id], references: [id])
-  org       Organisation @relation(fields: [org_id], references: [id])
-  processor User?        @relation("PayrollProcessor", fields: [processed_by], references: [id])
+  user                User           @relation(fields: [user_id], references: [id])
+  org                 Organisation   @relation(fields: [org_id], references: [id])
+  processor           User?          @relation("PayrollProcessor", fields: [processed_by], references: [id])
   reimbursed_expenses ExpenseClaim[]
 
   @@unique([user_id, period_month, period_year])
@@ -635,7 +912,7 @@ model OvertimeRule {
   id              String   @id @default(uuid())
   org_id          String
   name            String   @db.VarChar(100)
-  rule_type       String   @db.VarChar(20)  // "daily" | "weekly" | "seventh_day"
+  rule_type       String   @db.VarChar(20) // "daily" | "weekly" | "seventh_day"
   threshold_hours Decimal  @db.Decimal(5, 2)
   multiplier      Decimal  @db.Decimal(4, 2)
   priority        Int      @default(1)
@@ -670,6 +947,104 @@ model PerformanceReview {
   @@map("performance_reviews")
 }
 
+model Project {
+  id             String    @id @default(uuid())
+  org_id         String
+  owner_id       String
+  name           String    @db.VarChar(180)
+  description    String?   @db.Text
+  status         String    @default("planning") @db.VarChar(30)
+  status_options String[]  @default(["todo", "in_progress", "blocked", "done"])
+  priority       String    @default("medium") @db.VarChar(20)
+  start_date     DateTime? @db.Date
+  due_date       DateTime? @db.Date
+  created_at     DateTime  @default(now())
+  updated_at     DateTime  @updatedAt
+
+  org         Organisation        @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  owner       User                @relation("ProjectOwner", fields: [owner_id], references: [id])
+  members     ProjectMember[]
+  tasks       ProjectTask[]
+  attachments ProjectAttachment[]
+
+  @@index([org_id, status])
+  @@map("projects")
+}
+
+model ProjectMember {
+  project_id String
+  user_id    String
+  role       String   @default("member") @db.VarChar(30)
+  joined_at  DateTime @default(now())
+
+  project Project @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([project_id, user_id])
+  @@index([user_id])
+  @@map("project_members")
+}
+
+model ProjectTask {
+  id                  String    @id @default(uuid())
+  project_id          String
+  assignee_id         String?
+  created_by          String
+  title               String    @db.VarChar(220)
+  description         String?   @db.Text
+  status              String    @default("todo") @db.VarChar(30)
+  priority            String    @default("medium") @db.VarChar(20)
+  due_date            DateTime? @db.Date
+  start_date          DateTime? @db.Date
+  parent_task_id      String?
+  is_milestone        Boolean   @default(false)
+  completed_at        DateTime?
+  performance_goal_id String?
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+
+  project          Project                 @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  assignee         User?                   @relation("ProjectTaskAssignee", fields: [assignee_id], references: [id], onDelete: SetNull)
+  creator          User                    @relation("ProjectTaskCreator", fields: [created_by], references: [id])
+  performance_goal PerformanceGoal?        @relation(fields: [performance_goal_id], references: [id], onDelete: SetNull)
+  attachments      ProjectAttachment[]
+  parent           ProjectTask?            @relation("ProjectTaskSubtasks", fields: [parent_task_id], references: [id], onDelete: Cascade)
+  subtasks         ProjectTask[]           @relation("ProjectTaskSubtasks")
+  comments         ProjectTaskComment[]
+  dependencies     ProjectTaskDependency[] @relation("TaskBlockedBy")
+  blocking         ProjectTaskDependency[] @relation("TaskBlocks")
+
+  @@index([project_id, status])
+  @@index([assignee_id, status])
+  @@map("project_tasks")
+}
+
+model ProjectTaskDependency {
+  task_id       String
+  depends_on_id String
+  created_at    DateTime @default(now())
+
+  task       ProjectTask @relation("TaskBlockedBy", fields: [task_id], references: [id], onDelete: Cascade)
+  depends_on ProjectTask @relation("TaskBlocks", fields: [depends_on_id], references: [id], onDelete: Cascade)
+
+  @@id([task_id, depends_on_id])
+  @@map("project_task_dependencies")
+}
+
+model ProjectTaskComment {
+  id         String   @id @default(uuid())
+  task_id    String
+  user_id    String
+  body       String   @db.Text
+  created_at DateTime @default(now())
+
+  task ProjectTask @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  user User        @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([task_id, created_at])
+  @@map("project_task_comments")
+}
+
 model PerformanceGoal {
   id          String    @id @default(uuid())
   review_id   String
@@ -681,10 +1056,31 @@ model PerformanceGoal {
   completion  Int       @default(0)
   created_at  DateTime  @default(now())
 
-  review PerformanceReview @relation(fields: [review_id], references: [id])
-  user   User              @relation(fields: [user_id], references: [id])
+  review        PerformanceReview @relation(fields: [review_id], references: [id])
+  user          User              @relation(fields: [user_id], references: [id])
+  project_tasks ProjectTask[]
 
   @@map("performance_goals")
+}
+
+model ProjectAttachment {
+  id          String   @id @default(uuid())
+  project_id  String
+  task_id     String?
+  uploaded_by String
+  file_key    String
+  file_name   String   @db.VarChar(255)
+  file_size   Int
+  mime_type   String   @db.VarChar(120)
+  created_at  DateTime @default(now())
+
+  project  Project      @relation(fields: [project_id], references: [id], onDelete: Cascade)
+  task     ProjectTask? @relation(fields: [task_id], references: [id], onDelete: Cascade)
+  uploader User         @relation(fields: [uploaded_by], references: [id])
+
+  @@index([project_id, created_at])
+  @@index([task_id])
+  @@map("project_attachments")
 }
 
 model WhatsappLog {
@@ -704,7 +1100,6 @@ model WhatsappLog {
 
   @@map("whatsapp_notification_logs")
 }
-
 
 model InAppNotification {
   id          String    @id @default(uuid())
@@ -734,15 +1129,15 @@ model LateArrivalNotice {
   user_id         String
   org_id          String
   date            DateTime  @db.Date
-  expected_time   String    @db.VarChar(10)   // HH:MM wall-clock — expected arrival
+  expected_time   String    @db.VarChar(10) // HH:MM wall-clock — expected arrival
   reason          String    @db.Text
   status          String    @default("pending") @db.VarChar(20) // pending | acknowledged | cancelled
   acknowledged_by String?
   acknowledged_at DateTime?
   created_at      DateTime  @default(now())
 
-  user              User               @relation(fields: [user_id], references: [id])
-  org               Organisation       @relation(fields: [org_id], references: [id])
+  user               User               @relation(fields: [user_id], references: [id])
+  org                Organisation       @relation(fields: [org_id], references: [id])
   attendance_records AttendanceRecord[]
 
   @@unique([user_id, date])
@@ -757,7 +1152,7 @@ model Announcement {
   org_id        String
   title         String    @db.VarChar(255)
   body          String    @db.Text
-  department_id String?   // null ⇒ org-wide
+  department_id String? // null ⇒ org-wide
   scheduled_for DateTime? // null ⇒ published immediately on create
   published_at  DateTime?
   created_by    String
@@ -800,7 +1195,7 @@ model OnboardingTemplateItem {
   template_id   String
   title         String  @db.VarChar(200)
   description   String?
-  due_days      Int?    // days after assignment the item is due
+  due_days      Int? // days after assignment the item is due
   sort_order    Int     @default(0)
   assignee_role String  @default("employee") @db.VarChar(20) // employee | manager
 
@@ -869,17 +1264,17 @@ model AnnouncementReceipt {
 }
 
 model PlanDefinition {
-  id            String  @id @db.VarChar(50)
-  display_name  String  @db.VarChar(100)
-  price_monthly Decimal @default(0) @db.Decimal(10, 2)
-  price_annual  Decimal @default(0) @db.Decimal(10, 2)
-  max_employees Int     @default(0)
-  trial_days    Int     @default(14)
-  features      Json    @default("{}")
-  description   String? @db.Text
-  highlight     Boolean @default(false)
-  is_active     Boolean @default(true)
-  sort_order    Int     @default(0)
+  id            String   @id @db.VarChar(50)
+  display_name  String   @db.VarChar(100)
+  price_monthly Decimal  @default(0) @db.Decimal(10, 2)
+  price_annual  Decimal  @default(0) @db.Decimal(10, 2)
+  max_employees Int      @default(0)
+  trial_days    Int      @default(14)
+  features      Json     @default("{}")
+  description   String?  @db.Text
+  highlight     Boolean  @default(false)
+  is_active     Boolean  @default(true)
+  sort_order    Int      @default(0)
   updated_at    DateTime @default(now()) @updatedAt
 
   @@map("plan_definitions")
@@ -1011,20 +1406,27 @@ model BlogPost {
 }
 
 model AiConversation {
-  id        String   @id @default(uuid())
-  orgId     String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id        String      @id @default(uuid())
+  orgId     String      @map("org_id")
+  userId    String?     @map("user_id")
+  context   String?     @db.Text
+  createdAt DateTime    @default(now()) @map("created_at")
+  updatedAt DateTime    @updatedAt @map("updated_at")
   messages  AiMessage[]
+  user      User?       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, updatedAt])
+  @@map("ai_conversations")
 }
 
 model AiMessage {
-  id          String   @id @default(uuid())
-  conversationId String
-  role        String   // "user" | "assistant" | "system"
-  content     String
-  toolCalls   Json?
-  createdAt   DateTime @default(now())
+  id             String   @id @default(uuid())
+  sequence       BigInt   @unique @default(autoincrement())
+  conversationId String   @map("conversation_id")
+  role           String // "user" | "assistant" | "system"
+  content        String
+  toolCalls      Json?    @map("tool_calls")
+  createdAt      DateTime @default(now()) @map("created_at")
 
   conversation AiConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 

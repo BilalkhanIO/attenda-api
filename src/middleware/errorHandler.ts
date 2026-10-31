@@ -1,9 +1,10 @@
 import { Request, Response, NextFunction } from 'express';
 import { AppError } from '../utils/response';
+import { logger } from '../utils/logger';
 
 export function errorHandler(
   err: Error,
-  _req: Request,
+  req: Request,
   res: Response,
   _next: NextFunction
 ) {
@@ -35,7 +36,7 @@ export function errorHandler(
     });
   }
 
-  console.error('[ERROR]', err);
+  logger.error({ err, method: req.method, path: req.originalUrl, userId: req.user?.sub }, 'Unhandled API error');
 
   res.status(500).json({
     success: false,

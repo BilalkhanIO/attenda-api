@@ -4,6 +4,7 @@ import { validate } from '../middleware/validate';
 import {
   checkinSchema, checkoutSchema, breakStartSchema, breakEndSchema,
   heartbeatSchema, ipEventSchema, lateNoticeSchema, attendanceOverrideSchema,
+  attendanceReviewResolveSchema,
 } from '../schemas';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
 import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
@@ -12,7 +13,11 @@ import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, calculateBreak
 import prisma from '../utils/prisma';
 import type { Shift, ShiftBreak } from '@prisma/client';
 import { recordAudit } from '../services/audit';
-import { emitOrgEvent } from '../services/notifications';
+import { createNotification, emitOrgEvent } from '../services/notifications';
+import { resolveUserPermissions } from '../services/authorization';
+import { evaluateCheckinLocation, parseAttendanceSecurity } from '../utils/attendanceSecurity';
+import { issueAttendanceClockAnchor, verifyAttendanceClockAnchor } from '../utils/attendanceClock';
+import { createHash } from 'node:crypto';
 
 const router = Router();
 router.use(authenticate);
@@ -23,10 +28,53 @@ const RECORD_INCLUDE = {
   break_records: { orderBy: { break_start: 'asc' } },
 } as const;
 
+router.get('/reviews', requirePermission('attendance.review_flags'), async (req, res, next) => {
+  try {
+    const limit = Math.max(1, Math.min(100, Number.parseInt(String(req.query.limit ?? '50'), 10) || 50));
+    const records = await prisma.attendanceRecord.findMany({
+      where: { org_id: req.user!.org_id, checkin_requires_review: true },
+      include: RECORD_INCLUDE,
+      orderBy: [{ checkin_received_at: 'asc' }, { id: 'asc' }],
+      take: limit,
+    });
+    ok(res, records);
+  } catch (e) { next(e); }
+});
+
+router.put('/reviews/:id/resolve', requirePermission('attendance.review_flags'), validate({ body: attendanceReviewResolveSchema }), async (req, res, next) => {
+  try {
+    const id = String(req.params.id);
+    const { decision, note } = req.body as { decision: 'approve' | 'reject' | 'request_recheck'; note: string };
+    const record = await prisma.attendanceRecord.findFirst({ where: { id, org_id: req.user!.org_id, checkin_requires_review: true } });
+    if (!record) throw new NotFoundError('Attendance review');
+    const resolvedAt = new Date();
+    const changed = await prisma.attendanceRecord.updateMany({
+      where: { id, org_id: req.user!.org_id, checkin_requires_review: true },
+      data: {
+        checkin_requires_review: false,
+        checkin_reviewed_at: resolvedAt,
+        checkin_reviewed_by: req.user!.sub,
+        checkin_review_decision: decision,
+        checkin_review_note: note,
+      },
+    });
+    if (!changed.count) throw new AppError('This review was already handled. Reload the queue.', 409, 'STALE_REVIEW');
+    await recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: `attendance.checkin_review.${decision}`, entityType: 'attendance_record', entityId: id, before: { checkin_requires_review: true }, after: { checkin_requires_review: false, decision, note } });
+    createNotification({
+      userId: record.user_id, orgId: req.user!.org_id, type: 'attendance_checkin_review',
+      title: decision === 'approve' ? 'Offline check-in verified' : decision === 'reject' ? 'Offline check-in evidence rejected' : 'Please recheck your attendance',
+      body: note, actionType: 'attendance', actionId: record.id,
+    }).catch(console.error);
+    emitOrgEvent(req.user!.org_id, 'attendance_changed');
+    const updated = await prisma.attendanceRecord.findUnique({ where: { id }, include: RECORD_INCLUDE });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
 async function orgTimeContext(orgId: string) {
   const org = await prisma.organisation.findUnique({
     where: { id: orgId },
-    select: { timezone: true, late_threshold: true, gap_forgiveness_mins: true },
+    select: { timezone: true, late_threshold: true, gap_forgiveness_mins: true, attendance_security: true },
   });
   const timezone = org?.timezone ?? 'UTC';
   return { org, timezone, today: dateOnlyInTz(new Date(), timezone) };
@@ -201,16 +249,37 @@ router.get('/late-summary', requirePermission('attendance.view_team'), async (re
 router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { days = '30' } = req.query as { days?: string };
+    const parsedDays = Number.parseInt(days, 10);
+    const historyDays = Number.isFinite(parsedDays) ? Math.max(1, Math.min(365, parsedDays)) : 30;
     const since = new Date();
-    since.setDate(since.getDate() - parseInt(days));
+    since.setDate(since.getDate() - historyDays);
+    const where = { user_id: req.user!.sub, date: { gte: since } };
+    const cursorMode = req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string';
+    const parsedLimit = Number.parseInt(String(req.query.limit ?? '50'), 10);
+    const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 50;
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+
+    if (cursorMode && cursor) {
+      const anchor = await prisma.attendanceRecord.findFirst({ where: { ...where, id: cursor }, select: { id: true } });
+      if (!anchor) throw new ValidationError('Invalid attendance cursor');
+    }
+
     const records = await prisma.attendanceRecord.findMany({
-      where: { user_id: req.user!.sub, date: { gte: since } },
-      orderBy: { date: 'desc' },
+      where,
+      ...(cursorMode && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      orderBy: [{ date: 'desc' }, { id: 'desc' }],
+      ...(cursorMode ? { take: limit + 1 } : {}),
       include: {
         break_records: { orderBy: { break_start: 'asc' } },
       },
     });
-    ok(res, records);
+    if (!cursorMode) {
+      ok(res, records);
+      return;
+    }
+    const hasMore = records.length > limit;
+    const items = hasMore ? records.slice(0, limit) : records;
+    ok(res, { items, next_cursor: hasMore ? items[items.length - 1]?.id ?? null : null, has_more: hasMore, limit });
   } catch (e) { next(e); }
 });
 
@@ -405,11 +474,12 @@ router.get('/remote/monitor', requirePermission('remote.approve'), async (req: R
 // Full nudge log for one session — accessible by the employee or their manager
 router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const isEmployee = req.user!.role === 'employee';
+    const permissions = await resolveUserPermissions(req.user!.sub, req.user!.org_id);
+    const canViewTeam = permissions.has('attendance.view_team') || permissions.has('attendance.override');
     const session = await prisma.remoteSession.findFirst({
-      where: isEmployee
-        ? { id: String(req.params.id), user_id: req.user!.sub }
-        : { id: String(req.params.id), user: { org_id: req.user!.org_id } },
+      where: canViewTeam
+        ? { id: String(req.params.id), user: { org_id: req.user!.org_id } }
+        : { id: String(req.params.id), user_id: req.user!.sub },
       include: {
         user:         { select: { id: true, name: true, department: true, avatar_url: true } },
         attendance:   { select: { date: true } },
@@ -443,6 +513,8 @@ router.post('/break/start', validate({ body: breakStartSchema }), async (req: Re
       : record.break_records.filter(b => b.break_type === break_type).length;
     const allowedCount = policy?.allowed_count_per_shift ?? 1;
     const limitExceeded = !!policy && policy.break_kind === 'flexible' && takenCount >= allowedCount;
+    if (limitExceeded && !policy.allow_extra_breaks) throw new AppError('No more breaks of this type are allowed today', 400, 'BREAK_LIMIT_REACHED');
+    if (shift_break_id && !policy) throw new AppError('This break is not available today', 400, 'INVALID_BREAK');
     // Ad-hoc breaks (no shift policy) are always unpaid.
     // Payability is only determined by the linked ShiftBreak policy.
     const isPaid = policy
@@ -476,7 +548,7 @@ router.post('/break/start', validate({ body: breakStartSchema }), async (req: Re
 // break record for history and analytics.
 router.post('/break/end', validate({ body: breakEndSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { wifi_connected = false } = req.body as { wifi_connected?: boolean };
+    const { wifi_connected } = req.body as { wifi_connected?: boolean };
     const { today, timezone: tz } = await orgTimeContext(req.user!.org_id);
 
     const record = await prisma.attendanceRecord.findUnique({
@@ -522,7 +594,7 @@ router.post('/break/end', validate({ body: breakEndSchema }), async (req: Reques
         break_end:           now,
         duration_mins:       durationMins,
         late_return_minutes: lateReturnMins,
-        wifi_on_at_end:      !!wifi_connected,
+        wifi_on_at_end:      wifi_connected ?? null,
       },
     });
 
@@ -693,6 +765,7 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
   try {
     const now   = new Date();
     const { org, timezone: tz, today } = await orgTimeContext(req.user!.org_id);
+    const attendanceSecurity = parseAttendanceSecurity(org?.attendance_security);
 
     // Find today's attendance record (with active break)
     const record = await prisma.attendanceRecord.findUnique({
@@ -783,6 +856,8 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
     // ── Pre-check-in late minutes ───────────────────────
     // If not yet checked in and shift has started, calculate live late minutes.
     let pre_checkin_late_minutes = 0;
+    let expected_checkin_utc: string | null = null;
+    const late_tolerance_minutes = lateThresholdFor(shift, org);
     let shift_start_utc: string | null = null;
     let shift_end_utc: string | null = null;
     if (!record?.check_in_at && shift) {
@@ -791,8 +866,9 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
         select: { is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
       });
       const adjusted = adjustedWindowForLeave(shift, tz, now, approvedLeave);
+      expected_checkin_utc = adjusted.start.toISOString();
       const rawLate = Math.max(0, Math.round((now.getTime() - adjusted.start.getTime()) / 60000));
-      pre_checkin_late_minutes = rawLate > lateThresholdFor(shift, org) ? rawLate : 0;
+      pre_checkin_late_minutes = Math.max(0, rawLate - late_tolerance_minutes);
     }
     if (shift) {
       const win = scheduledWindow(shift, tz, now);
@@ -838,7 +914,12 @@ router.get('/today-status', async (req: Request, res: Response, next: NextFuncti
       active_break: activeBreak,
       date: today.toISOString().split('T')[0],
       pre_checkin_late_minutes,
+      expected_checkin_utc,
+      late_tolerance_minutes,
+      location_capture_enabled: attendanceSecurity?.geofence_enabled ?? false,
+      location_required: !!attendanceSecurity?.geofence_enabled && attendanceSecurity.require_location,
       server_time: now.toISOString(),
+      attendance_clock_anchor: issueAttendanceClockAnchor(req.user!.sub, req.user!.org_id, now),
     });
   } catch (e) { next(e); }
 });
@@ -873,21 +954,73 @@ router.get('/leave-check', async (req: Request, res: Response, next: NextFunctio
 // ─── POST /attendance/checkin ──────────────────────────
 router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { type = 'manual', qr_code, duration_type = 'full_day', count_away_as_break, away_shift_break_id } = req.body;
-    const { org: orgInfo, timezone: orgTimezone, today } = await orgTimeContext(req.user!.org_id);
+    const {
+      type = 'manual', qr_code, duration_type = 'full_day', count_away_as_break,
+      away_shift_break_id, idempotency_key, client_event_at, offline = false,
+      latitude, longitude, accuracy_m, is_mocked = false,
+      device_uptime_ms, server_anchor_uptime_ms, clock_epoch, server_anchor_epoch, attendance_clock_anchor,
+    } = req.body;
+    const { org: orgInfo, timezone: orgTimezone, today: orgToday } = await orgTimeContext(req.user!.org_id);
+    const receivedAt = new Date();
+    const clientEventAt = client_event_at ? new Date(client_event_at) : null;
+    if (offline && (!idempotency_key || !clientEventAt || !attendance_clock_anchor || device_uptime_ms === undefined || server_anchor_uptime_ms === undefined || !clock_epoch || !server_anchor_epoch)) {
+      throw new AppError('Offline check-in needs a trusted time anchor. Reconnect before retrying.', 409, 'OFFLINE_CHECKIN_REVIEW');
+    }
+    const hashBody = Object.fromEntries(Object.entries(req.body).filter(([key]) => key !== 'offline').sort(([a], [b]) => a.localeCompare(b)));
+    const requestHash = idempotency_key ? createHash('sha256').update(JSON.stringify(hashBody)).digest('hex') : null;
+    let checkInAt = receivedAt;
+    let requiresCheckinReview = false;
+    if (offline && clientEventAt) {
+      const anchor = verifyAttendanceClockAnchor(attendance_clock_anchor!, req.user!.sub, req.user!.org_id);
+      const anchorAt = new Date(anchor.server_time);
+      const elapsedMs = device_uptime_ms! - server_anchor_uptime_ms!;
+      const anchorAgeMs = receivedAt.getTime() - anchorAt.getTime();
+      const monotonicValid = clock_epoch === server_anchor_epoch && elapsedMs >= 0 && elapsedMs <= 12 * 60 * 60_000 && anchorAgeMs >= 0 && anchorAgeMs <= 12 * 60 * 60_000;
+      if (monotonicValid) {
+        checkInAt = new Date(anchorAt.getTime() + elapsedMs);
+        if (checkInAt.getTime() > receivedAt.getTime() + 2 * 60_000) throw new AppError('Offline time proof is outside the valid range. Contact your manager.', 409, 'OFFLINE_CHECKIN_REVIEW');
+        requiresCheckinReview = Math.abs(checkInAt.getTime() - clientEventAt.getTime()) > 2 * 60_000 || receivedAt.getTime() - checkInAt.getTime() > 10 * 60_000 || anchorAgeMs > 10 * 60_000;
+      } else {
+        // A reboot/process reset breaks the monotonic chain. Do not trust the
+        // wall clock; record at receipt time and send the event to review.
+        checkInAt = receivedAt;
+        requiresCheckinReview = true;
+      }
+    }
+    const attendanceDate = dateOnlyInTz(checkInAt, orgTimezone);
+    const serverAnchorAt = offline ? new Date(verifyAttendanceClockAnchor(attendance_clock_anchor!, req.user!.sub, req.user!.org_id).server_time) : null;
+    const checkinTrustData = {
+      checkin_request_hash: requestHash,
+      checkin_source: offline ? 'offline' : type,
+      checkin_requires_review: requiresCheckinReview,
+      ...(offline && { device_uptime_ms, server_anchor_uptime_ms, server_anchor_at: serverAnchorAt, clock_epoch }),
+    };
+
+    if (idempotency_key) {
+      const duplicate = await prisma.attendanceRecord.findFirst({
+        where: { user_id: req.user!.sub, checkin_idempotency_key: idempotency_key },
+        include: RECORD_INCLUDE,
+      });
+      if (duplicate) {
+        if (duplicate.checkin_request_hash && requestHash && duplicate.checkin_request_hash !== requestHash) throw new AppError('This idempotency key was already used with a different check-in payload.', 409, 'IDEMPOTENCY_KEY_REUSED');
+        return ok(res, { ...duplicate, action: 'already_recorded', idempotent: true });
+      }
+    }
+    const locationPolicy = type === 'remote' ? null : parseAttendanceSecurity(orgInfo?.attendance_security);
+    const locationCheck = evaluateCheckinLocation(locationPolicy, { latitude, longitude, accuracy_m, is_mocked });
     // Capture client IP — prefer X-Forwarded-For (behind proxy/load balancer)
     const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || null;
 
-    // Check no existing check-in today
+    // Check no existing check-in on the event's organization-local day.
     const existing = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      where: { user_id_date: { user_id: req.user!.sub, date: attendanceDate } },
     });
 
     // Re-entry: employee was auto-checked out (WiFi dropout / heartbeat expiry)
     // and has now returned without having logged a break. Log the gap as an
     // unpaid 'away' break and reopen the record so the rest of the day continues.
     if (existing?.check_in_at && existing.check_out_at && existing.auto_checked_out) {
-      const reentryTime = new Date();
+      const reentryTime = checkInAt;
       const reopenedStatus = (existing.late_minutes ?? 0) > 0 ? 'late' : 'in';
       const gapSinceCheckout = Math.round((reentryTime.getTime() - existing.check_out_at.getTime()) / 60000);
 
@@ -905,6 +1038,17 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
             auto_checked_out:  false,
             status:            reopenedStatus,
             last_heartbeat_at: null,
+            ...(idempotency_key && { checkin_idempotency_key: idempotency_key }),
+            ...(clientEventAt && { client_checkin_at: clientEventAt }),
+            checkin_received_at: receivedAt,
+            offline_reconciled: offline,
+            ...checkinTrustData,
+            ...(locationPolicy?.geofence_enabled && latitude !== undefined && { latitude }),
+            ...(locationPolicy?.geofence_enabled && longitude !== undefined && { longitude }),
+            ...(locationPolicy?.geofence_enabled && accuracy_m !== undefined && { location_accuracy_m: accuracy_m }),
+            mock_location_detected: locationPolicy?.geofence_enabled ? is_mocked : false,
+            geofence_status: locationCheck?.status,
+            geofence_distance_m: locationCheck?.distance_m ?? undefined,
           },
           include: RECORD_INCLUDE,
         });
@@ -929,6 +1073,17 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
           break_minutes:     breakTotals.totalMins,
           paid_break_minutes: breakTotals.paidMins,
           last_heartbeat_at: null,
+          ...(idempotency_key && { checkin_idempotency_key: idempotency_key }),
+          ...(clientEventAt && { client_checkin_at: clientEventAt }),
+          checkin_received_at: receivedAt,
+          offline_reconciled: offline,
+          ...checkinTrustData,
+          ...(locationPolicy?.geofence_enabled && latitude !== undefined && { latitude }),
+          ...(locationPolicy?.geofence_enabled && longitude !== undefined && { longitude }),
+          ...(locationPolicy?.geofence_enabled && accuracy_m !== undefined && { location_accuracy_m: accuracy_m }),
+          mock_location_detected: locationPolicy?.geofence_enabled ? is_mocked : false,
+          geofence_status: locationCheck?.status,
+          geofence_distance_m: locationCheck?.distance_m ?? undefined,
         },
         include: RECORD_INCLUDE,
       });
@@ -955,13 +1110,13 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
       if (!verification.valid) throw new ValidationError(verification.reason || 'Invalid QR code');
     }
 
-    const now = new Date();
+    const now = checkInAt;
 
     // ── Check for approved leave ──────────────────────────────────────────────
     // Half-day leave employees are expected to check in for the other half.
     // Full-day leave: allow check-in but flag is_on_approved_leave=true + notify manager.
     const approvedLeave = await prisma.leaveRequest.findFirst({
-      where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
+      where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: attendanceDate }, end_date: { gte: attendanceDate } },
       select: { id: true, leave_type: true, is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
     });
     // Half-day leave: not an override — employee IS expected to show up for the other half
@@ -969,7 +1124,7 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
 
     // ── Check for an active late notice ──────────────────────────────────────
     const lateNotice = await prisma.lateArrivalNotice.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: today } },
+      where: { user_id_date: { user_id: req.user!.sub, date: attendanceDate } },
       select: { id: true, status: true },
     });
     const activeNoticeId = lateNotice && lateNotice.status !== 'cancelled' ? lateNotice.id : null;
@@ -985,7 +1140,7 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
     let shiftId: string | null = null;
 
     if (type !== 'remote') {
-      const shift = await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, now);
+      const shift = await effectiveShiftForUser(req.user!.sub, req.user!.org_id, attendanceDate, now);
 
       if (shift) {
         shiftId = shift.id;
@@ -1008,11 +1163,24 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
       }
     }
 
-    const record = existing
+    let record;
+    try {
+      record = existing
       ? await prisma.attendanceRecord.update({
           where: { id: existing.id },
           data: {
             check_in_at: now, check_in_type: type, status,
+            checkin_idempotency_key: idempotency_key ?? undefined,
+            client_checkin_at: clientEventAt ?? undefined,
+            checkin_received_at: receivedAt,
+            offline_reconciled: offline,
+            ...checkinTrustData,
+            ...(locationPolicy?.geofence_enabled && latitude !== undefined && { latitude }),
+            ...(locationPolicy?.geofence_enabled && longitude !== undefined && { longitude }),
+            ...(locationPolicy?.geofence_enabled && accuracy_m !== undefined && { location_accuracy_m: accuracy_m }),
+            mock_location_detected: locationPolicy?.geofence_enabled ? is_mocked : false,
+            geofence_status: locationCheck?.status,
+            geofence_distance_m: locationCheck?.distance_m ?? undefined,
             late_minutes: lateMins,
             early_checkin_minutes: earlyCheckinMins,
             ...(rawIp          && { ip_detected: rawIp }),
@@ -1027,7 +1195,18 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
       : await prisma.attendanceRecord.create({
           data: {
             user_id: req.user!.sub, org_id: req.user!.org_id,
-            date: today, check_in_at: now, check_in_type: type, status,
+            date: attendanceDate, check_in_at: now, check_in_type: type, status,
+            checkin_idempotency_key: idempotency_key ?? undefined,
+            client_checkin_at: clientEventAt ?? undefined,
+            checkin_received_at: receivedAt,
+            offline_reconciled: offline,
+            ...checkinTrustData,
+            ...(locationPolicy?.geofence_enabled && latitude !== undefined && { latitude }),
+            ...(locationPolicy?.geofence_enabled && longitude !== undefined && { longitude }),
+            ...(locationPolicy?.geofence_enabled && accuracy_m !== undefined && { location_accuracy_m: accuracy_m }),
+            mock_location_detected: locationPolicy?.geofence_enabled ? is_mocked : false,
+            geofence_status: locationCheck?.status,
+            geofence_distance_m: locationCheck?.distance_m ?? undefined,
             late_minutes: lateMins,
             early_checkin_minutes: earlyCheckinMins,
             ip_detected:     rawIp          ?? undefined,
@@ -1039,6 +1218,32 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
           },
           include: RECORD_INCLUDE,
         });
+    } catch (error) {
+      if ((error as { code?: string }).code !== 'P2002') throw error;
+      const concurrentRecord = await prisma.attendanceRecord.findUnique({
+        where: { user_id_date: { user_id: req.user!.sub, date: attendanceDate } },
+        include: RECORD_INCLUDE,
+      });
+      if (!concurrentRecord?.check_in_at) throw error;
+      if (idempotency_key && concurrentRecord.checkin_idempotency_key === idempotency_key && concurrentRecord.checkin_request_hash && requestHash && concurrentRecord.checkin_request_hash !== requestHash) {
+        throw new AppError('This idempotency key was already used with a different check-in payload.', 409, 'IDEMPOTENCY_KEY_REUSED');
+      }
+      return ok(res, {
+        ...concurrentRecord,
+        action: 'already_recorded',
+        idempotent: !!idempotency_key && concurrentRecord.checkin_idempotency_key === idempotency_key,
+      });
+    }
+
+    if (requiresCheckinReview) {
+      const reviewer = await prisma.user.findUnique({ where: { id: req.user!.sub }, select: { manager_id: true } });
+      if (reviewer?.manager_id) createNotification({
+        userId: reviewer.manager_id, orgId: req.user!.org_id,
+        type: 'attendance_checkin_review', title: 'Offline check-in needs review',
+        body: `${req.user!.name} submitted an offline check-in with uncertain timing. Review the evidence before using it for payroll decisions.`,
+        actionType: 'attendance', actionId: record.id,
+      }).catch(console.error);
+    }
 
     // If on full-day approved leave: alert manager that employee checked in anyway
     if (isFullDayLeaveOverride) {
@@ -1281,7 +1486,7 @@ router.post('/heartbeat', validate({ body: heartbeatSchema }), async (req: Reque
 
     await prisma.attendanceRecord.update({
       where: { id: record.id },
-      data: { last_heartbeat_at: new Date(), last_heartbeat_ssid: ssid ?? null },
+      data: { last_heartbeat_at: new Date(), last_heartbeat_ssid: ssid ?? null, ip_checkout_pending_at: null },
     });
     const hbOrg = await prisma.organisation.findUnique({
       where: { id: req.user!.org_id },
@@ -1322,6 +1527,11 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
       });
 
       if (!existing?.check_in_at) {
+        if (!org?.wifi_auto_checkin_enabled) return ok(res, { action: 'disabled' });
+        const attendanceSecurity = parseAttendanceSecurity(org.attendance_security);
+        if (attendanceSecurity?.geofence_enabled) {
+          return ok(res, { action: 'manual_checkin_required', reason: 'Location verification must be completed in the app.' });
+        }
         const now = new Date();
         // Detect late arrival for IP-based check-in (timezone-aware, shift-first threshold)
         let status   = 'in';
@@ -1498,6 +1708,7 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
         data: {
           last_heartbeat_at: new Date(),
           last_heartbeat_ssid: ssid ?? null,
+          ip_checkout_pending_at: null,
         },
       });
       return ok(res, { action: 'already_in', grace_mins: org?.heartbeat_grace_mins ?? 20 });

@@ -7,6 +7,14 @@ import prisma from '../utils/prisma';
 const router = Router();
 router.use(authenticate);
 
+// Available role choices for the platform-user form.
+router.get('/roles', requirePermission('platform.users.manage'), async (_req: Request, res: Response, next: NextFunction) => {
+  try {
+    const roles = await prisma.platformRole.findMany({ select: { slug: true, name: true, description: true }, orderBy: { name: 'asc' } });
+    ok(res, roles);
+  } catch (e) { next(e); }
+});
+
 // ─── GET /admin/users ──────────────────────────────────
 router.get('/', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
   try {
