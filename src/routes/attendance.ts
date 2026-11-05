@@ -701,33 +701,44 @@ router.post('/break/start', validate({ body: breakStartSchema }), idempotency, a
       ? availableBreaks.find(b => b.id === shift_break_id)
       : availableBreaks.find(b => b.name === break_type || b.id === break_type);
 
-    const takenCount = policy
-      ? record.break_records.filter(b => b.shift_break_id === policy.id).length
-      : record.break_records.filter(b => b.break_type === break_type).length;
     const allowedCount = policy?.allowed_count_per_shift ?? 1;
-    const limitExceeded = !!policy && policy.break_kind === 'flexible' && takenCount >= allowedCount;
-    if (limitExceeded && !policy.allow_extra_breaks) throw new AppError('No more breaks of this type are allowed today', 400, 'BREAK_LIMIT_REACHED');
     if (shift_break_id && !policy) throw new AppError('This break is not available today', 400, 'INVALID_BREAK');
-    // Ad-hoc breaks (no shift policy) are always unpaid.
-    // Payability is only determined by the linked ShiftBreak policy.
-    const isPaid = policy
-      ? !!policy.is_paid && (limitExceeded ? !policy.deduct_extra_time : policy.paid_within_limit)
-      : false;
-
-    const breakRecord = await prisma.breakRecord.create({
-      data: {
-        attendance_id: record.id,
-        break_start: eventAt,
-        break_type: policy?.name ?? break_type,
-        is_paid: isPaid,
-        shift_break_id: policy?.id ?? undefined,
-        limit_exceeded: limitExceeded,
-        counted_as_extra: limitExceeded,
-        source: req.body?.offline ? 'offline' : 'manual',
-        ...(key && { start_idempotency_key: key, start_request_hash: hash }),
-      },
+    const { breakRecord, limitExceeded } = await prisma.$transaction(async tx => {
+      // Serialize break starts against checkout and other break actions by
+      // locking the parent attendance row, then re-read the authoritative state.
+      const activeAttendance = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM attendance_records
+        WHERE id = ${record.id} AND org_id = ${req.user!.org_id} AND user_id = ${req.user!.sub} AND check_out_at IS NULL
+        FOR UPDATE
+      `;
+      if (!activeAttendance.length) throw new AppError('This attendance record has already been checked out.', 409, 'CHECKED_OUT');
+      const currentBreaks = await tx.breakRecord.findMany({ where: { attendance_id: record.id }, select: { shift_break_id: true, break_type: true, break_end: true } });
+      if (currentBreaks.some(item => !item.break_end)) throw new AppError('Break already in progress', 409, 'BREAK_IN_PROGRESS');
+      const takenCount = policy
+        ? currentBreaks.filter(item => item.shift_break_id === policy.id).length
+        : currentBreaks.filter(item => item.break_type === break_type).length;
+      const limitExceeded = !!policy && policy.break_kind === 'flexible' && takenCount >= allowedCount;
+      if (limitExceeded && !policy!.allow_extra_breaks) throw new AppError('No more breaks of this type are allowed today', 400, 'BREAK_LIMIT_REACHED');
+      // Ad-hoc breaks (no shift policy) are always unpaid.
+      const isPaid = policy
+        ? !!policy.is_paid && (limitExceeded ? !policy.deduct_extra_time : policy.paid_within_limit)
+        : false;
+      const breakRecord = await tx.breakRecord.create({
+        data: {
+          attendance_id: record.id,
+          break_start: eventAt,
+          break_type: policy?.name ?? break_type,
+          is_paid: isPaid,
+          shift_break_id: policy?.id ?? undefined,
+          limit_exceeded: limitExceeded,
+          counted_as_extra: limitExceeded,
+          source: req.body?.offline ? 'offline' : 'manual',
+          ...(key && { start_idempotency_key: key, start_request_hash: hash }),
+        },
+      });
+      if (req.body?.offline) await tx.attendanceRecord.update({ where: { id: record.id }, data: { offline_reconciled: true, ...(requiresReview && { checkin_requires_review: true }) } });
+      return { breakRecord, limitExceeded };
     });
-    if (req.body?.offline) await prisma.attendanceRecord.update({ where: { id: record.id }, data: { offline_reconciled: true, ...(requiresReview && { checkin_requires_review: true }) } });
     if (req.body?.offline && requiresReview) await notifyOfflineAttendanceReview(req.user!.sub, req.user!.org_id, record.id, 'break start');
     ok(res, {
       ...breakRecord,
@@ -786,33 +797,44 @@ router.post('/break/end', validate({ body: breakEndSchema }), idempotency, async
       }
     }
 
-    const ended = await prisma.breakRecord.update({
-      where: { id: activeBreak.id },
-      data: {
-        break_end:           now,
-        duration_mins:       durationMins,
-        late_return_minutes: lateReturnMins,
-        wifi_on_at_end:      wifi_connected ?? null,
-        ...(key && { end_idempotency_key: key, end_request_hash: hash }),
-        ...(req.body?.offline && { source: 'offline' }),
-      },
-    });
-
-    // Recalculate net_hours_worked on the parent attendance record from the
-    // actual break rows, so total/paid/unpaid cannot drift.
-    const breakTotals = await calculateBreakTotals(record.id);
-    const totalMins       = record.check_in_at
-      ? Math.round((now.getTime() - record.check_in_at.getTime()) / 60000)
-      : 0;
-
-    await prisma.attendanceRecord.update({
-      where: { id: record.id },
-      data: {
-        break_minutes: breakTotals.totalMins,
-        paid_break_minutes: breakTotals.paidMins,
-        net_hours_worked: parseFloat(((totalMins - breakTotals.unpaidMins) / 60).toFixed(2)),
-        ...(req.body?.offline && { offline_reconciled: true, ...(requiresReview && { checkin_requires_review: true }) }),
-      },
+    const ended = await prisma.$transaction(async tx => {
+      const activeAttendance = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM attendance_records
+        WHERE id = ${record.id} AND org_id = ${req.user!.org_id} AND user_id = ${req.user!.sub} AND check_out_at IS NULL
+        FOR UPDATE
+      `;
+      if (!activeAttendance.length) throw new AppError('This attendance record has already been checked out.', 409, 'CHECKED_OUT');
+      const currentBreak = await tx.breakRecord.findFirst({
+        where: { id: activeBreak.id, attendance_id: record.id, break_end: null },
+        select: { id: true, break_start: true },
+      });
+      if (!currentBreak) throw new AppError('This break has already ended.', 409, 'BREAK_ALREADY_ENDED');
+      if (now <= currentBreak.break_start) throw new AppError('Break end must be after break start. This event needs review.', 409, 'OFFLINE_EVENT_REVIEW');
+      const currentDuration = Math.max(0, Math.round((now.getTime() - currentBreak.break_start.getTime()) / 60000));
+      const updatedCount = await tx.breakRecord.updateMany({
+        where: { id: currentBreak.id, attendance_id: record.id, break_end: null },
+        data: {
+          break_end: now,
+          duration_mins: currentDuration,
+          late_return_minutes: lateReturnMins,
+          wifi_on_at_end: wifi_connected ?? null,
+          ...(key && { end_idempotency_key: key, end_request_hash: hash }),
+          ...(req.body?.offline && { source: 'offline' }),
+        },
+      });
+      if (!updatedCount.count) throw new AppError('This break has already ended.', 409, 'BREAK_ALREADY_ENDED');
+      const breakTotals = await calculateBreakTotals(record.id, tx);
+      const totalMins = record.check_in_at ? Math.round((now.getTime() - record.check_in_at.getTime()) / 60000) : 0;
+      await tx.attendanceRecord.update({
+        where: { id: record.id },
+        data: {
+          break_minutes: breakTotals.totalMins,
+          paid_break_minutes: breakTotals.paidMins,
+          net_hours_worked: parseFloat(((totalMins - breakTotals.unpaidMins) / 60).toFixed(2)),
+          ...(req.body?.offline && { offline_reconciled: true, ...(requiresReview && { checkin_requires_review: true }) }),
+        },
+      });
+      return tx.breakRecord.findUniqueOrThrow({ where: { id: currentBreak.id } });
     });
     if (req.body?.offline && requiresReview) await notifyOfflineAttendanceReview(req.user!.sub, req.user!.org_id, record.id, 'break end');
 
@@ -1662,9 +1684,6 @@ router.post('/checkout', validate({ body: checkoutSchema }), idempotency, async 
     if (now < record.check_in_at) throw new AppError('Check-out time is before check-in. This event needs review.', 409, 'OFFLINE_EVENT_REVIEW');
     const hoursWorked  = calcHoursWorked(record.check_in_at, now);
 
-    // Settle breaks (close any open break) and compute net hours
-    const breaks   = await settleBreaks(record.id, now, orgTimezone);
-    const netHours = netHoursWorked(hoursWorked, breaks.unpaidMins);
     const approvedLeave = await prisma.leaveRequest.findFirst({
       where: { user_id: req.user!.sub, status: 'approved', start_date: { lte: today }, end_date: { gte: today } },
       select: { is_half_day: true, half_day_period: true, leave_start_time: true, leave_end_time: true },
@@ -1684,37 +1703,58 @@ router.post('/checkout', validate({ body: checkoutSchema }), idempotency, async 
     const earlyTolerance = record.shift?.early_checkout_tolerance_mins ?? 15;
     const earlyMins = Math.max(0, rawEarlyMins - earlyTolerance);
     const score     = adherenceScore(record.late_minutes ?? 0, earlyMins, record.shift);
-    const extraOfficeMins = await netExtraMinutesAfterShift(record.id, now, scheduledEnd);
     const autoCountOvertime = !!record.shift?.overtime_enabled && !record.shift?.overtime_requires_approval;
-    const overtimeHours = autoCountOvertime
-      ? parseFloat((extraOfficeMins / 60).toFixed(2))
-      : 0;
+    // Claim the attendance row first, then close breaks and the linked project
+    // timer in the same transaction. A second checkout waits for the claim and
+    // sees check_out_at set; any timer/break database error rolls the checkout
+    // back instead of returning a misleading success.
+    const { updated, rawEarlyMins, earlyMins, stoppedTimerId } = await prisma.$transaction(async tx => {
+      const claimed = await tx.attendanceRecord.updateMany({
+        where: { id: record.id, org_id: req.user!.org_id, user_id: req.user!.sub, check_out_at: null },
+        data: {
+          check_out_at: now,
+          status: 'out',
+          ...(key && { checkout_idempotency_key: key, checkout_request_hash: hash }),
+        },
+      });
+      if (!claimed.count) throw new AppError('This attendance record has already been checked out.', 409, 'ALREADY_CHECKED_OUT');
 
-    const updated = await prisma.attendanceRecord.update({
-      where: { id: record.id },
-      data: {
-        check_out_at: now, hours_worked: hoursWorked, status: 'out',
-        net_hours_worked: netHours,
-        overtime_hours: overtimeHours,
-        extra_office_minutes: autoCountOvertime ? 0 : extraOfficeMins,
-        break_minutes: breaks.totalMins, paid_break_minutes: breaks.paidMins,
-        early_out_minutes: earlyMins,
-        ...(key && { checkout_idempotency_key: key, checkout_request_hash: hash }),
-        ...(req.body?.offline && { offline_reconciled: true, checkin_requires_review: record.checkin_requires_review || requiresReview }),
-        ...(score != null && { adherence_score: score }),
-      },
-      include: RECORD_INCLUDE,
+      const breaks = await settleBreaks(record.id, now, orgTimezone, tx);
+      const netHours = netHoursWorked(hoursWorked, breaks.unpaidMins);
+      const extraOfficeMins = await netExtraMinutesAfterShift(record.id, now, scheduledEnd, tx);
+      const overtimeHours = autoCountOvertime ? parseFloat((extraOfficeMins / 60).toFixed(2)) : 0;
+      const updated = await tx.attendanceRecord.update({
+        where: { id: record.id },
+        data: {
+          hours_worked: hoursWorked,
+          net_hours_worked: netHours,
+          overtime_hours: overtimeHours,
+          extra_office_minutes: autoCountOvertime ? 0 : extraOfficeMins,
+          break_minutes: breaks.totalMins,
+          paid_break_minutes: breaks.paidMins,
+          early_out_minutes: earlyMins,
+          ...(req.body?.offline && { offline_reconciled: true, checkin_requires_review: record.checkin_requires_review || requiresReview }),
+          ...(score != null && { adherence_score: score }),
+        },
+        include: RECORD_INCLUDE,
+      });
+
+      const runningTimer = await tx.timeEntry.findFirst({
+        where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null, status: 'draft' },
+        orderBy: { started_at: 'desc' },
+        select: { id: true, started_at: true },
+      });
+      let stoppedTimerId: string | null = null;
+      if (runningTimer) {
+        const stopped = await tx.timeEntry.updateMany({
+          where: { id: runningTimer.id, ended_at: null, status: 'draft' },
+          data: { ended_at: now, minutes: Math.max(1, Math.round((now.getTime() - runningTimer.started_at.getTime()) / 60000)), attendance_id: record.id },
+        });
+        if (stopped.count) stoppedTimerId = runningTimer.id;
+      }
+      return { updated, rawEarlyMins, earlyMins, stoppedTimerId };
     });
-    // Attendance checkout is the authoritative end of the employee's work
-    // session. Close a running project timer at that same server-resolved time.
-    const runningTimer = await prisma.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null }, select: { id: true, started_at: true } }).catch(() => null);
-    if (runningTimer) {
-      const closed = await prisma.timeEntry.updateMany({
-        where: { id: runningTimer.id, ended_at: null, status: 'draft' },
-        data: { ended_at: now, minutes: Math.max(1, Math.round((now.getTime() - runningTimer.started_at.getTime()) / 60000)), attendance_id: record.id },
-      }).catch(() => ({ count: 0 }));
-      if (closed.count) recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'time.timer.auto_stop', entityType: 'time_entry', entityId: runningTimer.id, after: { attendance_id: record.id, ended_at: now.toISOString() } });
-    }
+    if (stoppedTimerId) recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'time.timer.auto_stop', entityType: 'time_entry', entityId: stoppedTimerId, after: { attendance_id: record.id, ended_at: now.toISOString() } });
     if (req.body?.offline && requiresReview) await notifyOfflineAttendanceReview(req.user!.sub, req.user!.org_id, record.id, 'check-out');
 
     // Fire WhatsApp notification (non-blocking)

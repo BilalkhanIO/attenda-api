@@ -34,6 +34,7 @@ import { generateGeminiJson } from "../services/ai/gemini-json";
 import { evaluateScheduleCompliance } from "../services/compliance/evaluateSchedule";
 import { isInEmployeeScope, scopedEmployeeIds } from "../services/locationScope";
 import { intersectAssignmentEmployeeIds } from "../services/shiftAssignmentScope";
+import { getScheduleIssues } from "../services/scheduleIssues";
 
 const router = Router();
 router.use(authenticate);
@@ -1461,22 +1462,36 @@ router.post(
         orderBy: { effective_from: 'desc' },
       });
       const findings = evaluateScheduleCompliance(surroundingAssignments, activeRules, ws, we);
-      const blockingFindings = findings.filter(item => item.severity === 'block');
+      const scheduleIssueSummary = await getScheduleIssues(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), ws);
+      const leaveAndAvailabilityBlocks = scheduleIssueSummary.issues
+        .filter(item => item.code === 'approved_leave' || item.code === 'unavailable')
+        .map(item => ({
+          code: item.code,
+          dedupe_key: `schedule:${ws.toISOString().slice(0, 10)}:${item.code}:${item.assignment_id ?? item.user_id ?? 'team'}:${item.date ?? 'week'}`,
+          rule_id: null,
+          assignment_id: item.assignment_id ?? null,
+          user_id: item.user_id ?? null,
+          severity: 'block' as const,
+          details: { date: item.date, message: item.message },
+          message: item.message,
+        }));
+      const publishFindings = [...findings, ...leaveAndAvailabilityBlocks];
+      const blockingFindings = publishFindings.filter(item => item.severity === 'block');
       const overrideReason = typeof req.body?.override_reason === 'string' ? req.body.override_reason.trim().slice(0, 1000) : '';
       const canOverride = req.permissions?.has('compliance.override') ?? false;
       if (blockingFindings.length && (!canOverride || overrideReason.length < 8)) {
         await prisma.$transaction(async tx => {
           await tx.complianceViolation.updateMany({ where: { org_id: req.user!.org_id, week_start: ws, status: 'open' }, data: { status: 'resolved', resolved_at: new Date() } });
-          for (const finding of findings) {
+          for (const finding of publishFindings) {
             await tx.complianceViolation.upsert({
               where: { org_id_dedupe_key: { org_id: req.user!.org_id, dedupe_key: finding.dedupe_key } },
               create: { org_id: req.user!.org_id, rule_id: finding.rule_id || null, rule_code: finding.code, dedupe_key: finding.dedupe_key, week_start: ws, assignment_id: finding.assignment_id, user_id: finding.user_id, severity: finding.severity, details: { ...finding.details, message: finding.message }, status: 'open' },
               update: { rule_id: finding.rule_id || null, severity: finding.severity, details: { ...finding.details, message: finding.message }, status: 'open', override_reason: null, override_by: null, override_at: null, resolved_at: null },
             });
           }
-          await tx.shiftScheduleEvent.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, event_type: 'schedule_publish_blocked', entity_type: 'schedule', details: { week_start: ws.toISOString().slice(0, 10), blocking_findings: blockingFindings.length, rule_codes: [...new Set(blockingFindings.map(item => item.code))] } } });
+          await tx.shiftScheduleEvent.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, event_type: 'schedule_publish_blocked', entity_type: 'schedule', details: { week_start: ws.toISOString().slice(0, 10), blocking_findings: blockingFindings.length, rule_codes: [...new Set(blockingFindings.map(item => item.code))], findings: blockingFindings.map(item => ({ code: item.code, assignment_id: item.assignment_id, user_id: item.user_id, message: item.message })) } } });
         });
-        throw new AppError(`Schedule has ${blockingFindings.length} blocking compliance finding(s). Review the schedule or provide an override reason (minimum 8 characters) with compliance.override permission.`, 409, 'COMPLIANCE_BLOCK');
+        throw new AppError(`Schedule has ${blockingFindings.length} blocking conflict(s), including compliance, approved leave, or unavailability. Resolve them or provide an override reason (minimum 8 characters) with compliance.override permission.`, 409, 'COMPLIANCE_BLOCK');
       }
 
       // Mark only the shift templates that appear in this week as published
@@ -1484,7 +1499,7 @@ router.post(
       if (shiftIds.length > 0) {
         await prisma.$transaction(async tx => {
           await tx.complianceViolation.updateMany({ where: { org_id: req.user!.org_id, week_start: ws, status: 'open' }, data: { status: 'resolved', resolved_at: new Date() } });
-          for (const finding of findings) {
+          for (const finding of publishFindings) {
             const overridden = finding.severity === 'block' && blockingFindings.length > 0;
             await tx.complianceViolation.upsert({
               where: { org_id_dedupe_key: { org_id: req.user!.org_id, dedupe_key: finding.dedupe_key } },
@@ -1495,7 +1510,7 @@ router.post(
           if (!scopedIds) await tx.shift.updateMany({ where: { id: { in: shiftIds }, org_id: req.user!.org_id }, data: { is_published: true } });
           await tx.shiftAssignment.updateMany({ where: { shift_id: { in: shiftIds }, date: { gte: ws, lte: we }, shift: { org_id: req.user!.org_id }, ...(scopedIds ? { user_id: { in: scopedIds } } : {}) }, data: { is_published: true } });
           await tx.shiftAssignment.updateMany({ where: { shift_id: { in: shiftIds }, date: { gte: ws, lte: we }, shift: { org_id: req.user!.org_id }, acknowledgement_status: 'not_required', ...(scopedIds ? { user_id: { in: scopedIds } } : {}) }, data: { acknowledgement_status: 'pending', acknowledgement_due_at: new Date(Date.now() + SHIFT_ACK_WINDOW_MS), acknowledged_at: null, acknowledgement_note: null } });
-          await tx.shiftScheduleEvent.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, event_type: 'schedule_published', entity_type: 'schedule', details: { week_start: ws.toISOString().slice(0, 10), assignments: assignments.length, shift_ids: shiftIds, compliance_findings: findings.length, override_reason: blockingFindings.length ? overrideReason : null } } });
+          await tx.shiftScheduleEvent.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, event_type: 'schedule_published', entity_type: 'schedule', details: { week_start: ws.toISOString().slice(0, 10), assignments: assignments.length, shift_ids: shiftIds, compliance_findings: publishFindings.length, blocking_findings: blockingFindings.length, override_reason: blockingFindings.length ? overrideReason : null } } });
         });
       }
       else await prisma.$transaction(async tx => {

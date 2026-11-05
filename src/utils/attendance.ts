@@ -2,6 +2,9 @@
 // (manual checkout, shift auto-checkout, IP grace-period checkout, midnight
 // safety net) so break accounting and net-hours math stay consistent.
 import prisma from './prisma';
+import type { Prisma } from '@prisma/client';
+
+type AttendanceDb = Pick<Prisma.TransactionClient, 'breakRecord' | 'attendanceRecord'>;
 
 export interface BreakSettlement {
   paidMins:  number;
@@ -9,8 +12,8 @@ export interface BreakSettlement {
   totalMins: number;
 }
 
-export async function calculateBreakTotals(attendanceId: string): Promise<BreakSettlement> {
-  const all = await prisma.breakRecord.findMany({
+export async function calculateBreakTotals(attendanceId: string, db: AttendanceDb = prisma): Promise<BreakSettlement> {
+  const all = await db.breakRecord.findMany({
     where: { attendance_id: attendanceId, break_end: { not: null } },
     include: { shift_break: true },
   });
@@ -28,9 +31,9 @@ export async function calculateBreakTotals(attendanceId: string): Promise<BreakS
   return { paidMins, unpaidMins, totalMins: paidMins + unpaidMins };
 }
 
-export async function updateAttendanceBreakSummary(attendanceId: string): Promise<BreakSettlement> {
-  const totals = await calculateBreakTotals(attendanceId);
-  await prisma.attendanceRecord.update({
+export async function updateAttendanceBreakSummary(attendanceId: string, db: AttendanceDb = prisma): Promise<BreakSettlement> {
+  const totals = await calculateBreakTotals(attendanceId, db);
+  await db.attendanceRecord.update({
     where: { id: attendanceId },
     data: {
       break_minutes: totals.totalMins,
@@ -79,30 +82,30 @@ function calcLateReturnMins(
  * @param orgTimezone  IANA timezone string used to convert fixed break wall-clock
  *                     end times to UTC for late-return calculation.
  */
-export async function settleBreaks(attendanceId: string, at: Date, orgTimezone = 'UTC'): Promise<BreakSettlement> {
-  const open = await prisma.breakRecord.findMany({
+export async function settleBreaks(attendanceId: string, at: Date, orgTimezone = 'UTC', db: AttendanceDb = prisma): Promise<BreakSettlement> {
+  const open = await db.breakRecord.findMany({
     where: { attendance_id: attendanceId, break_end: null },
     include: { shift_break: true },
   });
   for (const b of open) {
     const mins           = Math.max(0, Math.round((at.getTime() - b.break_start.getTime()) / 60000));
     const lateReturnMins = calcLateReturnMins(b.shift_break as any, at, orgTimezone, mins);
-    await prisma.breakRecord.update({
+    await db.breakRecord.update({
       where: { id: b.id },
       data:  { break_end: at, duration_mins: mins, auto_ended: true, late_return_minutes: lateReturnMins, wifi_on_at_end: null } as any,
     });
   }
 
-  const all = await prisma.breakRecord.findMany({
+  const all = await db.breakRecord.findMany({
     where: { attendance_id: attendanceId, break_end: { not: null } },
   });
 
-  const totals = await calculateBreakTotals(attendanceId);
+  const totals = await calculateBreakTotals(attendanceId, db);
   const paidMins = totals.paidMins;
   let unpaidMins = totals.unpaidMins;
 
   // Auto-deduct any mandatory flexible shift breaks that the employee missed taking.
-  const attendance = await prisma.attendanceRecord.findUnique({
+  const attendance = await db.attendanceRecord.findUnique({
     where: { id: attendanceId },
     include: { shift: { include: { breaks: true } } }
   });
@@ -158,7 +161,7 @@ export async function settleBreaks(attendanceId: string, at: Date, orgTimezone =
       if (templateMissing <= 0) continue;
 
       const compStart = new Date(at.getTime() - templateMissing * 60000);
-      await prisma.breakRecord.create({
+      await db.breakRecord.create({
         data: {
           attendance_id: attendanceId,
           shift_break_id: shiftBreak.id,
@@ -192,11 +195,12 @@ export async function netExtraMinutesAfterShift(
   attendanceId: string,
   checkOutAt: Date,
   scheduledEnd: Date | null,
+  db: AttendanceDb = prisma,
 ): Promise<number> {
   if (!scheduledEnd) return 0;
   const end = scheduledEnd;
   if (checkOutAt <= end) return 0;
-  const breaks = await prisma.breakRecord.findMany({
+  const breaks = await db.breakRecord.findMany({
     where: { attendance_id: attendanceId, break_end: { not: null } },
     include: { shift_break: true },
   });
