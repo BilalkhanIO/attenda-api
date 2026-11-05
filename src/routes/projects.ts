@@ -168,6 +168,26 @@ router.post('/:id/members', requirePermission('projects.manage'), idempotency, a
   } catch (error) { next(error); }
 });
 
+router.delete('/:id/members/:userId', requirePermission('projects.manage'), idempotency, async (req, res, next) => {
+  try {
+    const projectId = String(req.params.id);
+    const userId = String(req.params.userId);
+    const project = await prisma.project.findFirst({ where: { id: projectId, org_id: req.user!.org_id }, select: { id: true, owner_id: true } });
+    if (!project) throw new NotFoundError('Project');
+    if (project.owner_id === userId) throw new ValidationError('The project owner cannot be removed. Transfer ownership first.');
+    const member = await prisma.projectMember.findUnique({ where: { project_id_user_id: { project_id: projectId, user_id: userId } }, include: { user: { select: { name: true } } } });
+    if (!member) throw new NotFoundError('Project member');
+    const assignedOpenTasks = await prisma.projectTask.count({ where: { project_id: projectId, assignee_id: userId, status: { not: 'done' } } });
+    if (assignedOpenTasks) throw new AppError(`Reassign or complete ${assignedOpenTasks} open task(s) before removing this member.`, 409, 'PROJECT_MEMBER_HAS_OPEN_TASKS');
+    await prisma.$transaction(async tx => {
+      await tx.projectMember.delete({ where: { project_id_user_id: { project_id: projectId, user_id: userId } } });
+      await tx.auditLog.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, action: 'project.member.remove', entity_type: 'project', entity_id: projectId, before: { user_id: userId, role: member.role }, after: { user_id: userId, removed: true } } });
+    });
+    emitOrgEvent(req.user!.org_id, 'project_changed');
+    noContent(res);
+  } catch (error) { next(error); }
+});
+
 router.post('/:id/tasks', requirePermission('projects.tasks.manage'), idempotency, async (req, res, next) => {
   try {
     const project = await prisma.project.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
@@ -246,6 +266,10 @@ router.put('/tasks/:taskId', ensureTaskUpdateAccess, idempotency, async (req, re
       if (matching !== uniqueDependencies.length) throw new ValidationError('Dependencies must be tasks in the same project');
     }
     const previousAssignee = task.assignee_id;
+    if (canManage && assignee_id) {
+      const member = await prisma.projectMember.findUnique({ where: { project_id_user_id: { project_id: task.project_id, user_id: String(assignee_id) } }, select: { user_id: true } });
+      if (!member) throw new ValidationError('Task assignee must be a project member. Add them to the project first.');
+    }
     const updateData = {
       ...(canManage && title !== undefined && { title: String(title).trim() }),
       ...(canManage && description !== undefined && { description: description?.trim() || null }),
@@ -288,15 +312,15 @@ router.put('/tasks/:taskId', ensureTaskUpdateAccess, idempotency, async (req, re
           }
           return updateTask(tx);
         });
-    if (status !== undefined || assignee_id !== undefined || priority !== undefined || uniqueDependencies !== undefined) {
+    if (Object.keys(updateData).length > 0) {
       recordAudit({
         orgId: req.user!.org_id,
         actorId: req.user!.sub,
         action: 'project.task.update',
         entityType: 'project_task',
         entityId: task.id,
-        before: { status: task.status, assignee_id: previousAssignee, priority: task.priority, ...(previousDependencyIds && { depends_on_ids: previousDependencyIds }) },
-        after: { status: updated.status, assignee_id: updated.assignee_id, priority: updated.priority, ...(uniqueDependencies && { depends_on_ids: uniqueDependencies }) },
+        before: { title: task.title, description: task.description, status: task.status, assignee_id: previousAssignee, priority: task.priority, start_date: task.start_date, due_date: task.due_date, ...(previousDependencyIds && { depends_on_ids: previousDependencyIds }) },
+        after: { title: updated.title, description: updated.description, status: updated.status, assignee_id: updated.assignee_id, priority: updated.priority, start_date: updated.start_date, due_date: updated.due_date, ...(uniqueDependencies && { depends_on_ids: uniqueDependencies }) },
       });
     }
     if (canManage && assignee_id && assignee_id !== previousAssignee && assignee_id !== req.user!.sub) {
