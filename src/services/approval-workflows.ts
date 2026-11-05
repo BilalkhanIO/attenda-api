@@ -344,6 +344,19 @@ export async function reviewApproval(
     if (!request) throw new NotFoundError('Attendance correction');
     await assertReviewerScope(viewer, type, request.user_id);
     await prisma.$transaction(async tx => {
+      if (action === 'approve') {
+        const processedPayroll = await tx.payrollRecord.findFirst({
+          where: {
+            org_id: viewer.orgId,
+            user_id: request.user_id,
+            period_month: request.date.getUTCMonth() + 1,
+            period_year: request.date.getUTCFullYear(),
+            status: 'processed',
+          },
+          select: { id: true },
+        });
+        if (processedPayroll) throw new AppError('This attendance period is already in processed payroll. Recall the payroll run before approving this correction.', 409, 'ATTENDANCE_PERIOD_PAYROLL_PROCESSED');
+      }
       const claimed = await tx.attendanceCorrection.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: action === 'approve' ? 'approved' : 'rejected', reviewed_by: viewer.userId, reviewed_at: now, review_note: action === 'reject' ? reason : note } });
       if (!claimed.count) throw new ValidationError('This request has already been reviewed');
       if (action === 'reject') {
