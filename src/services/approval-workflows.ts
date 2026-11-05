@@ -343,10 +343,42 @@ export async function reviewApproval(
     const request = await prisma.attendanceCorrection.findFirst({ where: { id, org_id: viewer.orgId }, include: { user: { select: { id: true, name: true } } } });
     if (!request) throw new NotFoundError('Attendance correction');
     await assertReviewerScope(viewer, type, request.user_id);
-    const result = await prisma.$transaction(async tx => {
+    await prisma.$transaction(async tx => {
       const claimed = await tx.attendanceCorrection.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: action === 'approve' ? 'approved' : 'rejected', reviewed_by: viewer.userId, reviewed_at: now, review_note: action === 'reject' ? reason : note } });
       if (!claimed.count) throw new ValidationError('This request has already been reviewed');
-      if (action === 'reject') return null;
+      if (action === 'reject') {
+        await tx.auditLog.create({
+          data: {
+            org_id: viewer.orgId,
+            actor_id: viewer.userId,
+            action: 'attendance.correction.reject',
+            entity_type: 'attendance_correction',
+            entity_id: id,
+            before: { status: 'pending' },
+            after: { status: 'rejected' },
+            reason,
+          },
+        });
+        await tx.outboxEvent.create({
+          data: {
+            org_id: viewer.orgId,
+            event_type: 'notification_requested',
+            entity_type: 'attendance_correction',
+            entity_id: id,
+            payload: {
+              userId: request.user_id,
+              orgId: viewer.orgId,
+              type: 'correction_rejected',
+              title: 'Attendance correction rejected',
+              body: `Your correction was rejected: ${reason}`,
+              actionType: 'attendance_correction',
+              actionId: id,
+              dedupeKey: id,
+            },
+          },
+        });
+        return;
+      }
       let record = request.attendance_id ? await tx.attendanceRecord.findFirst({ where: { id: request.attendance_id, org_id: viewer.orgId } }) : await tx.attendanceRecord.findUnique({ where: { user_id_date: { user_id: request.user_id, date: request.date } } });
       const checkIn = request.requested_check_in ?? record?.check_in_at ?? null;
       const checkOut = request.requested_check_out ?? record?.check_out_at ?? null;
@@ -358,12 +390,50 @@ export async function reviewApproval(
         record = await tx.attendanceRecord.create({ data: { user_id: request.user_id, org_id: viewer.orgId, location_id: subject?.primary_location_id ?? null, date: request.date, check_in_at: request.requested_check_in, check_out_at: request.requested_check_out, ...(hours !== null ? { hours_worked: hours } : {}), check_in_type: 'manual', status: 'in', is_overridden: true, override_by: viewer.userId, override_reason: `correction: ${request.reason}` } });
       }
       await tx.attendanceCorrection.update({ where: { id }, data: { attendance_id: record.id } });
+      const actionNotification = {
+        userId: request.user_id,
+        orgId: viewer.orgId,
+        type: action === 'approve' ? 'correction_approved' as const : 'correction_rejected' as const,
+        title: `Attendance correction ${actionPast}`,
+        body: action === 'approve' ? `Your correction for ${dateLabel(request.date)} was approved` : `Your correction was rejected: ${reason}`,
+        actionType: 'attendance_correction',
+        actionId: id,
+        dedupeKey: id,
+      };
+      const auditAction = `attendance.correction.${action}`;
+      const auditEntityType = action === 'approve' ? 'attendance_record' : 'attendance_correction';
+      const auditEntityId = action === 'approve' ? record.id : id;
+      const auditBefore = action === 'approve' ? before : { status: 'pending' };
+      const auditAfter = action === 'approve'
+        ? { check_in_at: record.check_in_at, check_out_at: record.check_out_at, hours_worked: record.hours_worked }
+        : { status: 'rejected' };
+      await tx.auditLog.create({
+        data: {
+          org_id: viewer.orgId,
+          actor_id: viewer.userId,
+          action: auditAction,
+          entity_type: auditEntityType,
+          entity_id: auditEntityId,
+          before: auditBefore ?? undefined,
+          after: auditAfter,
+          reason: action === 'reject' ? reason : request.reason,
+        },
+      });
+      await tx.outboxEvent.create({
+        data: {
+          org_id: viewer.orgId,
+          event_type: 'notification_requested',
+          entity_type: 'attendance_correction',
+          entity_id: id,
+          payload: actionNotification,
+        },
+      });
       return { record, before };
     });
     requesterId = request.user_id; requesterName = request.user.name; event = 'attendance_changed';
-    notification = { type: action === 'approve' ? 'correction_approved' : 'correction_rejected', title: `Attendance correction ${actionPast}`, body: action === 'approve' ? `Your correction for ${dateLabel(request.date)} was approved` : `Your correction was rejected: ${reason}`, actionType: 'attendance_correction' };
+    notification = undefined;
     summary = `${requesterName}'s attendance correction was ${actionPast}`;
-    audit = { action: `attendance.correction.${action}`, entityType: action === 'approve' ? 'attendance_record' : 'attendance_correction', entityId: action === 'approve' && result ? result.record.id : id, ...(action === 'approve' && result ? { before: result.before, after: { check_in_at: result.record.check_in_at, check_out_at: result.record.check_out_at, hours_worked: result.record.hours_worked } } : {}), reason: action === 'reject' ? reason : request.reason };
+    audit = undefined;
   } else if (type === 'timesheet') {
     const sheet = await prisma.timesheet.findFirst({ where: { id, org_id: viewer.orgId, status: 'submitted' }, include: { user: { select: { id: true, name: true } } } });
     if (!sheet) throw new NotFoundError('Submitted timesheet');
