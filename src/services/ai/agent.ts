@@ -761,14 +761,35 @@ default:
       }
       if (!Object.keys(data).length) throw new ValidationError('Specify at least one task field to update');
 
-      const updated = await this.prisma.projectTask.update({
+      let previousDependencyIds: string[] | undefined;
+      const updateTask = (client: Pick<PrismaClient, 'projectTask'>) => client.projectTask.update({
         where: { id: task.id }, data,
         include: { assignee: { select: { id: true, name: true, email: true } } },
       });
+      const updated = dependencies === undefined
+        ? await updateTask(this.prisma)
+        : await this.prisma.$transaction(async tx => {
+            await tx.$queryRaw`SELECT "id" FROM "projects" WHERE "id" = ${task.project_id} FOR UPDATE`;
+            const edges = await tx.projectTaskDependency.findMany({
+              where: { task: { project_id: task.project_id }, task_id: { not: task.id } },
+              select: { task_id: true, depends_on_id: true },
+            });
+            previousDependencyIds = (await tx.projectTaskDependency.findMany({ where: { task_id: task.id }, select: { depends_on_id: true } })).map(edge => edge.depends_on_id);
+            const graph = new Map<string, string[]>();
+            for (const edge of edges) graph.set(edge.task_id, [...(graph.get(edge.task_id) ?? []), edge.depends_on_id]);
+            const reachesTask = (node: string, visited = new Set<string>()): boolean => {
+              if (node === task.id) return true;
+              if (visited.has(node)) return false;
+              visited.add(node);
+              return (graph.get(node) ?? []).some(next => reachesTask(next, visited));
+            };
+            if (dependencies.some(dependencyId => reachesTask(dependencyId))) throw new ValidationError('These dependencies would create a cycle. Remove a dependency path that leads back to this task.');
+            return updateTask(tx);
+          });
       recordAudit({
         orgId: this.orgId, actorId: this.userId, action: 'project.task.update.ai', entityType: 'project_task', entityId: task.id,
-        before: { title: task.title, description: task.description, status: task.status, priority: task.priority, assignee_id: task.assignee_id, start_date: task.start_date, due_date: task.due_date },
-        after: { title: updated.title, description: updated.description, status: updated.status, priority: updated.priority, assignee_id: updated.assignee_id, start_date: updated.start_date, due_date: updated.due_date },
+        before: { title: task.title, description: task.description, status: task.status, priority: task.priority, assignee_id: task.assignee_id, start_date: task.start_date, due_date: task.due_date, ...(previousDependencyIds && { depends_on_ids: previousDependencyIds }) },
+        after: { title: updated.title, description: updated.description, status: updated.status, priority: updated.priority, assignee_id: updated.assignee_id, start_date: updated.start_date, due_date: updated.due_date, ...(dependencies && { depends_on_ids: dependencies }) },
       });
 
       if (updated.assignee_id && updated.assignee_id !== this.userId) {
@@ -884,21 +905,37 @@ default:
           ],
         };
       }
-      const comment = await this.prisma.projectTaskComment.create({
-        data: { task_id: task.id, user_id: this.userId, body },
-        include: { user: { select: { id: true, name: true, avatar_url: true } } },
+      const recipients = new Set<string>(mentionedIds);
+      if (task.assignee_id && task.assignee_id !== this.userId) recipients.add(task.assignee_id);
+      const comment = await this.prisma.$transaction(async tx => {
+        const createdComment = await tx.projectTaskComment.create({
+          data: { task_id: task.id, user_id: this.userId, body },
+          include: { user: { select: { id: true, name: true, avatar_url: true } } },
+        });
+        for (const userId of recipients) {
+          const isMention = mentionedIds.has(userId);
+          await tx.outboxEvent.create({ data: {
+            org_id: this.orgId,
+            event_type: 'notification_requested',
+            entity_type: 'project_task_comment',
+            entity_id: createdComment.id,
+            payload: {
+              userId, orgId: this.orgId, type: 'project_task_comment',
+              title: isMention ? 'You were mentioned on a task' : 'New comment on your task',
+              body: `${task.title} · ${body.slice(0, 120)}`,
+              actionType: 'project_task', actionId: task.id,
+              dedupeKey: `${createdComment.id}:${userId}`,
+            },
+          } });
+        }
+        await tx.auditLog.create({ data: {
+          org_id: this.orgId, actor_id: this.userId, action: 'project.task.comment.ai',
+          entity_type: 'project_task', entity_id: task.id,
+          after: { comment_id: createdComment.id, mentioned_user_ids: [...mentionedIds] },
+        } });
+        return createdComment;
       });
-      const notified = new Set<string>([this.userId]);
       this.commentTaskIdsThisTurn.add(task.id);
-      for (const mentionedUserId of mentionedIds) {
-        if (notified.has(mentionedUserId)) continue;
-        notified.add(mentionedUserId);
-        createNotification({ userId: mentionedUserId, orgId: this.orgId, type: 'project_task_comment', title: 'You were mentioned on a task', body: `${task.title} · ${body.slice(0, 120)}`, actionType: 'project_task', actionId: task.id }).catch(() => {});
-      }
-      if (task.assignee_id && !notified.has(task.assignee_id)) {
-        createNotification({ userId: task.assignee_id, orgId: this.orgId, type: 'project_task_comment', title: 'New comment on your task', body: `${task.title} · ${body.slice(0, 120)}`, actionType: 'project_task', actionId: task.id }).catch(() => {});
-      }
-      recordAudit({ orgId: this.orgId, actorId: this.userId, action: 'project.task.comment.ai', entityType: 'project_task', entityId: task.id, after: { comment_id: comment.id } });
       emitOrgEvent(this.orgId, 'project_changed');
       return { name: 'addProjectTaskComment', success: true, data: { ...comment, project_name: task.project.name } };
     } catch (error) {
@@ -925,9 +962,14 @@ default:
         const orgPeople = await this.prisma.user.findMany({ where: { org_id: this.orgId, is_active: true, deleted_at: null }, select: { id: true, name: true, email: true, department: true } });
         const choices = this.employeeChoices(orgPeople, 'add', userId);
         if (choices) return { name: 'manageProjectMember', success: false, error: 'Choose the employee to add; I have not changed project membership.', choices };
-        await this.prisma.projectMember.upsert({ where: { project_id_user_id: { project_id: project.id, user_id: user.id } }, update: {}, create: { project_id: project.id, user_id: user.id, role: 'member' } });
-        recordAudit({ orgId: this.orgId, actorId: this.userId, action: 'project.member.add.ai', entityType: 'project', entityId: project.id, after: { user_id: user.id } });
-        if (user.id !== this.userId) createNotification({ userId: user.id, orgId: this.orgId, type: 'project_member_added', title: 'You were added to a project', body: project.name, actionType: 'project', actionId: project.id }).catch(() => {});
+        await this.prisma.$transaction(async tx => {
+          await tx.projectMember.upsert({ where: { project_id_user_id: { project_id: project.id, user_id: user.id } }, update: {}, create: { project_id: project.id, user_id: user.id, role: 'member' } });
+          await tx.auditLog.create({ data: { org_id: this.orgId, actor_id: this.userId, action: 'project.member.add.ai', entity_type: 'project', entity_id: project.id, after: { user_id: user.id } } });
+          if (user.id !== this.userId) await tx.outboxEvent.create({ data: {
+            org_id: this.orgId, event_type: 'notification_requested', entity_type: 'project', entity_id: project.id,
+            payload: { userId: user.id, orgId: this.orgId, type: 'project_member_added', title: 'You were added to a project', body: project.name, actionType: 'project', actionId: project.id, dedupeKey: `${project.id}:${user.id}:member-added` },
+          } });
+        });
         emitOrgEvent(this.orgId, 'project_changed');
         return { name: 'manageProjectMember', success: true, data: { project_id: project.id, project_name: project.name, action: args.action, member: user } };
       } else if (args.action === 'remove') {
@@ -937,12 +979,14 @@ default:
         const choices = this.employeeChoices(orgPeople, 'remove', userId);
         if (choices) return { name: 'manageProjectMember', success: false, error: 'Confirm which employee you want to remove; no membership was changed.', choices };
         if (user.id === project.owner_id) throw new ValidationError('The project owner cannot be removed');
-        const assigned = await this.prisma.projectTask.count({ where: { project_id: project.id, assignee_id: user.id } });
-        if (assigned) throw new ValidationError(`Reassign or unassign this member’s ${assigned} task(s) before removing them`);
+        const assigned = await this.prisma.projectTask.count({ where: { project_id: project.id, assignee_id: user.id, status: { not: 'done' } } });
+        if (assigned) throw new ValidationError(`Reassign or complete this member’s ${assigned} open task(s) before removing them`);
         const membership = await this.prisma.projectMember.findUnique({ where: { project_id_user_id: { project_id: project.id, user_id: user.id } } });
         if (!membership) throw new ValidationError('This user is not a member of the project');
-        await this.prisma.projectMember.delete({ where: { project_id_user_id: { project_id: project.id, user_id: user.id } } });
-        recordAudit({ orgId: this.orgId, actorId: this.userId, action: 'project.member.remove.ai', entityType: 'project', entityId: project.id, before: { user_id: user.id } });
+        await this.prisma.$transaction(async tx => {
+          await tx.projectMember.delete({ where: { project_id_user_id: { project_id: project.id, user_id: user.id } } });
+          await tx.auditLog.create({ data: { org_id: this.orgId, actor_id: this.userId, action: 'project.member.remove.ai', entity_type: 'project', entity_id: project.id, before: { user_id: user.id, role: membership.role }, after: { user_id: user.id, removed: true } } });
+        });
       } else throw new ValidationError('Action must be add or remove');
       emitOrgEvent(this.orgId, 'project_changed');
       return { name: 'manageProjectMember', success: true, data: { project_id: project.id, project_name: project.name, action: args.action } };

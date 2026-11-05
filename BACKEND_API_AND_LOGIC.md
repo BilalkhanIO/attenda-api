@@ -184,6 +184,8 @@ Attendance corrections mount at `/attendance/corrections` before generic attenda
 | GET | `/` | `attendance.override` | Reviewer queue |
 | PUT | `/:id/approve`, `/:id/reject` | `attendance.override` + schema | Decide correction; approval applies requested timestamps |
 
+Correction approval uses a pending-status compare-and-set. The attendance update, correction linkage, audit entry, and notification request are committed together; rejected corrections persist the review reason and notification request in the same transaction. This keeps retries from applying the correction twice and prevents a committed decision from losing its notification intent.
+
 ### Leave, overtime, expenses and shared approvals
 
 Leave request dates are persisted as date-only values and capture the employee’s primary location when submitted. Future-date validation uses that location’s timezone (organization timezone is the legacy fallback), and working-day calculation includes global plus location-specific holidays. The location snapshot keeps holiday interpretation stable if the employee later transfers. On approval, attendance leave records skip weekends and the captured location’s holidays using UTC date-only arithmetic, independent of the API host timezone. The organization leave-accrual policy is applied using each active employee’s current location-local year/month; unique employee/type/period grant rows and balance/ledger updates commit in the same transaction. The organization-local daily 02:00 schedule checks employees during local days 1–2 to absorb inter-zone boundary differences. Per-location accrual policy values are not yet configurable.
@@ -304,16 +306,19 @@ Leave request dates are persisted as date-only values and capture the employee�
 | GET | `/` | `projects.view` | List visible projects and summaries |
 | POST | `/` | `projects.manage` | Create project |
 | PUT, DELETE | `/:id` | `projects.manage` | Update/delete project |
-| POST | `/:id/members` | `projects.manage` | Add/remove project member |
+| POST | `/:id/members` | `projects.manage` | Add a member to the project |
+| DELETE | `/:id/members/:userId` | `projects.manage` | Remove a member when they own no open tasks; project owner transfer is required before removing the owner |
 | POST | `/:id/tasks` | `projects.tasks.manage` | Create task/milestone |
 | PUT | `/tasks/:taskId` | Authorized project/task scope | Update task, assignment, status, dates, priority or dependencies |
-| POST | `/tasks/:taskId/comments` | Authorized task participant/editor | Add comment and mentions |
+| POST | `/tasks/:taskId/comments` | Authorized task participant/editor | Add comment and explicit `mention_ids`; mentioned users must be active project members. Comment, audit, and per-recipient notification requests commit together through the outbox |
 | POST | `/:id/attachments/upload-url` | Authorized project scope | Request object-storage upload URL |
 | POST | `/:id/attachments/upload-local` | Authorized project scope | Upload via local storage fallback |
 | POST | `/:id/attachments` | Authorized project scope | Register attachment metadata |
 | GET | `/attachments/:attachmentId/download`, `/file` | Authorized project scope | Download/stream attachment |
 | GET | `/:id/activity` | Project-visible user | Project/task activity |
 | GET | `/:id/calendar.ics` | Project-visible user | Project date export |
+
+Project task assignees must be project members. Task edits record title, description, status, owner, priority, dates, and dependency changes in audit history. Dependency edits serialize per project and reject cycles. Web and mobile provide project search/status filtering and task search/status/priority/owner/due-date filters; web additionally provides board, list, calendar, and timeline views. Task details carry subtasks, files, dependencies, and discussion. The project file service uses signed object-storage URLs in configured deployments and a development-only local fallback.
 
 ### Payroll — `/payroll`
 
@@ -552,7 +557,7 @@ Schema changes must ship with reviewed additive migrations under `prisma/migrati
 `20261102170000_offline_attendance_actions` adds replay keys and payload hashes for check-out and break start/end.
 `20261031250000_transactional_outbox` creates durable outbox rows and database triggers for core attendance, leave, overtime, remote-work, swap, expense, project/task, shift and assignment mutations. `20261103150000_time_tracking_outbox` extends transaction-coupled triggers to time entries and timesheets and captures project budget changes. `20261109150000_outbox_related_entities` adds attendance corrections/breaks, project membership/comments/dependencies/attachments, and shift breaks/checkpoints/scans/emergency offers/availability/coverage rules. `20261109160000_outbox_parent_tenant_resolution` prioritizes project, shift, assignment, checkpoint, and attendance parents when resolving child-row tenant ownership, before falling back to user ownership. The worker claims rows with `FOR UPDATE SKIP LOCKED`, publishes SSE invalidations and creates webhook deliveries with a unique `(outbox_event_id, webhook_id)` key. Publication retries are durable; webhook delivery has its own retry lifecycle. Keep the webhook event catalogue and worker allowlist aligned with `OrgEventType`; do not create a second application outbox row for writes already captured by triggers. Payloads currently contain entity identifiers and event metadata, not a full before/after audit diff.
 `20261102090000_general_idempotency` adds a 24-hour idempotency response store keyed by organisation, user and request key; wired to leave/expense submission, payroll generation/processing, shift assignments/bulk assignment and open-shift claims.
-`20261102110000_payroll_draft_input_hash` records a stable hash for external payroll inputs and marks draft payroll stale when attendance, approved unpaid leave, hourly pay, overtime multipliers, or organisation tax/pension rates change. Processing is blocked until a manager regenerates; manual adjustments are preserved.
+`20261102110000_payroll_draft_input_hash` records a stable hash for external payroll inputs. Migration `20261110120000_attendance_payroll_input_integrity` marks draft payroll stale for attendance writes from API routes, jobs, or imports. It locks affected payroll rows while reconciling: an attendance correction affecting an already processed period is rejected until payroll is recalled. Finalization uses a conditional draft-and-fresh update so concurrent attendance changes cannot silently finalize a stale snapshot. Processing is blocked until a manager regenerates; manual adjustments are preserved.
 `20261102120000_signed_cursor_indexes` adds composite indexes for the signed keyset ordering used by audit, attendance and notification feeds.
 `20261102130000_leave_cursor_index` adds the organization/date keyset index for leave request feeds.
 `20261102180000_employee_expense_cursors` adds org-scoped `(created_at DESC, id DESC)` indexes for employee and expense cursor feeds.
