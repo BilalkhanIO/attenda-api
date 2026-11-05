@@ -10,7 +10,6 @@ import { validate } from '../middleware/validate';
 import { idempotency } from '../middleware/idempotency';
 import { payrollPeriodSchema, payrollAdjustSchema, payrollRecallSchema, payRateSchema } from '../schemas';
 import { recordAudit } from '../services/audit';
-import { createNotification } from '../services/notifications';
 import { statutoryParameterSetSchema } from '../schemas/statutory-payroll';
 import { applyStatutoryPayroll } from '../services/statutoryPayroll';
 import { buildPayrollJournal } from '../services/payrollJournal';
@@ -712,11 +711,31 @@ router.post('/process-full', requirePermission('payroll.process'), idempotency, 
 
         // Update record with payslip URL
         stage = 'payroll_record_update';
-        const finalized = await prisma.payrollRecord.updateMany({
-          where: { id: record.id, org_id: req.user!.org_id, status: 'draft', inputs_stale: false },
-          data: { status: 'processed', processed_at: new Date(), processed_by: req.user!.sub, payslip_url: key },
+        const finalized = await prisma.$transaction(async tx => {
+          const changed = await tx.payrollRecord.updateMany({
+            where: { id: record.id, org_id: req.user!.org_id, status: 'draft', inputs_stale: false },
+            data: { status: 'processed', processed_at: new Date(), processed_by: req.user!.sub, payslip_url: key },
+          });
+          if (!changed.count) return false;
+          await tx.outboxEvent.create({ data: {
+            org_id: req.user!.org_id,
+            event_type: 'notification_requested',
+            entity_type: 'payroll_record',
+            entity_id: record.id,
+            payload: {
+              userId: record.user.id,
+              orgId: req.user!.org_id,
+              type: 'payslip_ready',
+              title: 'Your payslip is ready',
+              body: `Your payslip for ${periodLabel} is available in Attenda under Profile → Payslips.`,
+              actionType: 'payslip_ready',
+              actionId: record.id,
+              dedupeKey: record.id,
+            },
+          } });
+          return true;
         });
-        if (!finalized.count) {
+        if (!finalized) {
           throw new AppError(
             'This payroll record changed while it was being finalized. The draft was not processed; regenerate it and retry.',
             409,
@@ -726,34 +745,12 @@ router.post('/process-full', requirePermission('payroll.process'), idempotency, 
 
         processed++;
 
-        // The notification router persists channel deliveries independently and
-        // retries provider failures. A queue-write failure is reported without
-        // changing the already-finalized payroll record.
-        let notificationRecorded = false;
-        try {
-          notificationRecorded = await createNotification({
-            userId: record.user.id,
-            orgId: req.user!.org_id,
-            type: 'payslip_ready',
-            title: 'Your payslip is ready',
-            body: `Your payslip for ${periodLabel} is available in Attenda under Profile → Payslips.`,
-            actionType: 'payslip_ready',
-            actionId: record.id,
-            dedupeKey: record.id,
-          });
-        } catch (err) {
-          logger.error({ err, orgId: req.user!.org_id, payrollRecordId: record.id }, 'payslip notification enqueue failed');
-        }
-        if (!notificationRecorded) {
-          notificationQueueFailures.push({ payroll_record_id: record.id, employee_id: record.user.id, employee_name: record.user.name });
-          logger.error({ orgId: req.user!.org_id, actorId: req.user!.sub, payrollRecordId: record.id }, 'payslip notification could not be queued');
-        }
         results.push({
           payroll_record_id: record.id,
           employee_id: record.user.id,
           employee_name: record.user.name,
           status: 'processed',
-          notification_status: notificationRecorded ? 'recorded' : 'queue_failed',
+          notification_status: 'recorded',
         });
       } catch (err) {
         logger.error({ err, orgId: req.user!.org_id, actorId: req.user!.sub, payrollRecordId: record.id, year: y, month: m }, 'payroll record finalization failed');
