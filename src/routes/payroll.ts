@@ -698,10 +698,17 @@ router.post('/process-full', requirePermission('payroll.process'), idempotency, 
 
         // Update record with payslip URL
         stage = 'payroll_record_update';
-        await prisma.payrollRecord.update({
-          where: { id: record.id },
+        const finalized = await prisma.payrollRecord.updateMany({
+          where: { id: record.id, org_id: req.user!.org_id, status: 'draft', inputs_stale: false },
           data: { status: 'processed', processed_at: new Date(), processed_by: req.user!.sub, payslip_url: key },
         });
+        if (!finalized.count) {
+          throw new AppError(
+            'This payroll record changed while it was being finalized. The draft was not processed; regenerate it and retry.',
+            409,
+            'PAYROLL_INPUTS_CHANGED_DURING_PROCESSING',
+          );
+        }
 
         processed++;
 
