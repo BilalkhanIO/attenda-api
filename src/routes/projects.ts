@@ -230,19 +230,43 @@ router.post('/tasks/:taskId/comments', ensureTaskCommentAccess, idempotency, asy
     if (!await canAccessProject(task.project_id, req.user!.sub, req.user!.org_id)) throw new NotFoundError('Project task');
     const body = String(req.body.body ?? '').trim();
     if (!body || body.length > 5000) throw new ValidationError('Comment is required and must be under 5,000 characters');
-    const comment = await prisma.projectTaskComment.create({ data: { task_id: task.id, user_id: req.user!.sub, body }, include: { user: { select: { id: true, name: true, avatar_url: true } } } });
-    const notifiedUsers = new Set<string>();
+    const explicitMentionIds = req.body.mention_ids ?? [];
+    if (!Array.isArray(explicitMentionIds) || explicitMentionIds.length > 20 || explicitMentionIds.some((id: unknown) => typeof id !== 'string')) throw new ValidationError('Mentions must contain up to 20 project member ids');
+    const uniqueMentionIds = [...new Set(explicitMentionIds.map(String))].filter(id => id !== req.user!.sub);
+    const validMembers = uniqueMentionIds.length ? await prisma.projectMember.findMany({ where: { project_id: task.project_id, user_id: { in: uniqueMentionIds }, user: { deleted_at: null } }, select: { user_id: true } }) : [];
+    if (validMembers.length !== uniqueMentionIds.length) throw new ValidationError('Mentioned employees must be active members of this project');
+    const notifiedUsers = new Set<string>(uniqueMentionIds);
     const mentionEmails = [...body.matchAll(/@([A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})/gi)].map(match => match[1].toLowerCase());
     const mentioned = mentionEmails.length ? await prisma.user.findMany({ where: { org_id: req.user!.org_id, deleted_at: null, email: { in: [...new Set(mentionEmails)] } }, select: { id: true } }) : [];
-    for (const user of mentioned) {
-      if (user.id === req.user!.sub) continue;
-      notifiedUsers.add(user.id);
-      createNotification({ userId: user.id, orgId: req.user!.org_id, type: 'project_task_comment', title: 'You were mentioned on a task', body: `${task.title} · ${body.slice(0, 120)}`, actionType: 'project_task', actionId: task.id }).catch(() => {});
-    }
+    const projectMembers = mentioned.length ? await prisma.projectMember.findMany({ where: { project_id: task.project_id, user_id: { in: mentioned.map(user => user.id) } }, select: { user_id: true } }) : [];
+    for (const user of projectMembers) if (user.user_id !== req.user!.sub) notifiedUsers.add(user.user_id);
     if (task.assignee_id && task.assignee_id !== req.user!.sub && !notifiedUsers.has(task.assignee_id)) {
-      createNotification({ userId: task.assignee_id, orgId: req.user!.org_id, type: 'project_task_comment', title: 'New comment on your task', body: `${task.title} · ${body.slice(0, 120)}`, actionType: 'project_task', actionId: task.id }).catch(() => {});
+      notifiedUsers.add(task.assignee_id);
     }
-    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'project.task.comment', entityType: 'project_task', entityId: task.id, after: { comment_id: comment.id } });
+    const comment = await prisma.$transaction(async tx => {
+      const createdComment = await tx.projectTaskComment.create({ data: { task_id: task.id, user_id: req.user!.sub, body }, include: { user: { select: { id: true, name: true, avatar_url: true } } } });
+      for (const userId of notifiedUsers) {
+        const isMention = uniqueMentionIds.includes(userId) || projectMembers.some(member => member.user_id === userId);
+        await tx.outboxEvent.create({ data: {
+          org_id: req.user!.org_id,
+          event_type: 'notification_requested',
+          entity_type: 'project_task_comment',
+          entity_id: createdComment.id,
+          payload: {
+            userId,
+            orgId: req.user!.org_id,
+            type: 'project_task_comment',
+            title: isMention ? 'You were mentioned on a task' : 'New comment on your task',
+            body: `${task.title} · ${body.slice(0, 120)}`,
+            actionType: 'project_task',
+            actionId: task.id,
+            dedupeKey: `${createdComment.id}:${userId}`,
+          },
+        } });
+      }
+      await tx.auditLog.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, action: 'project.task.comment', entity_type: 'project_task', entity_id: task.id, after: { comment_id: createdComment.id, mentioned_user_ids: uniqueMentionIds } } });
+      return createdComment;
+    });
     emitOrgEvent(req.user!.org_id, 'project_changed');
     created(res, comment);
   } catch (error) { next(error); }
