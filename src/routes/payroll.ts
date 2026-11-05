@@ -16,6 +16,7 @@ import { applyStatutoryPayroll } from '../services/statutoryPayroll';
 import { buildPayrollJournal } from '../services/payrollJournal';
 import { setEffectivePayRate } from '../services/payRates';
 import { acquireRedisLease } from '../utils/redisLease';
+import { acquirePayrollConfigurationLease } from '../services/payrollCoordination';
 import { logger } from '../utils/logger';
 
 const router = Router();
@@ -63,6 +64,7 @@ router.get('/rates/:userId', requirePermission('payroll.manage'), async (req, re
 });
 
 router.put('/rates/:userId', requirePermission('payroll.manage'), idempotency, validate({ body: payRateSchema }), async (req, res, next) => {
+  let releaseConfigurationLease: (() => Promise<void>) | null = null;
   try {
     const userId = String(req.params.userId);
     const user = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id, deleted_at: null }, select: { id: true } });
@@ -73,6 +75,7 @@ router.put('/rates/:userId', requirePermission('payroll.manage'), idempotency, v
     const effectiveFrom = new Date(`${req.body.effective_from}T00:00:00.000Z`);
     if (Number.isNaN(effectiveFrom.getTime()) || effectiveFrom.toISOString().slice(0, 10) !== req.body.effective_from) throw new ValidationError('effective_from must be a valid date');
     if (!/^\d{4}-\d{2}-01$/.test(req.body.effective_from)) throw new ValidationError('Pay rate changes must take effect on the first day of a payroll month');
+    releaseConfigurationLease = await acquirePayrollConfigurationLease(req.user!.org_id);
     const result = await prisma.$transaction(async tx => {
       const rate = await setEffectivePayRate({ tx, orgId: req.user!.org_id, userId, amount: req.body.amount, basis: req.body.basis, currency, effectiveFrom, actorId: req.user!.sub });
       const today = new Date(`${localDateStr(new Date(), org?.timezone)}T00:00:00.000Z`);
@@ -95,6 +98,7 @@ router.put('/rates/:userId', requirePermission('payroll.manage'), idempotency, v
     recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'payroll.rate.update', entityType: 'pay_rate', entityId: result.id, after: { user_id: userId, amount: req.body.amount, basis: req.body.basis, currency, effective_from: result.effective_from, effective_to: result.effective_to } });
     ok(res, result);
   } catch (error) { next(error); }
+  finally { await releaseConfigurationLease?.().catch(() => {}); }
 });
 
 router.post('/statutory-parameter-sets', requirePermission('payroll.manage'), idempotency, validate({ body: statutoryParameterSetSchema }), async (req, res, next) => {
@@ -116,11 +120,13 @@ router.post('/statutory-parameter-sets', requirePermission('payroll.manage'), id
 });
 
 router.post('/statutory-parameter-sets/:id/activate', requirePermission('payroll.process'), idempotency, async (req, res, next) => {
+  let releaseConfigurationLease: (() => Promise<void>) | null = null;
   try {
     const set = await prisma.statutoryParameterSet.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
     if (!set) throw new NotFoundError('Statutory parameter set');
     if (set.status !== 'draft') throw new AppError('Only draft statutory parameter sets can be activated.', 409, 'STATUTORY_SET_NOT_DRAFT');
     if (set.created_by === req.user!.sub) throw new AppError('A different payroll approver must activate this parameter set.', 403, 'MAKER_CHECKER_REQUIRED');
+    releaseConfigurationLease = await acquirePayrollConfigurationLease(req.user!.org_id);
     const fromYear = set.effective_from.getUTCFullYear();
     const fromMonth = set.effective_from.getUTCMonth() + 1;
     const throughYear = set.effective_to?.getUTCFullYear();
@@ -156,6 +162,7 @@ router.post('/statutory-parameter-sets/:id/activate', requirePermission('payroll
     recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'payroll.statutory.activate', entityType: 'statutory_parameter_set', entityId: set.id, before: { status: set.status }, after: { status: activated.status, country_code: set.country_code, effective_from: set.effective_from, effective_to: set.effective_to } });
     ok(res, activated);
   } catch (error) { next(error); }
+  finally { await releaseConfigurationLease?.().catch(() => {}); }
 });
 
 // ─── GET /payroll ──────────────────────────────────────
@@ -189,11 +196,13 @@ router.get('/', requirePermission('payroll.view'), async (req, res, next) => {
 // ─── POST /payroll/generate ────────────────────────────
 router.post('/generate', requirePermission('payroll.manage'), idempotency, validate({ body: payrollPeriodSchema }), async (req, res, next) => {
   let releaseLease: (() => Promise<void>) | null = null;
+  let releaseConfigurationLease: (() => Promise<void>) | null = null;
   try {
     const { month, year } = req.body;
     const m = month || new Date().getMonth() + 1;
     const y = year  || new Date().getFullYear();
     releaseLease = await acquirePayrollPeriodLease(req.user!.org_id, y, m);
+    releaseConfigurationLease = await acquirePayrollConfigurationLease(req.user!.org_id);
 
     const start = startOfMonth(y, m);
     const end   = endOfMonth(y, m);
@@ -303,7 +312,7 @@ router.post('/generate', requirePermission('payroll.manage'), idempotency, valid
       month: m, year: y,
     });
   } catch (e) { next(e); }
-  finally { await releaseLease?.().catch(() => {}); }
+  finally { await releaseConfigurationLease?.().catch(() => {}); await releaseLease?.().catch(() => {}); }
 });
 
 // ─── GET /payroll/me ───────────────────────────────────
@@ -477,6 +486,7 @@ router.get('/:id', requirePermission('payroll.view'), async (req, res, next) => 
 // ─── PUT /payroll/:id/adjust ───────────────────────────
 router.put('/:id/adjust', requirePermission('payroll.manage'), idempotency, validate({ body: payrollAdjustSchema }), async (req, res, next) => {
   let releaseLease: (() => Promise<void>) | null = null;
+  let releaseConfigurationLease: (() => Promise<void>) | null = null;
   try {
     const { field, value, reason } = req.body;
     if (!field || value === undefined || !reason) throw new ValidationError('field, value and reason required');
@@ -487,6 +497,7 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), idempotency, vali
     });
     if (!record) throw new NotFoundError('Payroll record');
     releaseLease = await acquirePayrollPeriodLease(record.org_id, record.period_year, record.period_month);
+    releaseConfigurationLease = await acquirePayrollConfigurationLease(record.org_id);
     if (record.status === 'processed') throw new AppError('Cannot adjust processed payroll', 400, 'LOCKED');
 
     const updateData: Record<string, unknown> = { adjustment_reason: reason };
@@ -548,6 +559,7 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), idempotency, vali
     });
     ok(res, updated);
   } catch (e) { next(e); }
+  finally { await releaseConfigurationLease?.().catch(() => {}); await releaseLease?.().catch(() => {}); }
   finally { await releaseLease?.().catch(() => {}); }
 });
 
@@ -601,12 +613,14 @@ router.get('/payslips/:id', async (req, res, next) => {
 // Finalize payroll records and enqueue payslip-ready notifications separately.
 router.post('/process-full', requirePermission('payroll.process'), idempotency, validate({ body: payrollPeriodSchema }), async (req, res, next) => {
   let releaseLease: (() => Promise<void>) | null = null;
+  let releaseConfigurationLease: (() => Promise<void>) | null = null;
   try {
     const { month, year } = req.body;
     const m = month || new Date().getMonth() + 1;
     const y = year  || new Date().getFullYear();
 
     releaseLease = await acquirePayrollPeriodLease(req.user!.org_id, y, m);
+    releaseConfigurationLease = await acquirePayrollConfigurationLease(req.user!.org_id);
 
     const incomplete = await prisma.payrollRecord.count({
       where: { org_id: req.user!.org_id, period_month: m, period_year: y, is_incomplete: true },
@@ -784,7 +798,7 @@ router.post('/process-full', requirePermission('payroll.process'), idempotency, 
         : `Payroll processed for ${processed} employees; ${failures.length} records and ${notificationQueueFailures.length} notification queues need attention.`,
     });
   } catch (e) { next(e); }
-  finally { await releaseLease?.().catch(() => {}); }
+  finally { await releaseConfigurationLease?.().catch(() => {}); await releaseLease?.().catch(() => {}); }
 });
 
 // ─── GET /payroll/payslips/:id/download ───────────────

@@ -13,6 +13,7 @@ import { orgSettingsSchema, announcementSchema, attendanceSecuritySchema } from 
 import { isScheduledForLater, publishAnnouncement, announcementAudienceWhere } from '../services/announcements';
 import { generateGeminiJson } from '../services/ai/gemini-json';
 import { recordAudit } from '../services/audit';
+import { acquirePayrollConfigurationLease } from '../services/payrollCoordination';
 import { decodeCursor, encodeCursor, keysetAfter } from '../utils/cursor';
 import { dateOnlyInTz } from '../utils/shift';
 import { attendanceDateKey, attendanceDateOffset, localAttendanceDate, localAttendanceMonthStart, shiftAttendanceDateKey } from '../services/attendanceAnalytics';
@@ -708,6 +709,7 @@ orgRouter.get('/settings', requirePermission('org.settings.view'), async (req, r
 
 // PUT /org/settings
 orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ body: orgSettingsSchema }), async (req, res, next) => {
+  let releasePayrollConfiguration: (() => Promise<void>) | null = null;
   try {
     const {
       name, timezone, currency, payroll_day, monthly_pay_divisor, tax_rate, pension_rate, late_threshold, totp_required,
@@ -766,6 +768,9 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
       if (mins < 0 || mins > 90) throw new ValidationError('gap_forgiveness_mins must be between 0 and 90');
       data.gap_forgiveness_mins = mins;
     }
+    if (['monthly_pay_divisor', 'tax_rate', 'pension_rate'].some(key => data[key] !== undefined)) {
+      releasePayrollConfiguration = await acquirePayrollConfigurationLease(req.user!.org_id);
+    }
     const updated = await prisma.$transaction(async tx => {
       const org = await tx.organisation.update({ where: { id: req.user!.org_id }, data, select: ORG_SETTINGS_SELECT });
       if (data.monthly_pay_divisor !== undefined) await tx.payrollRecord.updateMany({ where: { org_id: req.user!.org_id, status: 'draft' }, data: { inputs_stale: true } });
@@ -774,6 +779,7 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
     });
     ok(res, updated);
   } catch (e) { next(e); }
+  finally { await releasePayrollConfiguration?.().catch(() => {}); }
 });
 
 // GET /org/audit-logs — append-only trail of pay-affecting mutations
