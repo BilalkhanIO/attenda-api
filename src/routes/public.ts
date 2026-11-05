@@ -31,7 +31,7 @@ router.post('/onboard', async (req: Request, res: Response, next: NextFunction) 
       throw new AppError('An application with this email already exists. Check your inbox or contact support.', 409, 'DUPLICATE_APPLICATION');
     }
 
-    await prisma.organisation.create({
+    const createdOrg = await prisma.organisation.create({
       data: {
         name:          company_name.trim(),
         timezone:      timezone?.trim() || 'UTC',
@@ -41,6 +41,7 @@ router.post('/onboard', async (req: Request, res: Response, next: NextFunction) 
         company_size:  company_size || null,
       },
     });
+    await prisma.location.create({ data: { org_id: createdOrg.id, name: 'Main office', timezone: timezone?.trim() || 'UTC', is_main: true } });
 
     ok(res, { message: "Application received! We'll review it and email you within 24 hours." }, 201);
   } catch (e) { next(e); }

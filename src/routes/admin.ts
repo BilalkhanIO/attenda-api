@@ -3,6 +3,7 @@ import prisma from '../utils/prisma';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, paginated, ValidationError, NotFoundError, ForbiddenError } from '../utils/response';
 import { generateToken } from '../utils/auth';
+import { idempotency, sensitiveResponseIdempotency } from '../middleware/idempotency';
 
 const router = Router();
 
@@ -141,7 +142,7 @@ router.get('/orgs/:id', canViewOrgs, async (req: Request, res: Response, next: N
 });
 
 // PATCH /admin/orgs/:id — org profile fields
-router.patch('/orgs/:id', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/orgs/:id', canManageOrgs, idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, timezone, contact_name, contact_email, company_size, billing_email } = req.body;
     const data: Record<string, unknown> = {};
@@ -256,7 +257,7 @@ router.post('/orgs/:id/activate', canManageOrgs, async (req: Request, res: Respo
 });
 
 // POST /admin/orgs/:id/approve
-router.post('/orgs/:id/approve', canApproveOrgs, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs/:id/approve', canApproveOrgs, sensitiveResponseIdempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
     if (!org) throw new NotFoundError('Organisation');
@@ -312,7 +313,7 @@ router.post('/orgs/:id/approve', canApproveOrgs, async (req: Request, res: Respo
 });
 
 // POST /admin/orgs/:id/reject
-router.post('/orgs/:id/reject', canApproveOrgs, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs/:id/reject', canApproveOrgs, idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const org = await prisma.organisation.findUnique({ where: { id: req.params.id as string } });
     if (!org) throw new NotFoundError('Organisation');
@@ -323,13 +324,14 @@ router.post('/orgs/:id/reject', canApproveOrgs, async (req: Request, res: Respon
 });
 
 // POST /admin/orgs — direct org creation
-router.post('/orgs', canManageOrgs, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/orgs', canManageOrgs, idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, timezone = 'UTC', currency = 'USD', plan = 'starter' } = req.body;
     if (!name?.trim()) throw new ValidationError('name is required');
     const org = await prisma.organisation.create({
       data: { name: name.trim(), timezone, currency, plan, status: 'active', subscription_status: 'active' },
     });
+    await prisma.location.create({ data: { org_id: org.id, name: 'Main office', timezone, is_main: true } });
     // Seed system org roles so users added later resolve permissions correctly
     const { seedOrgRbacForOrganisation } = await import('../utils/rbac-seed');
     await seedOrgRbacForOrganisation(org.id);
@@ -434,7 +436,7 @@ router.get('/blog', canManageBlog, async (req: Request, res: Response, next: Nex
   } catch (e) { next(e); }
 });
 
-router.post('/blog', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/blog', canManageBlog, idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
       slug, title, excerpt, content, author_name, author_avatar, cover_image,
@@ -473,7 +475,7 @@ router.get('/blog/:id', canManageBlog, async (req: Request, res: Response, next:
   } catch (e) { next(e); }
 });
 
-router.put('/blog/:id', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
+router.put('/blog/:id', canManageBlog, idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
       slug, title, excerpt, content, author_name, author_avatar, cover_image,
@@ -507,7 +509,7 @@ router.put('/blog/:id', canManageBlog, async (req: Request, res: Response, next:
   } catch (e) { next(e); }
 });
 
-router.delete('/blog/:id', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/blog/:id', canManageBlog, idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     await prisma.blogPost.delete({ where: { id: req.params.id as string } });
     ok(res, { message: 'Post deleted' });
@@ -515,7 +517,7 @@ router.delete('/blog/:id', canManageBlog, async (req: Request, res: Response, ne
 });
 
 // PATCH /admin/blog/:id/publish — toggle publish status
-router.patch('/blog/:id/publish', canManageBlog, async (req: Request, res: Response, next: NextFunction) => {
+router.patch('/blog/:id/publish', canManageBlog, idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const existing = await prisma.blogPost.findUniqueOrThrow({ where: { id: req.params.id as string } });
     const post = await prisma.blogPost.update({
@@ -531,7 +533,7 @@ router.patch('/blog/:id/publish', canManageBlog, async (req: Request, res: Respo
 
 // ── Broadcast ──────────────────────────────────────────────────────────────
 
-router.post('/broadcast', requirePermission('platform.broadcast.send', 'platform.orgs.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/broadcast', requirePermission('platform.broadcast.send', 'platform.orgs.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { title, body, target = 'all' } = req.body;
     if (!title?.trim() || !body?.trim()) throw new ValidationError('title and body are required');

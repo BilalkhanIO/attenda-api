@@ -1,6 +1,7 @@
 import prisma from '../utils/prisma';
+import { setLeaveLedgerContext } from './leaveLedger';
 import { jobLogger } from '../utils/logger';
-import { toZonedTime } from 'date-fns-tz';
+import { dateOnlyInTz } from '../utils/shift';
 
 export interface AccrualPolicy {
   days_per_year: number;
@@ -8,6 +9,16 @@ export interface AccrualPolicy {
 }
 
 export type AccrualConfig = Record<string, AccrualPolicy>;
+
+export function accrualPeriodForLocation(now: Date, timezone: string): { year: number; month: number; effectiveDate: Date } | null {
+  const localDate = dateOnlyInTz(now, timezone);
+  // Daily org-local retries cover branch zones that are up to a calendar day
+  // ahead of the organization's scheduler timezone.
+  if (localDate.getUTCDate() > 2) return null;
+  const year = localDate.getUTCFullYear();
+  const month = localDate.getUTCMonth() + 1;
+  return { year, month, effectiveDate: new Date(Date.UTC(year, month - 1, 1)) };
+}
 
 /** Parse and sanity-check an org's leave_accrual JSON; null when unusable. */
 export function parseAccrualConfig(raw: unknown): AccrualConfig | null {
@@ -80,62 +91,65 @@ export async function runMonthlyAccrual(
   for (const org of orgs) {
     const config = parseAccrualConfig(org.leave_accrual);
     if (!config) continue;
-    const localNow = toZonedTime(now, org.timezone || 'UTC');
-    const year = localNow.getFullYear();
-    const month = localNow.getMonth() + 1;
+    const users = await prisma.user.findMany({
+      where: { org_id: org.id, is_active: true, deleted_at: null },
+      select: { id: true, primary_location_id: true, primary_location: { select: { timezone: true } } },
+    });
+    let orgHadEligibleUsers = false;
 
-    try {
-      const result = await prisma.$transaction(async (tx) => {
-        // Unique key is the durable idempotency key. Creating it and updating
-        // balances in one transaction means a crash cannot leave a half-run.
-        await tx.leaveAccrualRun.create({ data: { org_id: org.id, year, month } });
-        const users = await tx.user.findMany({
-          where: { org_id: org.id, is_active: true, deleted_at: null },
-          select: { id: true },
-        });
-        let touched = 0;
+    for (const user of users) {
+      const timezone = user.primary_location?.timezone || org.timezone || 'UTC';
+      const period = accrualPeriodForLocation(now, timezone);
+      if (!period) continue;
+      const { year, month, effectiveDate } = period;
+      orgHadEligibleUsers = true;
 
-        for (const user of users) {
-          for (const [type, policy] of Object.entries(config)) {
-            const inc = monthlyIncrement(policy);
-            const existing = await tx.leaveBalance.findFirst({
-              where: { user_id: user.id, leave_type: type, year },
+      for (const [type, policy] of Object.entries(config)) {
+        const inc = monthlyIncrement(policy);
+        try {
+          await prisma.$transaction(async tx => {
+            // The employee/type/local-period grant is the idempotency key. The
+            // grant and balance/ledger mutation commit or roll back together.
+            await tx.leaveAccrualGrant.create({ data: {
+              org_id: org.id, user_id: user.id, leave_type: type, year, month,
+              days: inc, location_id: user.primary_location_id,
+            } });
+            await setLeaveLedgerContext(tx, {
+              reason: 'accrual',
+              refId: `${org.id}:${user.id}:${year}-${String(month).padStart(2, '0')}:${type}`,
+              note: `Monthly ${type} accrual ${year}-${String(month).padStart(2, '0')}`,
+              effectiveDate,
             });
-
+            const existing = await tx.leaveBalance.findFirst({ where: { user_id: user.id, leave_type: type, year } });
             if (existing) {
-              // Atomic increment preserves concurrent HR adjustments.
-              await tx.leaveBalance.update({
-                where: { id: existing.id },
-                data: { total_days: { increment: inc } },
-              });
+              await tx.leaveBalance.update({ where: { id: existing.id }, data: { total_days: { increment: inc } } });
             } else {
               let seed = inc;
               if (month === 1) {
-                const prior = await tx.leaveBalance.findFirst({
-                  where: { user_id: user.id, leave_type: type, year: year - 1 },
-                });
+                const prior = await tx.leaveBalance.findFirst({ where: { user_id: user.id, leave_type: type, year: year - 1 } });
                 if (prior) seed += carryOver(policy, toDays(prior.total_days), toDays(prior.used_days));
               }
-              await tx.leaveBalance.create({
-                data: {
-                  user_id: user.id, org_id: org.id, leave_type: type, year,
-                  total_days: Math.round(seed * 100) / 100, used_days: 0,
-                },
-              });
+              await tx.leaveBalance.create({ data: {
+                user_id: user.id, org_id: org.id, leave_type: type, year,
+                total_days: Math.round(seed * 100) / 100, used_days: 0,
+              } });
             }
-            touched++;
-          }
+          });
+          balancesTouched++;
+        } catch (error) {
+          if ((error as { code?: string }).code === 'P2002') { skipped++; continue; }
+          throw error;
         }
-        return touched;
+      }
+    }
+    if (orgHadEligibleUsers) {
+      const orgDate = dateOnlyInTz(now, org.timezone || 'UTC');
+      await prisma.leaveAccrualRun.upsert({
+        where: { org_id_year_month: { org_id: org.id, year: orgDate.getUTCFullYear(), month: orgDate.getUTCMonth() + 1 } },
+        create: { org_id: org.id, year: orgDate.getUTCFullYear(), month: orgDate.getUTCMonth() + 1 },
+        update: {},
       });
       orgsProcessed++;
-      balancesTouched += result;
-    } catch (error) {
-      if ((error as { code?: string }).code === 'P2002') {
-        skipped++;
-        continue;
-      }
-      throw error;
     }
   }
 

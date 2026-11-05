@@ -1,12 +1,16 @@
 import prisma from '../utils/prisma';
 import { resolveUserPermissions } from './authorization';
 import { createNotification, emitOrgEvent } from './notifications';
+import { setLeaveLedgerContext } from './leaveLedger';
 import { recordAudit } from './audit';
 import { AppError, NotFoundError, ValidationError } from '../utils/response';
 import { calcHoursWorked } from '../utils/auth';
 import { dateOnlyInTz } from '../utils/shift';
+import { decodeCursor, encodeCursor, keysetAfterAscending } from '../utils/cursor';
+import { holidaySetForRange } from './holidays';
+import { reviewableEmployeeIds } from './locationScope';
 
-export type ApprovalType = 'leave' | 'overtime' | 'remote' | 'swap' | 'late_notice' | 'expense' | 'correction';
+export type ApprovalType = 'leave' | 'overtime' | 'remote' | 'swap' | 'late_notice' | 'expense' | 'correction' | 'timesheet';
 export type ApprovalAction = 'approve' | 'reject' | 'acknowledge';
 
 export interface ApprovalViewer { userId: string; orgId: string }
@@ -31,13 +35,11 @@ export interface ApprovalItem {
 
 const dateLabel = (value: Date | null | undefined) => value ? value.toISOString().slice(0, 10) : '';
 const timeLabel = (value: Date | null | undefined) => value ? value.toISOString().slice(11, 16) : undefined;
-const requestTypes: ApprovalType[] = ['leave', 'overtime', 'remote', 'swap', 'late_notice', 'expense', 'correction'];
+const requestTypes: ApprovalType[] = ['leave', 'overtime', 'remote', 'swap', 'late_notice', 'expense', 'correction', 'timesheet'];
 
 async function accessContext(viewer: ApprovalViewer) {
   const permissions = await resolveUserPermissions(viewer.userId, viewer.orgId);
-  const reports = async () => (await prisma.user.findMany({
-    where: { org_id: viewer.orgId, manager_id: viewer.userId, deleted_at: null }, select: { id: true },
-  })).map(row => row.id);
+  const reports = async () => (await reviewableEmployeeIds(viewer.orgId, viewer.userId, permissions, 'employees.view')) ?? [];
   return { permissions, reports };
 }
 
@@ -46,6 +48,7 @@ function scopeFor(type: ApprovalType, permissions: Set<string>, viewerId: string
   if (type === 'remote' || type === 'late_notice') return permissions.has('employees.view') ? undefined : reports;
   if (type === 'leave' || type === 'swap') return permissions.has('employees.view') ? undefined : reports;
   if (type === 'correction') return permissions.has('employees.view') ? undefined : reports;
+  if (type === 'timesheet') return permissions.has('employees.view') ? undefined : reports;
   if (type === 'expense') return permissions.has('expenses.manage') || permissions.has('employees.view') ? undefined : reports;
   if (type === 'overtime') return permissions.has('employees.view') ? undefined : reports;
   return undefined;
@@ -60,16 +63,27 @@ function hasTypePermission(type: ApprovalType, permissions: Set<string>): boolea
     case 'late_notice': return permissions.has('attendance.late_notices.manage');
     case 'expense': return permissions.has('expenses.view') || permissions.has('expenses.manage');
     case 'correction': return permissions.has('attendance.override');
+    case 'timesheet': return permissions.has('time.approve');
   }
 }
 
 /** Build the shared, permission-scoped approval inbox used by the UI and AI. */
-export async function listPendingApprovals(viewer: ApprovalViewer, typeFilter?: ApprovalType | 'all') {
+export async function listPendingApprovals(
+  viewer: ApprovalViewer,
+  typeFilter?: ApprovalType | 'all',
+  pagination?: { enabled: boolean; cursor?: string; limit: number },
+): Promise<{ total?: number; availableTypes: ApprovalType[]; countsByType: Partial<Record<ApprovalType, number>>; items: ApprovalItem[]; next_cursor?: string | null; has_more?: boolean; limit?: number; counts_are_page_local?: boolean }> {
   const { permissions, reports } = await accessContext(viewer);
   const permittedTypes = requestTypes.filter(type => hasTypePermission(type, permissions));
   const selectedTypes = typeFilter && typeFilter !== 'all'
     ? permittedTypes.filter(type => type === typeFilter)
     : permittedTypes;
+  const cursorFilters = { org_id: viewer.orgId, user_id: viewer.userId, type: typeFilter ?? 'all', permitted_types: selectedTypes };
+  const position = pagination?.enabled && pagination.cursor ? decodeCursor(pagination.cursor, cursorFilters) : null;
+  const pageTake = pagination?.enabled ? pagination.limit + 1 : 200;
+  const after = (type: ApprovalType, field: 'created_at' | 'submitted_at' = 'created_at') => position
+    ? keysetAfterAscending(position, field, type, requestTypes)
+    : {};
   const reportIds = selectedTypes.some(type => scopeFor(type, permissions, viewer.userId, []) !== undefined)
     ? await reports() : [];
   const items: ApprovalItem[] = [];
@@ -80,7 +94,7 @@ export async function listPendingApprovals(viewer: ApprovalViewer, typeFilter?: 
     const userWhere = scopedIds ? { in: scopedIds } : undefined;
 
     if (type === 'leave') {
-      const rows = await prisma.leaveRequest.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { created_at: 'asc' }, take: 200 });
+      const rows = await prisma.leaveRequest.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }), ...after(type) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { created_at: 'asc' }, take: pageTake });
       const shifts = rows.length ? await prisma.shiftAssignment.findMany({
         where: { user_id: { in: [...new Set(rows.map(row => row.user_id))] }, date: { gte: rows.reduce((min, row) => row.start_date < min ? row.start_date : min, rows[0].start_date), lte: rows.reduce((max, row) => row.end_date > max ? row.end_date : max, rows[0].end_date) } },
         select: { user_id: true, date: true },
@@ -91,32 +105,40 @@ export async function listPendingApprovals(viewer: ApprovalViewer, typeFilter?: 
         return { type, id: row.id, requester: row.user.name, avatarUrl: row.user.avatar_url ?? undefined, department: row.user.department ?? undefined, summary: `${row.leave_type} leave · ${dateLabel(row.start_date)} – ${dateLabel(row.end_date)} · ${row.working_days} day${row.working_days === 1 ? '' : 's'}`, detail: [row.reason, conflictNote].filter(Boolean).join('\n') || undefined, createdAt: row.created_at.toISOString(), rejectNeedsReason: true, canAct: true };
       }));
     } else if (type === 'overtime') {
-      const rows = await prisma.overtimeRequest.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) }, include: { user: { select: { name: true, avatar_url: true, department: true } }, attendance: { select: { date: true } } }, orderBy: { created_at: 'asc' }, take: 200 });
+      const rows = await prisma.overtimeRequest.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }), ...after(type) }, include: { user: { select: { name: true, avatar_url: true, department: true } }, attendance: { select: { date: true } } }, orderBy: { created_at: 'asc' }, take: pageTake });
       const leaves = rows.length ? await prisma.leaveRequest.findMany({ where: { status: 'approved', user_id: { in: [...new Set(rows.map(row => row.user_id))] }, start_date: { lte: rows.reduce((max, row) => row.attendance.date > max ? row.attendance.date : max, rows[0].attendance.date) }, end_date: { gte: rows.reduce((min, row) => row.attendance.date < min ? row.attendance.date : min, rows[0].attendance.date) } }, select: { user_id: true, start_date: true, end_date: true } }) : [];
       items.push(...rows.map(row => {
         const conflict = leaves.some(leave => leave.user_id === row.user_id && leave.start_date <= row.attendance.date && leave.end_date >= row.attendance.date);
         return { type, id: row.id, requester: row.user.name, avatarUrl: row.user.avatar_url ?? undefined, department: row.user.department ?? undefined, summary: `${row.requested_minutes} minutes overtime · ${dateLabel(row.attendance.date)}`, detail: [row.reason, conflict ? '⚠ This date overlaps approved leave.' : undefined].filter(Boolean).join('\n') || undefined, createdAt: row.created_at.toISOString(), rejectNeedsReason: true, canAct: true };
       }));
     } else if (type === 'remote') {
-      const rows = await prisma.remoteSession.findMany({ where: { status: 'pending', user: { org_id: viewer.orgId, ...(userWhere && { id: userWhere }) } }, include: { user: { select: { name: true, avatar_url: true, department: true } }, attendance: { select: { date: true } } }, orderBy: { created_at: 'asc' }, take: 200 });
+      const rows = await prisma.remoteSession.findMany({ where: { status: 'pending', user: { org_id: viewer.orgId, ...(userWhere && { id: userWhere }) }, ...after(type) }, include: { user: { select: { name: true, avatar_url: true, department: true } }, attendance: { select: { date: true } } }, orderBy: { created_at: 'asc' }, take: pageTake });
       const leaves = rows.length ? await prisma.leaveRequest.findMany({ where: { status: 'approved', user_id: { in: [...new Set(rows.map(row => row.user_id))] }, start_date: { lte: rows.reduce((max, row) => row.attendance.date > max ? row.attendance.date : max, rows[0].attendance.date) }, end_date: { gte: rows.reduce((min, row) => row.attendance.date < min ? row.attendance.date : min, rows[0].attendance.date) } }, select: { user_id: true, start_date: true, end_date: true } }) : [];
       items.push(...rows.map(row => {
         const conflict = leaves.some(leave => leave.user_id === row.user_id && leave.start_date <= row.attendance.date && leave.end_date >= row.attendance.date);
         return { type, id: row.id, requester: row.user.name, avatarUrl: row.user.avatar_url ?? undefined, department: row.user.department ?? undefined, summary: `Remote work · ${row.duration_type.replace(/_/g, ' ')} · ${dateLabel(row.attendance.date)}`, detail: [row.review_note, conflict ? '⚠ This date overlaps approved leave.' : undefined].filter(Boolean).join('\n') || undefined, createdAt: row.created_at.toISOString(), rejectNeedsReason: true, canAct: true };
       }));
     } else if (type === 'swap') {
-      const rows = await prisma.shiftSwap.findMany({ where: { status: 'pending', requester: { org_id: viewer.orgId, ...(userWhere && { id: userWhere }) } }, include: { requester: { select: { name: true, avatar_url: true, department: true } }, target: { select: { name: true } }, requester_assignment: { include: { shift: { select: { name: true } } } }, target_assignment: { include: { shift: { select: { name: true } } } } }, orderBy: { created_at: 'asc' }, take: 200 });
+      const rows = await prisma.shiftSwap.findMany({ where: { status: 'pending', requester: { org_id: viewer.orgId, ...(userWhere && { id: userWhere }) }, ...after(type) }, include: { requester: { select: { name: true, avatar_url: true, department: true } }, target: { select: { name: true } }, requester_assignment: { include: { shift: { select: { name: true } } } }, target_assignment: { include: { shift: { select: { name: true } } } } }, orderBy: { created_at: 'asc' }, take: pageTake });
       items.push(...rows.map(row => ({ type, id: row.id, requester: row.requester.name, avatarUrl: row.requester.avatar_url ?? undefined, department: row.requester.department ?? undefined, summary: `Shift swap with ${row.target.name} · ${row.requester_assignment.shift.name} for ${row.target_assignment.shift.name}`, detail: row.reason ?? undefined, createdAt: row.created_at.toISOString(), rejectNeedsReason: true, canAct: true })));
     } else if (type === 'late_notice') {
       const org = await prisma.organisation.findUnique({ where: { id: viewer.orgId }, select: { timezone: true } });
       const today = dateOnlyInTz(new Date(), org?.timezone ?? 'UTC');
-      const rows = await prisma.lateArrivalNotice.findMany({ where: { org_id: viewer.orgId, status: 'pending', date: { gte: today }, ...(userWhere && { user_id: userWhere }) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: [{ date: 'asc' }, { created_at: 'asc' }], take: 200 });
+      const rows = await prisma.lateArrivalNotice.findMany({ where: { org_id: viewer.orgId, status: 'pending', date: { gte: today }, ...(userWhere && { user_id: userWhere }), ...after(type) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { created_at: 'asc' }, take: pageTake });
       items.push(...rows.map(row => ({ type, id: row.id, requester: row.user.name, avatarUrl: row.user.avatar_url ?? undefined, department: row.user.department ?? undefined, summary: `Late arrival · ${dateLabel(row.date)} · expected ${row.expected_time}`, detail: row.reason, createdAt: row.created_at.toISOString(), rejectNeedsReason: false, canAct: true, acknowledgeOnly: true })));
     } else if (type === 'expense') {
-      const rows = await prisma.expenseClaim.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { created_at: 'asc' }, take: 200 });
+      const rows = await prisma.expenseClaim.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }), ...after(type) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { created_at: 'asc' }, take: pageTake });
       items.push(...rows.map(row => ({ type, id: row.id, requester: row.user.name, avatarUrl: row.user.avatar_url ?? undefined, department: row.user.department ?? undefined, summary: `${row.category} · ${row.currency} ${Number(row.amount).toFixed(2)} · ${dateLabel(row.expense_date)}`, detail: row.description, createdAt: row.created_at.toISOString(), rejectNeedsReason: true, canAct: permissions.has('expenses.manage') })));
+    } else if (type === 'timesheet') {
+      const rows = await prisma.timesheet.findMany({ where: { org_id: viewer.orgId, status: 'submitted', ...(userWhere && { user_id: userWhere }), ...after(type, 'submitted_at') }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { submitted_at: 'asc' }, take: pageTake });
+      const ranges = await Promise.all(rows.map(async row => {
+        const end = new Date(row.week_start); end.setUTCDate(end.getUTCDate() + 7);
+        const total = await prisma.timeEntry.aggregate({ where: { org_id: viewer.orgId, user_id: row.user_id, started_at: { gte: row.week_start, lt: end }, status: 'submitted' }, _sum: { minutes: true } });
+        return { row, minutes: total._sum.minutes ?? 0 };
+      }));
+      items.push(...ranges.map(({ row, minutes }) => ({ type, id: row.id, requester: row.user.name, avatarUrl: row.user.avatar_url ?? undefined, department: row.user.department ?? undefined, summary: `Timesheet · week of ${dateLabel(row.week_start)} · ${(minutes / 60).toFixed(1)} hours`, detail: 'Approval locks the submitted project time entries.', createdAt: row.submitted_at?.toISOString() ?? row.created_at.toISOString(), rejectNeedsReason: true, canAct: true })));
     } else {
-      const rows = await prisma.attendanceCorrection.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { created_at: 'asc' }, take: 200 });
+      const rows = await prisma.attendanceCorrection.findMany({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }), ...after(type) }, include: { user: { select: { name: true, avatar_url: true, department: true } } }, orderBy: { created_at: 'asc' }, take: pageTake });
       items.push(...rows.map(row => {
         const times = [row.requested_check_in && `check-in ${timeLabel(row.requested_check_in)}`, row.requested_check_out && `check-out ${timeLabel(row.requested_check_out)}`].filter(Boolean).join(' · ');
         return { type, id: row.id, requester: row.user.name, avatarUrl: row.user.avatar_url ?? undefined, department: row.user.department ?? undefined, summary: `Attendance correction · ${dateLabel(row.date)}${times ? ` · ${times}` : ''}`, detail: row.reason, createdAt: row.created_at.toISOString(), rejectNeedsReason: true, canAct: true };
@@ -132,6 +154,7 @@ export async function listPendingApprovals(viewer: ApprovalViewer, typeFilter?: 
     late_notice: { href: '/attendance', label: 'Open attendance' },
     expense: { href: '/approvals/expense', label: 'Open expense request' },
     correction: { href: '/attendance', label: 'Open attendance' },
+    timesheet: { href: '/projects/time', label: 'Open timesheet' },
   };
   const now = Date.now();
   for (const item of items) {
@@ -142,17 +165,51 @@ export async function listPendingApprovals(viewer: ApprovalViewer, typeFilter?: 
     item.sourceHref = sourcePages[item.type].href;
     item.sourceLabel = sourcePages[item.type].label;
   }
-  items.sort((a, b) => ((b.ageHours ?? 0) - (a.ageHours ?? 0)) || (a.createdAt ?? '').localeCompare(b.createdAt ?? ''));
-  const countsByType = items.reduce<Partial<Record<ApprovalType, number>>>((counts, item) => { counts[item.type] = (counts[item.type] ?? 0) + 1; return counts; }, {});
-  return { total: items.length, availableTypes: permittedTypes, countsByType, items };
+  items.sort((a, b) => (a.createdAt ?? '').localeCompare(b.createdAt ?? '') || requestTypes.indexOf(a.type) - requestTypes.indexOf(b.type) || a.id.localeCompare(b.id));
+  const hasMore = !!pagination?.enabled && items.length > pagination.limit;
+  const pageItems = pagination?.enabled ? items.slice(0, pagination.limit) : items;
+  const countsByType: Partial<Record<ApprovalType, number>> = {};
+  if (pagination?.enabled) {
+    for (const item of pageItems) countsByType[item.type] = (countsByType[item.type] ?? 0) + 1;
+  } else {
+    const exactCounts = await Promise.all(selectedTypes.map(async type => {
+      const scopedIds = scopeFor(type, permissions, viewer.userId, reportIds);
+      if (scopedIds && scopedIds.length === 0) return [type, 0] as const;
+      const userWhere = scopedIds ? { in: scopedIds } : undefined;
+      let count: number;
+      switch (type) {
+        case 'leave': count = await prisma.leaveRequest.count({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) } }); break;
+        case 'overtime': count = await prisma.overtimeRequest.count({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) } }); break;
+        case 'remote': count = await prisma.remoteSession.count({ where: { status: 'pending', user: { org_id: viewer.orgId, ...(userWhere && { id: userWhere }) } } }); break;
+        case 'swap': count = await prisma.shiftSwap.count({ where: { status: 'pending', requester: { org_id: viewer.orgId, ...(userWhere && { id: userWhere }) } } }); break;
+        case 'late_notice': {
+          const org = await prisma.organisation.findUnique({ where: { id: viewer.orgId }, select: { timezone: true } });
+          const today = dateOnlyInTz(new Date(), org?.timezone ?? 'UTC');
+          count = await prisma.lateArrivalNotice.count({ where: { org_id: viewer.orgId, status: 'pending', date: { gte: today }, ...(userWhere && { user_id: userWhere }) } });
+          break;
+        }
+        case 'expense': count = await prisma.expenseClaim.count({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) } }); break;
+        case 'correction': count = await prisma.attendanceCorrection.count({ where: { org_id: viewer.orgId, status: 'pending', ...(userWhere && { user_id: userWhere }) } }); break;
+        case 'timesheet': count = await prisma.timesheet.count({ where: { org_id: viewer.orgId, status: 'submitted', ...(userWhere && { user_id: userWhere }) } }); break;
+      }
+      return [type, count] as const;
+    }));
+    for (const [type, count] of exactCounts) countsByType[type] = count;
+  }
+  const last = pageItems[pageItems.length - 1];
+  return {
+    ...(pagination?.enabled ? { next_cursor: hasMore && last?.createdAt ? encodeCursor({ at: new Date(last.createdAt), id: last.id, tie: last.type }, cursorFilters) : null, has_more: hasMore, limit: pagination.limit, counts_are_page_local: true } : { total: Object.values(countsByType).reduce((sum, count) => sum + (count ?? 0), 0) }),
+    availableTypes: permittedTypes, countsByType, items: pageItems,
+  };
 }
 
 async function assertReviewerScope(viewer: ApprovalViewer, type: ApprovalType, requesterId: string) {
   const { permissions } = await accessContext(viewer);
   if (type === 'leave' && permissions.has('leave.view_all')) return;
-  if (permissions.has('employees.view')) return;
-  const isDirectReport = await prisma.user.findFirst({ where: { id: requesterId, org_id: viewer.orgId, manager_id: viewer.userId, deleted_at: null }, select: { id: true } });
-  if (!isDirectReport) throw new AppError('You can only review requests for your direct reports', 403, 'FORBIDDEN');
+  const employeeIds = await reviewableEmployeeIds(viewer.orgId, viewer.userId, permissions, 'employees.view');
+  if (employeeIds !== null && !employeeIds.includes(requesterId)) {
+    throw new AppError('You can only review requests for your direct reports or managed locations', 403, 'FORBIDDEN');
+  }
 }
 
 /** Apply one decision with tenant, permission, scope, and pending-state checks. */
@@ -179,10 +236,12 @@ export async function reviewApproval(
   let audit: { action: string; entityType: string; entityId: string; before?: unknown; after?: unknown; reason?: string } | undefined;
 
   if (type === 'leave') {
-    const request = await prisma.leaveRequest.findFirst({ where: { id, org_id: viewer.orgId }, include: { user: { select: { name: true } } } });
+    const request = await prisma.leaveRequest.findFirst({ where: { id, org_id: viewer.orgId }, include: { user: { select: { name: true, primary_location_id: true } } } });
     if (!request) throw new NotFoundError('Leave request');
     await assertReviewerScope(viewer, type, request.user_id);
     if (action === 'approve') {
+      const locationId = request.location_id ?? request.user.primary_location_id;
+      const holidays = await holidaySetForRange(viewer.orgId, request.start_date, request.end_date, locationId);
       const scheduledShifts = await prisma.shiftAssignment.findMany({
         where: { user_id: request.user_id, date: { gte: request.start_date, lte: request.end_date } },
         select: { date: true },
@@ -191,25 +250,28 @@ export async function reviewApproval(
       await prisma.$transaction(async tx => {
         const claimed = await tx.leaveRequest.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: 'approved', reviewed_by: viewer.userId, reviewed_at: now } });
         if (!claimed.count) throw new ValidationError('This request has already been reviewed');
+        await setLeaveLedgerContext(tx, { reason: 'usage', refId: request.id, actorId: viewer.userId, note: 'Approved leave request' });
         await tx.leaveBalance.updateMany({ where: { user_id: request.user_id, leave_type: request.leave_type, year: request.start_date.getUTCFullYear() }, data: { used_days: { increment: request.working_days } } });
         const status = request.is_half_day || !!request.leave_start_time ? 'half_leave' : 'leave';
         const day = new Date(request.start_date);
         while (day <= request.end_date) {
-          if (day.getUTCDay() !== 0 && day.getUTCDay() !== 6) {
+          if (day.getUTCDay() !== 0 && day.getUTCDay() !== 6 && !holidays.has(day.toISOString().slice(0, 10))) {
             const date = new Date(day);
             const existing = await tx.attendanceRecord.findUnique({ where: { user_id_date: { user_id: request.user_id, date } } });
             if (status === 'half_leave' && existing?.check_in_at) {
               await tx.attendanceRecord.update({ where: { id: existing.id }, data: { status } });
             } else {
-              await tx.attendanceRecord.upsert({ where: { user_id_date: { user_id: request.user_id, date } }, update: { status }, create: { user_id: request.user_id, org_id: viewer.orgId, date, check_in_type: 'manual', status } });
+              await tx.attendanceRecord.upsert({ where: { user_id_date: { user_id: request.user_id, date } }, update: { status }, create: { user_id: request.user_id, org_id: viewer.orgId, location_id: locationId, date, check_in_type: 'manual', status } });
             }
           }
           day.setUTCDate(day.getUTCDate() + 1);
         }
       });
     } else {
-      const changed = await prisma.leaveRequest.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: 'rejected', reviewed_by: viewer.userId, reviewed_at: now, rejection_reason: reason } });
-      if (!changed.count) throw new ValidationError('This request has already been reviewed');
+      await prisma.$transaction(async tx => {
+        const changed = await tx.leaveRequest.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: 'rejected', reviewed_by: viewer.userId, reviewed_at: now, rejection_reason: reason } });
+        if (!changed.count) throw new ValidationError('This request has already been reviewed');
+      });
     }
     requesterId = request.user_id; requesterName = request.user.name; event = 'leave_changed';
     notification = { type: action === 'approve' ? 'leave_approved' : 'leave_rejected', title: `Leave ${actionPast}`, body: action === 'approve' ? `Your ${request.leave_type} leave was approved` : `Your ${request.leave_type} leave was rejected: ${reason}`, actionType: 'leave_request' };
@@ -269,8 +331,10 @@ export async function reviewApproval(
     if (!request) throw new NotFoundError('Late-arrival notice');
     if (request.date < today) throw new ValidationError('Past late-arrival notices cannot be acknowledged');
     await assertReviewerScope(viewer, type, request.user_id);
-    const changed = await prisma.lateArrivalNotice.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: 'acknowledged', acknowledged_by: viewer.userId, acknowledged_at: now } });
-    if (!changed.count) throw new ValidationError('This notice has already been acknowledged');
+    await prisma.$transaction(async tx => {
+      const changed = await tx.lateArrivalNotice.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: 'acknowledged', acknowledged_by: viewer.userId, acknowledged_at: now } });
+      if (!changed.count) throw new ValidationError('This notice has already been acknowledged');
+    });
     requesterId = request.user_id; requesterName = request.user.name;
     notification = { type: 'late_notice_ack', title: 'Late notice acknowledged', body: `Your late-arrival notice for ${dateLabel(request.date)} was acknowledged`, actionType: 'attendance' };
     summary = `${requesterName}'s late-arrival notice was acknowledged`;
@@ -289,7 +353,10 @@ export async function reviewApproval(
       const hours = checkIn && checkOut ? calcHoursWorked(checkIn, checkOut) : record?.hours_worked ?? null;
       const before = record ? { check_in_at: record.check_in_at, check_out_at: record.check_out_at, hours_worked: record.hours_worked } : null;
       if (record) record = await tx.attendanceRecord.update({ where: { id: record.id }, data: { ...(request.requested_check_in ? { check_in_at: request.requested_check_in } : {}), ...(request.requested_check_out ? { check_out_at: request.requested_check_out } : {}), ...(hours !== null ? { hours_worked: hours } : {}), is_overridden: true, override_by: viewer.userId, override_reason: `correction: ${request.reason}` } });
-      else record = await tx.attendanceRecord.create({ data: { user_id: request.user_id, org_id: viewer.orgId, date: request.date, check_in_at: request.requested_check_in, check_out_at: request.requested_check_out, ...(hours !== null ? { hours_worked: hours } : {}), check_in_type: 'manual', status: 'in', is_overridden: true, override_by: viewer.userId, override_reason: `correction: ${request.reason}` } });
+      else {
+        const subject = await tx.user.findFirst({ where: { id: request.user_id, org_id: viewer.orgId }, select: { primary_location_id: true } });
+        record = await tx.attendanceRecord.create({ data: { user_id: request.user_id, org_id: viewer.orgId, location_id: subject?.primary_location_id ?? null, date: request.date, check_in_at: request.requested_check_in, check_out_at: request.requested_check_out, ...(hours !== null ? { hours_worked: hours } : {}), check_in_type: 'manual', status: 'in', is_overridden: true, override_by: viewer.userId, override_reason: `correction: ${request.reason}` } });
+      }
       await tx.attendanceCorrection.update({ where: { id }, data: { attendance_id: record.id } });
       return { record, before };
     });
@@ -297,13 +364,31 @@ export async function reviewApproval(
     notification = { type: action === 'approve' ? 'correction_approved' : 'correction_rejected', title: `Attendance correction ${actionPast}`, body: action === 'approve' ? `Your correction for ${dateLabel(request.date)} was approved` : `Your correction was rejected: ${reason}`, actionType: 'attendance_correction' };
     summary = `${requesterName}'s attendance correction was ${actionPast}`;
     audit = { action: `attendance.correction.${action}`, entityType: action === 'approve' ? 'attendance_record' : 'attendance_correction', entityId: action === 'approve' && result ? result.record.id : id, ...(action === 'approve' && result ? { before: result.before, after: { check_in_at: result.record.check_in_at, check_out_at: result.record.check_out_at, hours_worked: result.record.hours_worked } } : {}), reason: action === 'reject' ? reason : request.reason };
+  } else if (type === 'timesheet') {
+    const sheet = await prisma.timesheet.findFirst({ where: { id, org_id: viewer.orgId, status: 'submitted' }, include: { user: { select: { id: true, name: true } } } });
+    if (!sheet) throw new NotFoundError('Submitted timesheet');
+    await assertReviewerScope(viewer, type, sheet.user_id);
+    if (sheet.user_id === viewer.userId) throw new AppError('You cannot approve your own timesheet.', 403, 'MAKER_CHECKER_REQUIRED');
+    const end = new Date(sheet.week_start); end.setUTCDate(end.getUTCDate() + 7);
+    const targetStatus = action === 'approve' ? 'locked' : 'rejected';
+    await prisma.$transaction(async tx => {
+      const changed = await tx.timesheet.updateMany({ where: { id, org_id: viewer.orgId, status: 'submitted' }, data: { status: targetStatus, reviewed_by: viewer.userId, reviewed_at: now, review_note: action === 'reject' ? reason : note } });
+      if (!changed.count) throw new ValidationError('This timesheet has already been reviewed');
+      await tx.timeEntry.updateMany({ where: { org_id: viewer.orgId, user_id: sheet.user_id, started_at: { gte: sheet.week_start, lt: end }, status: 'submitted' }, data: { status: targetStatus } });
+    });
+    requesterId = sheet.user_id; requesterName = sheet.user.name; event = 'timesheet_changed';
+    notification = { type: action === 'approve' ? 'timesheet_approved' : 'timesheet_rejected', title: `Timesheet ${actionPast}`, body: action === 'approve' ? 'Your timesheet was approved and locked.' : `Your timesheet was returned: ${reason}`, actionType: 'timesheet' };
+    summary = `${requesterName}'s timesheet was ${actionPast}`;
+    audit = { action: `timesheet.${action}`, entityType: 'timesheet', entityId: id, before: { status: 'submitted' }, after: { status: targetStatus }, reason: action === 'reject' ? reason : note ?? undefined };
   } else {
     const request = await prisma.expenseClaim.findFirst({ where: { id, org_id: viewer.orgId }, include: { user: { select: { id: true, name: true } } } });
     if (!request) throw new NotFoundError('Expense claim');
     if (!((await accessContext(viewer)).permissions.has('expenses.manage'))) throw new AppError('You can view expenses but cannot approve them', 403, 'FORBIDDEN');
     await assertReviewerScope(viewer, type, request.user_id);
-    const changed = await prisma.expenseClaim.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: action === 'approve' ? 'approved' : 'rejected', reviewed_by: viewer.userId, reviewed_at: now, review_note: action === 'reject' ? reason : note } });
-    if (!changed.count) throw new ValidationError('This request has already been reviewed');
+    await prisma.$transaction(async tx => {
+      const changed = await tx.expenseClaim.updateMany({ where: { id, org_id: viewer.orgId, status: 'pending' }, data: { status: action === 'approve' ? 'approved' : 'rejected', reviewed_by: viewer.userId, reviewed_at: now, review_note: action === 'reject' ? reason : note } });
+      if (!changed.count) throw new ValidationError('This request has already been reviewed');
+    });
     requesterId = request.user_id; requesterName = request.user.name; event = 'expense_changed';
     notification = { type: action === 'approve' ? 'expense_approved' : 'expense_rejected', title: `Expense claim ${actionPast}`, body: action === 'approve' ? `Your ${request.category} claim for ${request.currency} ${Number(request.amount).toFixed(2)} was approved` : `Your expense claim was rejected: ${reason}`, actionType: 'expense_claim' };
     summary = `${requesterName}'s ${request.category} expense claim was ${actionPast}`;

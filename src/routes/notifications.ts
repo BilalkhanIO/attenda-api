@@ -1,10 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
+import { idempotency } from '../middleware/idempotency';
 import { ok, NotFoundError, ValidationError } from '../utils/response';
 import { verifyAccessToken } from '../utils/auth';
 import { subscribeOrgEvents } from '../services/notifications';
 import prisma from '../utils/prisma';
 import { randomUUID } from 'node:crypto';
+import { decodeCursor, encodeCursor, keysetAfter } from '../utils/cursor';
 
 const router = Router();
 
@@ -84,7 +86,8 @@ router.get('/', async (req, res, next) => {
       const parsedLimit = Number.parseInt(String(req.query.limit ?? '20'), 10);
       const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(50, parsedLimit)) : 20;
       const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
-      if (cursor) {
+      const position = cursor ? decodeCursor(cursor, baseWhere) : null;
+      if (cursor && !position) {
         const anchor = await prisma.inAppNotification.findFirst({
           where: { id: cursor, ...baseWhere },
           select: { id: true },
@@ -94,8 +97,8 @@ router.get('/', async (req, res, next) => {
 
       const [rows, unreadCount] = await Promise.all([
         prisma.inAppNotification.findMany({
-          where: baseWhere,
-          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+          where: position ? { ...baseWhere, AND: [keysetAfter(position, 'created_at')] } : baseWhere,
+          ...(!position && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
           orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
           take: limit + 1,
         }),
@@ -105,7 +108,7 @@ router.get('/', async (req, res, next) => {
       const items = hasMore ? rows.slice(0, limit) : rows;
       ok(res, {
         items,
-        next_cursor: hasMore ? items[items.length - 1]?.id ?? null : null,
+        next_cursor: hasMore && items.length ? encodeCursor({ at: items[items.length - 1].created_at, id: items[items.length - 1].id }, baseWhere) : null,
         has_more: hasMore,
         unread_count: unreadCount,
       });
@@ -144,7 +147,7 @@ router.get('/count', async (req, res, next) => {
 });
 
 // ─── PUT /notifications/read-all ──────────────────────
-router.put('/read-all', async (req, res, next) => {
+router.put('/read-all', idempotency, async (req, res, next) => {
   try {
     await prisma.inAppNotification.updateMany({
       where: { user_id: req.user!.sub, read_at: null },
@@ -155,15 +158,16 @@ router.put('/read-all', async (req, res, next) => {
 });
 
 // ─── PUT /notifications/:id/read ──────────────────────
-router.put('/:id/read', async (req, res, next) => {
+router.put('/:id/read', idempotency, async (req, res, next) => {
   try {
+    const id = String(req.params.id);
     const notif = await prisma.inAppNotification.findFirst({
-      where: { id: req.params.id, user_id: req.user!.sub },
+      where: { id, user_id: req.user!.sub },
     });
     if (!notif) throw new NotFoundError('Notification');
 
     const updated = await prisma.inAppNotification.update({
-      where: { id: req.params.id },
+      where: { id },
       data:  { read_at: new Date() },
     });
     ok(res, updated);
@@ -171,14 +175,15 @@ router.put('/:id/read', async (req, res, next) => {
 });
 
 // ─── DELETE /notifications/:id ────────────────────────
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', idempotency, async (req, res, next) => {
   try {
+    const id = String(req.params.id);
     const notif = await prisma.inAppNotification.findFirst({
-      where: { id: req.params.id, user_id: req.user!.sub },
+      where: { id, user_id: req.user!.sub },
     });
     if (!notif) throw new NotFoundError('Notification');
 
-    await prisma.inAppNotification.delete({ where: { id: req.params.id } });
+    await prisma.inAppNotification.delete({ where: { id } });
     ok(res, { message: 'Notification deleted' });
   } catch (e) { next(e); }
 });

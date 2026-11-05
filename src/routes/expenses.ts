@@ -1,12 +1,15 @@
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
+import { idempotency } from '../middleware/idempotency';
 import { expenseClaimSchema, expenseReviewSchema, expenseReimburseSchema } from '../schemas';
 import { ok, created, NotFoundError, ValidationError, AppError } from '../utils/response';
 import { recalcPayrollTotals } from '../utils/payroll';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
 import { createNotification, emitOrgEvent } from '../services/notifications';
+import { decodeCursor, encodeCursor, keysetAfter } from '../utils/cursor';
+import { applyStatutoryPayroll } from '../services/statutoryPayroll';
 
 /**
  * Employee expense claims: employee submits amount + category + receipt →
@@ -27,7 +30,7 @@ const EXPENSE_INCLUDE = {
 const EXPENSE_STATUSES = ['pending', 'approved', 'rejected', 'reimbursed'] as const;
 
 // ─── POST /expenses ────────────────────────────────────
-router.post('/', validate({ body: expenseClaimSchema }), async (req, res, next) => {
+router.post('/', idempotency, validate({ body: expenseClaimSchema }), async (req, res, next) => {
   try {
     const { amount, currency, category, description, expense_date, receipt_url } = req.body;
 
@@ -73,8 +76,29 @@ router.post('/', validate({ body: expenseClaimSchema }), async (req, res, next) 
 // ─── GET /expenses/me ──────────────────────────────────
 router.get('/me', async (req, res, next) => {
   try {
+    const where: Record<string, unknown> = { org_id: req.user!.org_id, user_id: req.user!.sub };
+    const cursorMode = req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string';
+    if (cursorMode) {
+      const limit = Math.max(1, Math.min(100, Number.parseInt(String(req.query.limit ?? '25'), 10) || 25));
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+      const position = cursor ? decodeCursor(cursor, where) : null;
+      if (cursor && !position) {
+        const anchor = await prisma.expenseClaim.findFirst({ where: { ...where, id: cursor }, select: { id: true } });
+        if (!anchor) throw new ValidationError('Invalid expense cursor');
+      }
+      const rows = await prisma.expenseClaim.findMany({
+        where: position ? { ...where, AND: [keysetAfter(position, 'created_at')] } : where,
+        ...(!position && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        include: EXPENSE_INCLUDE, orderBy: [{ created_at: 'desc' }, { id: 'desc' }], take: limit + 1,
+      });
+      const hasMore = rows.length > limit;
+      const items = hasMore ? rows.slice(0, limit) : rows;
+      const last = items[items.length - 1];
+      ok(res, { items, next_cursor: hasMore && last ? encodeCursor({ at: last.created_at, id: last.id }, where) : null, has_more: hasMore, limit });
+      return;
+    }
     const claims = await prisma.expenseClaim.findMany({
-      where: { user_id: req.user!.sub },
+      where,
       include: EXPENSE_INCLUDE,
       orderBy: { created_at: 'desc' },
       take: 50,
@@ -92,6 +116,35 @@ router.get('/', requirePermission('expenses.view', 'expenses.manage'), async (re
     }
     const where: Record<string, unknown> = { org_id: req.user!.org_id };
     if (status !== 'all') where.status = status;
+
+    if (!req.permissions?.has('expenses.manage')) {
+      const team = await prisma.user.findMany({ where: { org_id: req.user!.org_id, manager_id: req.user!.sub, is_active: true, deleted_at: null }, select: { id: true } });
+      where.user_id = { in: team.map(user => user.id) };
+    }
+
+    const cursorMode = req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string';
+    if (cursorMode) {
+      const limit = Math.max(1, Math.min(100, Number.parseInt(String(req.query.limit ?? '25'), 10) || 25));
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+      const position = cursor ? decodeCursor(cursor, where) : null;
+      if (cursor && !position) {
+        const anchor = await prisma.expenseClaim.findFirst({ where: { ...where, id: cursor }, select: { id: true } });
+        if (!anchor) throw new ValidationError('Invalid expense cursor');
+      }
+      const rows = await prisma.expenseClaim.findMany({
+        where: position ? { ...where, AND: [keysetAfter(position, 'created_at')] } : where,
+        ...(!position && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        include: EXPENSE_INCLUDE, orderBy: [{ created_at: 'desc' }, { id: 'desc' }], take: limit + 1,
+      });
+      const hasMore = rows.length > limit;
+      const items = hasMore ? rows.slice(0, limit) : rows;
+      const last = items[items.length - 1];
+      const total = req.query.include_total === 'true' || req.query.include_total === '1'
+        ? await prisma.expenseClaim.count({ where })
+        : undefined;
+      ok(res, { items, next_cursor: hasMore && last ? encodeCursor({ at: last.created_at, id: last.id }, where) : null, has_more: hasMore, limit, ...(total !== undefined && { total }) });
+      return;
+    }
 
     const claims = await prisma.expenseClaim.findMany({
       where,
@@ -119,7 +172,7 @@ async function loadClaim(id: string, orgId: string, expectedStatus: string) {
 }
 
 // ─── PUT /expenses/:id/approve ─────────────────────────
-router.put('/:id/approve', requirePermission('expenses.manage'), validate({ body: expenseReviewSchema }), async (req, res, next) => {
+router.put('/:id/approve', requirePermission('expenses.manage'), idempotency, validate({ body: expenseReviewSchema }), async (req, res, next) => {
   try {
     const claim = await loadClaim(String(req.params.id), req.user!.org_id, 'pending');
     const note = req.body.note as string | undefined;
@@ -150,7 +203,7 @@ router.put('/:id/approve', requirePermission('expenses.manage'), validate({ body
 });
 
 // ─── PUT /expenses/:id/reject ──────────────────────────
-router.put('/:id/reject', requirePermission('expenses.manage'), validate({ body: expenseReviewSchema }), async (req, res, next) => {
+router.put('/:id/reject', requirePermission('expenses.manage'), idempotency, validate({ body: expenseReviewSchema }), async (req, res, next) => {
   try {
     const claim = await loadClaim(String(req.params.id), req.user!.org_id, 'pending');
     const note = req.body.note as string | undefined;
@@ -184,7 +237,7 @@ router.put('/:id/reject', requirePermission('expenses.manage'), validate({ body:
 // Adds the approved claim amount to the claimant's payroll record for the
 // given period as a manual adjustment, recalculated with the exact same
 // gross→tax→pension→net pipeline as PUT /payroll/:id/adjust.
-router.post('/:id/reimburse', requirePermission('expenses.manage'), validate({ body: expenseReimburseSchema }), async (req, res, next) => {
+router.post('/:id/reimburse', requirePermission('expenses.manage'), idempotency, validate({ body: expenseReimburseSchema }), async (req, res, next) => {
   try {
     const { month, year } = req.body;
     const claim = await loadClaim(String(req.params.id), req.user!.org_id, 'approved');
@@ -224,13 +277,17 @@ router.post('/:id/reimburse', requirePermission('expenses.manage'), validate({ b
       );
     }
 
-    const totals = recalcPayrollTotals({
+    const recalculated = recalcPayrollTotals({
       regular_hours:     Number(record.regular_hours),
       overtime_hours:    Number(record.overtime_hours),
       hourly_rate:       Number(record.hourly_rate),
       unpaid_deduction:  Number(record.unpaid_deduction),
       manual_adjustment: newAdjustment,
+      base_pay:          Number(record.base_pay),
+      overtime_pay:      Number(record.overtime_pay),
     }, Number(org?.tax_rate) || 0, Number(org?.pension_rate) || 0);
+    const statutory = await applyStatutoryPayroll({ orgId: record.org_id, userId: record.user_id, year: record.period_year, month: record.period_month }, recalculated);
+    const totals = statutory.totals;
 
     // Atomic: pay bump + claim status must commit together — a crash between
     // the two would leave pay increased with the claim still 'approved'
@@ -245,6 +302,10 @@ router.post('/:id/reimburse', requirePermission('expenses.manage'), validate({ b
           tax_deduction:     totals.tax_deduction,
           pension_deduction: totals.pension_deduction,
           net_pay:           totals.net_pay,
+          statutory_parameter_set_id: statutory.statutory_parameter_set_id,
+          tax_calculation_method: statutory.tax_calculation_method,
+          employee_statutory_deductions: statutory.employee_statutory_deductions,
+          employer_statutory_contributions: statutory.employer_statutory_contributions,
         },
       }),
       prisma.expenseClaim.update({

@@ -18,7 +18,7 @@ interface OperationObject {
   security?: Array<Record<string, string[]>>;
 }
 
-const ENVELOPE_RESPONSES = {
+const envelopeResponses = (dataSchema: Record<string, unknown> = {}) => ({
   '200': {
     description: 'Success envelope',
     content: {
@@ -27,7 +27,7 @@ const ENVELOPE_RESPONSES = {
           type: 'object',
           properties: {
             success: { type: 'boolean', const: true },
-            data: {},
+            data: dataSchema,
             pagination: {
               type: 'object',
               properties: {
@@ -43,7 +43,7 @@ const ENVELOPE_RESPONSES = {
   },
   '4XX': { $ref: '#/components/responses/Error' },
   '5XX': { $ref: '#/components/responses/Error' },
-};
+});
 
 function toJsonSchema(schema: ZodType): Record<string, unknown> {
   try {
@@ -74,6 +74,7 @@ type OpenApiMetadata = {
 };
 type TaggedHandler = {
   __validationSchemas?: ValidationSchemas;
+  __openapiResponseSchema?: ZodType;
   __openapi?: OpenApiMetadata;
 };
 interface RouteLayer {
@@ -114,13 +115,16 @@ export function buildOpenApiDoc(mounts: Array<[string, Router]>): Record<string,
       const schemas = layer.route.stack
         .map(s => s.handle.__validationSchemas)
         .find(Boolean);
+      const responseSchema = layer.route.stack
+        .map(s => s.handle.__openapiResponseSchema)
+        .find(Boolean);
 
       for (const method of Object.keys(layer.route.methods)) {
         if (method === '_all') continue;
         const op: OperationObject = {
           summary: `${method.toUpperCase()} ${path}`,
           tags: [tag],
-          responses: ENVELOPE_RESPONSES,
+          responses: envelopeResponses(responseSchema ? toJsonSchema(responseSchema) : {}),
         };
         if (requiresAuth) op.security = [{ bearerAuth: [] }];
         else if (allowsOptionalAuth) op.security = [{}, { bearerAuth: [] }];

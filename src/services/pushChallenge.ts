@@ -73,6 +73,41 @@ export async function sendPresenceChallenge(userId: string): Promise<boolean> {
   }
 }
 
+/** Send a user-facing notification through FCM. No token or body is logged. */
+export async function sendUserNotification(
+  userId: string,
+  title: string,
+  body: string,
+  action?: { type?: string; id?: string },
+): Promise<{ sent: boolean; providerRef?: string; permanentFailure?: boolean }> {
+  const firebase = getApp();
+  if (!firebase) return { sent: false, permanentFailure: true };
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { fcm_token: true } });
+  if (!user?.fcm_token) return { sent: false, permanentFailure: true };
+  try {
+    const { getMessaging } = require('firebase-admin/messaging');
+    const providerRef = await getMessaging(firebase).send({
+      token: user.fcm_token,
+      notification: { title: title.slice(0, 120), body: body.slice(0, 300) },
+      data: {
+        type: 'attenda_notification',
+        action_type: action?.type ?? '',
+        action_id: action?.id ?? '',
+      },
+      android: { priority: 'high' as const },
+    });
+    return { sent: true, providerRef };
+  } catch (error) {
+    const code = (error as { code?: string }).code;
+    if (code === 'messaging/registration-token-not-registered' || code === 'messaging/invalid-registration-token') {
+      await prisma.user.updateMany({ where: { id: userId, fcm_token: user.fcm_token }, data: { fcm_token: null, fcm_token_updated_at: null } });
+      return { sent: false, permanentFailure: true };
+    }
+    console.error(`[push] notification delivery failed for user ${userId}:`, code || (error as Error).message);
+    return { sent: false };
+  }
+}
+
 /** Test-only: reset the lazy-init state so env changes take effect. */
 export function _resetForTests(): void {
   app = null;

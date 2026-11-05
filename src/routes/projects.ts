@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type RequestHandler } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { created, noContent, NotFoundError, ok, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
@@ -8,10 +8,12 @@ import { createNotification, emitOrgEvent } from '../services/notifications';
 import { getSignedUploadUrl, getSignedDownloadUrl, isS3Configured } from '../services/s3';
 import { AppError } from '../utils/response';
 import { randomUUID } from 'node:crypto';
+import { idempotency } from '../middleware/idempotency';
 import multer from 'multer';
 import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { Prisma } from '@prisma/client';
 
 const router = Router();
 router.use(authenticate);
@@ -25,6 +27,24 @@ async function canAccessProject(projectId: string, userId: string, orgId: string
   if (member) return true;
   return !!await prisma.projectTask.findFirst({ where: { project_id: projectId, assignee_id: userId }, select: { id: true } });
 }
+
+const ensureTaskCommentAccess: RequestHandler = async (req, _res, next) => {
+  try {
+    const task = await prisma.projectTask.findFirst({ where: { id: String(req.params.taskId), project: { org_id: req.user!.org_id } }, select: { project_id: true } });
+    if (!task || !await canAccessProject(task.project_id, req.user!.sub, req.user!.org_id)) throw new NotFoundError('Project task');
+    next();
+  } catch (error) { next(error); }
+};
+
+const ensureTaskUpdateAccess: RequestHandler = async (req, _res, next) => {
+  try {
+    const task = await prisma.projectTask.findFirst({ where: { id: String(req.params.taskId), project: { org_id: req.user!.org_id } }, select: { project_id: true, assignee_id: true } });
+    if (!task) throw new NotFoundError('Project task');
+    const permissions = await resolveUserPermissions(req.user!.sub, req.user!.org_id);
+    if (!permissions.has('projects.tasks.manage') && task.assignee_id !== req.user!.sub) throw new NotFoundError('Project task');
+    next();
+  } catch (error) { next(error); }
+};
 
 const PROJECT_STATUSES = ['planning', 'active', 'on_hold', 'completed', 'cancelled'] as const;
 const PRIORITIES = ['low', 'medium', 'high', 'urgent'] as const;
@@ -73,11 +93,12 @@ router.get('/', requirePermission('projects.view'), async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-router.post('/', requirePermission('projects.manage'), async (req, res, next) => {
+router.post('/', requirePermission('projects.manage'), idempotency, async (req, res, next) => {
   try {
-    const { name, description, priority = 'medium', start_date, due_date, member_ids = [] } = req.body;
+    const { name, description, priority = 'medium', start_date, due_date, member_ids = [], budget_hours } = req.body;
     if (!String(name ?? '').trim()) throw new ValidationError('Project name is required');
     if (!PRIORITIES.includes(priority)) throw new ValidationError('Invalid project priority');
+    if (budget_hours !== undefined && budget_hours !== null && (!Number.isFinite(Number(budget_hours)) || Number(budget_hours) <= 0)) throw new ValidationError('Budget hours must be a positive number');
     const uniqueMembers = [...new Set([req.user!.sub, ...member_ids.map(String)])];
     const validCount = await prisma.user.count({ where: { id: { in: uniqueMembers }, org_id: req.user!.org_id, deleted_at: null } });
     if (validCount !== uniqueMembers.length) throw new ValidationError('One or more project members are invalid');
@@ -88,6 +109,7 @@ router.post('/', requirePermission('projects.manage'), async (req, res, next) =>
         owner_id: req.user!.sub,
         name: String(name).trim(), description: description?.trim() || null, priority,
         start_date: parseDate(start_date, 'start_date'), due_date: parseDate(due_date, 'due_date'),
+        budget_hours: budget_hours === undefined || budget_hours === null ? null : Number(budget_hours),
         members: { create: uniqueMembers.map(user_id => ({ user_id, role: user_id === req.user!.sub ? 'owner' : 'member' })) },
       },
       include: projectInclude,
@@ -97,13 +119,14 @@ router.post('/', requirePermission('projects.manage'), async (req, res, next) =>
   } catch (error) { next(error); }
 });
 
-router.put('/:id', requirePermission('projects.manage'), async (req, res, next) => {
+router.put('/:id', requirePermission('projects.manage'), idempotency, async (req, res, next) => {
   try {
     const project = await prisma.project.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
     if (!project) throw new NotFoundError('Project');
-    const { name, description, status, priority, start_date, due_date, status_options } = req.body;
+    const { name, description, status, priority, start_date, due_date, status_options, budget_hours } = req.body;
     if (status && !PROJECT_STATUSES.includes(status)) throw new ValidationError('Invalid project status');
     if (priority && !PRIORITIES.includes(priority)) throw new ValidationError('Invalid project priority');
+    if (budget_hours !== undefined && budget_hours !== null && (!Number.isFinite(Number(budget_hours)) || Number(budget_hours) <= 0)) throw new ValidationError('Budget hours must be a positive number');
     if (status_options !== undefined) {
       if (!Array.isArray(status_options) || status_options.length < 2 || status_options.length > 12 || !status_options.includes('todo') || status_options.some((value: unknown) => typeof value !== 'string' || !/^[a-z][a-z0-9_]{1,29}$/.test(value)) || new Set(status_options).size !== status_options.length) {
         throw new ValidationError('Task statuses must contain 2–12 unique labels using letters, numbers, and underscores');
@@ -119,6 +142,7 @@ router.put('/:id', requirePermission('projects.manage'), async (req, res, next) 
         ...(status && { status }), ...(priority && { priority }),
         ...(start_date !== undefined && { start_date: parseDate(start_date, 'start_date') }),
         ...(due_date !== undefined && { due_date: parseDate(due_date, 'due_date') }),
+        ...(budget_hours !== undefined && { budget_hours: budget_hours === null ? null : Number(budget_hours) }),
         ...(status_options !== undefined && { status_options }),
       },
       include: projectInclude,
@@ -128,7 +152,7 @@ router.put('/:id', requirePermission('projects.manage'), async (req, res, next) 
   } catch (error) { next(error); }
 });
 
-router.post('/:id/members', requirePermission('projects.manage'), async (req, res, next) => {
+router.post('/:id/members', requirePermission('projects.manage'), idempotency, async (req, res, next) => {
   try {
     const project = await prisma.project.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
     if (!project) throw new NotFoundError('Project');
@@ -144,7 +168,7 @@ router.post('/:id/members', requirePermission('projects.manage'), async (req, re
   } catch (error) { next(error); }
 });
 
-router.post('/:id/tasks', requirePermission('projects.tasks.manage'), async (req, res, next) => {
+router.post('/:id/tasks', requirePermission('projects.tasks.manage'), idempotency, async (req, res, next) => {
   try {
     const project = await prisma.project.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
     if (!project) throw new NotFoundError('Project');
@@ -179,7 +203,7 @@ router.post('/:id/tasks', requirePermission('projects.tasks.manage'), async (req
   } catch (error) { next(error); }
 });
 
-router.post('/tasks/:taskId/comments', async (req, res, next) => {
+router.post('/tasks/:taskId/comments', ensureTaskCommentAccess, idempotency, async (req, res, next) => {
   try {
     const task = await prisma.projectTask.findFirst({ where: { id: String(req.params.taskId), project: { org_id: req.user!.org_id } }, select: { id: true, project_id: true, title: true, assignee_id: true } });
     if (!task) throw new NotFoundError('Project task');
@@ -204,7 +228,7 @@ router.post('/tasks/:taskId/comments', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-router.put('/tasks/:taskId', async (req, res, next) => {
+router.put('/tasks/:taskId', ensureTaskUpdateAccess, idempotency, async (req, res, next) => {
   try {
     const task = await prisma.projectTask.findFirst({ where: { id: String(req.params.taskId), project: { org_id: req.user!.org_id } }, include: { project: { select: { status_options: true } } } });
     if (!task) throw new NotFoundError('Project task');
@@ -215,29 +239,65 @@ router.put('/tasks/:taskId', async (req, res, next) => {
     if (status && !task.project.status_options.includes(status)) throw new ValidationError('Invalid task status');
     if (priority && !PRIORITIES.includes(priority)) throw new ValidationError('Invalid task priority');
     let uniqueDependencies: string[] | undefined;
-    if (depends_on_ids !== undefined) {
+    if (canManage && depends_on_ids !== undefined) {
       if (!Array.isArray(depends_on_ids) || depends_on_ids.some((id: unknown) => typeof id !== 'string' || id === task.id)) throw new ValidationError('Invalid task dependencies');
       uniqueDependencies = [...new Set(depends_on_ids.map(String))];
       const matching = uniqueDependencies.length ? await prisma.projectTask.count({ where: { id: { in: uniqueDependencies }, project_id: task.project_id } }) : 0;
       if (matching !== uniqueDependencies.length) throw new ValidationError('Dependencies must be tasks in the same project');
     }
     const previousAssignee = task.assignee_id;
-    const updated = await prisma.projectTask.update({
+    const updateData = {
+      ...(canManage && title !== undefined && { title: String(title).trim() }),
+      ...(canManage && description !== undefined && { description: description?.trim() || null }),
+      ...(canManage && priority && { priority }), ...(canManage && assignee_id !== undefined && { assignee_id: assignee_id || null }),
+      ...(canManage && start_date !== undefined && { start_date: parseDate(start_date, 'start_date') }),
+      ...(canManage && due_date !== undefined && { due_date: parseDate(due_date, 'due_date') }),
+      ...(canManage && is_milestone !== undefined && { is_milestone: Boolean(is_milestone) }),
+      ...(canManage && uniqueDependencies !== undefined && { dependencies: { deleteMany: {}, create: uniqueDependencies.map(depends_on_id => ({ depends_on_id })) } }),
+      ...(status && { status, completed_at: status === 'done' ? new Date() : null }),
+    };
+    let previousDependencyIds: string[] | undefined;
+    const updateTask = (client: Pick<Prisma.TransactionClient, 'projectTask'>) => client.projectTask.update({
       where: { id: task.id },
-      data: {
-        ...(canManage && title !== undefined && { title: String(title).trim() }),
-        ...(canManage && description !== undefined && { description: description?.trim() || null }),
-        ...(canManage && priority && { priority }), ...(canManage && assignee_id !== undefined && { assignee_id: assignee_id || null }),
-        ...(canManage && start_date !== undefined && { start_date: parseDate(start_date, 'start_date') }),
-        ...(canManage && due_date !== undefined && { due_date: parseDate(due_date, 'due_date') }),
-        ...(canManage && is_milestone !== undefined && { is_milestone: Boolean(is_milestone) }),
-        ...(canManage && uniqueDependencies !== undefined && { dependencies: { deleteMany: {}, create: uniqueDependencies.map(depends_on_id => ({ depends_on_id })) } }),
-        ...(status && { status, completed_at: status === 'done' ? new Date() : null }),
-      },
+      data: updateData,
       include: { assignee: { select: { id: true, name: true, avatar_url: true } } },
     });
-    if (status !== undefined || assignee_id !== undefined || priority !== undefined) {
-      recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'project.task.update', entityType: 'project_task', entityId: task.id, before: { status: task.status, assignee_id: previousAssignee, priority: task.priority }, after: { status: updated.status, assignee_id: updated.assignee_id, priority: updated.priority } });
+    const updated = uniqueDependencies === undefined
+      ? await updateTask(prisma)
+      : await prisma.$transaction(async tx => {
+          // Serialize dependency graph edits per project so concurrent edits
+          // cannot both pass the cycle check and create a loop.
+          await tx.$queryRaw`SELECT "id" FROM "projects" WHERE "id" = ${task.project_id} FOR UPDATE`;
+          const edges = await tx.projectTaskDependency.findMany({
+            where: { task: { project_id: task.project_id }, task_id: { not: task.id } },
+            select: { task_id: true, depends_on_id: true },
+          });
+          previousDependencyIds = (await tx.projectTaskDependency.findMany({
+            where: { task_id: task.id }, select: { depends_on_id: true },
+          })).map(edge => edge.depends_on_id);
+          const graph = new Map<string, string[]>();
+          for (const edge of edges) graph.set(edge.task_id, [...(graph.get(edge.task_id) ?? []), edge.depends_on_id]);
+          const reachesTask = (node: string, visited = new Set<string>()): boolean => {
+            if (node === task.id) return true;
+            if (visited.has(node)) return false;
+            visited.add(node);
+            return (graph.get(node) ?? []).some(next => reachesTask(next, visited));
+          };
+          if (uniqueDependencies.some(dependencyId => reachesTask(dependencyId))) {
+            throw new ValidationError('These dependencies would create a cycle. Remove a dependency path that leads back to this task.');
+          }
+          return updateTask(tx);
+        });
+    if (status !== undefined || assignee_id !== undefined || priority !== undefined || uniqueDependencies !== undefined) {
+      recordAudit({
+        orgId: req.user!.org_id,
+        actorId: req.user!.sub,
+        action: 'project.task.update',
+        entityType: 'project_task',
+        entityId: task.id,
+        before: { status: task.status, assignee_id: previousAssignee, priority: task.priority, ...(previousDependencyIds && { depends_on_ids: previousDependencyIds }) },
+        after: { status: updated.status, assignee_id: updated.assignee_id, priority: updated.priority, ...(uniqueDependencies && { depends_on_ids: uniqueDependencies }) },
+      });
     }
     if (canManage && assignee_id && assignee_id !== previousAssignee && assignee_id !== req.user!.sub) {
       createNotification({ userId: assignee_id, orgId: req.user!.org_id, type: 'project_task_assigned', title: 'A project task was assigned to you', body: updated.title, actionType: 'project_task', actionId: updated.id }).catch(() => {});
@@ -280,7 +340,7 @@ router.post('/:id/attachments/upload-url', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-router.post('/:id/attachments/upload-local', localUpload.single('file'), async (req, res, next) => {
+router.post('/:id/attachments/upload-local', localUpload.single('file'), idempotency, async (req, res, next) => {
   try {
     if (process.env.NODE_ENV === 'production') throw new AppError('File storage is not configured', 503, 'S3_NOT_CONFIGURED');
     const project = await prisma.project.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
@@ -304,7 +364,7 @@ router.post('/:id/attachments/upload-local', localUpload.single('file'), async (
   } catch (error) { next(error); }
 });
 
-router.post('/:id/attachments', async (req, res, next) => {
+router.post('/:id/attachments', idempotency, async (req, res, next) => {
   try {
     const project = await prisma.project.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
     if (!project) throw new NotFoundError('Project');
@@ -390,7 +450,7 @@ router.get('/:id/calendar.ics', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-router.delete('/:id', requirePermission('projects.manage'), async (req, res, next) => {
+router.delete('/:id', requirePermission('projects.manage'), idempotency, async (req, res, next) => {
   try {
     const project = await prisma.project.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
     if (!project) throw new NotFoundError('Project');

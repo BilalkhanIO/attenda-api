@@ -1,11 +1,12 @@
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
-import { orgWebhookSchema } from '../schemas';
+import { orgWebhookSchema, WEBHOOK_EVENT_CATALOG, WEBHOOK_SCHEMA_VERSION } from '../schemas';
 import { ok, created, noContent, NotFoundError } from '../utils/response';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
 import { deliverToWebhook, generateWebhookSecret } from '../services/webhookDelivery';
+import { idempotency } from '../middleware/idempotency';
 
 /**
  * Outbound webhook management. Mounted at /org/outbound-webhooks; every route
@@ -23,6 +24,10 @@ import { deliverToWebhook, generateWebhookSecret } from '../services/webhookDeli
 const router = Router();
 router.use(authenticate);
 router.use(requirePermission('org.settings.update'));
+
+router.get('/catalogue', (_req, res) => {
+  ok(res, { current_schema_version: WEBHOOK_SCHEMA_VERSION, events: WEBHOOK_EVENT_CATALOG });
+});
 
 // Everything except the secret.
 const WEBHOOK_SELECT = {
@@ -56,7 +61,7 @@ router.get('/:id/deliveries', async (req, res, next) => {
       where: { org_id: req.user!.org_id, webhook_id: hook.id },
       orderBy: { created_at: 'desc' }, take: limit,
       select: {
-        id: true, event: true, status: true, attempts: true,
+        id: true, event: true, schema_version: true, status: true, attempts: true,
         next_attempt_at: true, last_attempt_at: true, delivered_at: true,
         response_status: true, last_error: true, created_at: true,
       },
@@ -65,7 +70,7 @@ router.get('/:id/deliveries', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
-router.post('/:id/deliveries/:deliveryId/replay', async (req, res, next) => {
+router.post('/:id/deliveries/:deliveryId/replay', idempotency, async (req, res, next) => {
   try {
     const webhookId = String(req.params.id);
     const deliveryId = String(req.params.deliveryId);
@@ -82,8 +87,22 @@ router.post('/:id/deliveries/:deliveryId/replay', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+router.post('/:id/rotate-secret', idempotency, async (req, res, next) => {
+  try {
+    const existing = await prisma.orgWebhook.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id } });
+    if (!existing) throw new NotFoundError('Webhook');
+    const secret = generateWebhookSecret();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60_000);
+    await prisma.orgWebhook.update({ where: { id: existing.id }, data: {
+      secret, previous_secret: existing.secret, previous_secret_expires_at: expiresAt,
+    } });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'org.webhook.secret.rotate', entityType: 'org_webhook', entityId: existing.id, after: { grace_expires_at: expiresAt } });
+    ok(res, { id: existing.id, secret, previous_secret_expires_at: expiresAt });
+  } catch (e) { next(e); }
+});
+
 // ─── POST /org/outbound-webhooks ───────────────────────
-router.post('/', validate({ body: orgWebhookSchema }), async (req, res, next) => {
+router.post('/', idempotency, validate({ body: orgWebhookSchema }), async (req, res, next) => {
   try {
     const { url, events } = req.body;
     const secret = generateWebhookSecret();
@@ -109,7 +128,7 @@ router.post('/', validate({ body: orgWebhookSchema }), async (req, res, next) =>
 });
 
 // ─── DELETE /org/outbound-webhooks/:id ─────────────────
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', idempotency, async (req, res, next) => {
   try {
     const hook = await prisma.orgWebhook.findFirst({
       where: { id: String(req.params.id), org_id: req.user!.org_id },
@@ -129,7 +148,7 @@ router.delete('/:id', async (req, res, next) => {
 // ─── POST /org/outbound-webhooks/:id/test ──────────────
 // Sends a signed 'test' event so receivers can verify their endpoint +
 // signature handling. Updates the hook's success/failure bookkeeping.
-router.post('/:id/test', async (req, res, next) => {
+router.post('/:id/test', idempotency, async (req, res, next) => {
   try {
     const hook = await prisma.orgWebhook.findFirst({
       where: { id: String(req.params.id), org_id: req.user!.org_id },

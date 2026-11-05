@@ -10,6 +10,7 @@ export const FEATURE_KEYS = [
   'api_access',
   'advanced_reports',
   'multi_location',
+  'time_tracking',
 ] as const;
 
 export type FeatureKey = (typeof FEATURE_KEYS)[number];
@@ -34,6 +35,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'attendance.export', module: 'attendance', description: 'Export attendance reports' },
   { key: 'attendance.late_notices.manage', module: 'attendance', description: 'Acknowledge late arrival notices' },
   { key: 'attendance.review_flags', module: 'attendance', description: 'Review flagged attendance check-ins' },
+  { key: 'attendance.devices.manage', module: 'attendance', description: 'Review and revoke trusted employee attendance devices' },
   // Leave
   { key: 'leave.view_team', module: 'leave', description: 'View team leave requests' },
   { key: 'leave.approve', module: 'leave', description: 'Approve or reject leave requests' },
@@ -49,12 +51,18 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'shifts.ai_schedule', module: 'shifts', description: 'Use AI scheduling' },
   { key: 'shifts.availability.manage', module: 'shifts', description: 'Review employee availability requests' },
   { key: 'shifts.coverage.manage', module: 'shifts', description: 'Set shift coverage requirements' },
+  { key: 'labor_cost.view', module: 'shifts', description: 'View aggregate schedule labor cost and overtime exposure' },
+  { key: 'labor_cost.manage', module: 'shifts', description: 'Manage weekly schedule labor budgets' },
+  { key: 'compliance.view', module: 'compliance', description: 'View labor compliance rules and schedule findings' },
+  { key: 'compliance.manage', module: 'compliance', description: 'Manage versioned labor compliance rules' },
+  { key: 'compliance.override', module: 'compliance', description: 'Override blocking schedule findings with an audited reason' },
   // Payroll
   { key: 'payroll.view', module: 'payroll', description: 'View payroll records' },
   { key: 'payroll.manage', module: 'payroll', description: 'Generate and adjust payroll' },
   { key: 'payroll.process', module: 'payroll', description: 'Process payroll runs' },
   // Employees
   { key: 'employees.view_team', module: 'employees', description: 'View direct reports' },
+  { key: 'employees.view_location', module: 'employees', description: 'View employees assigned to managed locations' },
   { key: 'employees.view', module: 'employees', description: 'View all employees in org' },
   { key: 'employees.create', module: 'employees', description: 'Invite employees' },
   { key: 'employees.update', module: 'employees', description: 'Update employee profiles' },
@@ -65,6 +73,7 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'org.settings.view', module: 'org', description: 'View org settings' },
   { key: 'org.settings.update', module: 'org', description: 'Update org settings' },
   { key: 'org.audit.view', module: 'org', description: 'View organization audit history' },
+  { key: 'org.events.replay', module: 'org', description: 'Inspect and replay dead-lettered transactional events' },
   { key: 'org.office.update', module: 'org', description: 'Manage office IPs and SSIDs' },
   { key: 'org.whatsapp.update', module: 'org', description: 'Configure WhatsApp integration' },
   { key: 'org.qr.manage', module: 'org', description: 'Manage check-in QR codes' },
@@ -72,6 +81,8 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'org.roles.manage', module: 'org', description: 'Manage custom org roles' },
   { key: 'org.announcements.send', module: 'org', description: 'Send org announcements and view read receipts' },
   { key: 'org.permissions.grant', module: 'org', description: 'Grant per-user permission overrides' },
+  { key: 'org.locations.view', module: 'org', description: 'View organization locations' },
+  { key: 'org.locations.manage', module: 'org', description: 'Manage organization locations and managers' },
   // Analytics & reports
   { key: 'analytics.view', module: 'analytics', description: 'View analytics dashboards' },
   { key: 'analytics.advanced', module: 'analytics', description: 'Advanced analytics and anomalies' },
@@ -85,6 +96,9 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   { key: 'projects.view', module: 'projects', description: 'View assigned projects and tasks' },
   { key: 'projects.manage', module: 'projects', description: 'Create and manage projects and members' },
   { key: 'projects.tasks.manage', module: 'projects', description: 'Create and assign project tasks' },
+  { key: 'time.view', module: 'time', description: 'View and manage own project time entries' },
+  { key: 'time.view_team', module: 'time', description: 'View team project time and reports' },
+  { key: 'time.approve', module: 'time', description: 'Review and lock submitted timesheets' },
   // Remote work
   { key: 'remote.approve', module: 'remote', description: 'Approve remote work sessions' },
   // WhatsApp
@@ -101,6 +115,8 @@ export const PERMISSION_CATALOG: PermissionDef[] = [
   // Onboarding
   { key: 'onboarding.manage', module: 'onboarding', description: 'Manage onboarding templates and assignments' },
   { key: 'onboarding.view_team', module: 'onboarding', description: 'View team onboarding progress' },
+  { key: 'offboarding.manage', module: 'offboarding', description: 'Manage employee exit cases and asset returns' },
+  { key: 'offboarding.view_team', module: 'offboarding', description: 'View organization offboarding cases' },
   // Platform (cross-tenant)
   { key: 'platform.orgs.view', module: 'platform', description: 'View organisations' },
   { key: 'platform.orgs.manage', module: 'platform', description: 'Manage organisation subscriptions' },

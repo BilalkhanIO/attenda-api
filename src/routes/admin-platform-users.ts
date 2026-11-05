@@ -3,6 +3,7 @@ import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, NotFoundError, ValidationError, ForbiddenError } from '../utils/response';
 import { hashPassword } from '../utils/auth';
 import prisma from '../utils/prisma';
+import { idempotency } from '../middleware/idempotency';
 
 const router = Router();
 router.use(authenticate);
@@ -108,7 +109,7 @@ router.get('/:id', requirePermission('platform.users.manage'), async (req: Reque
 });
 
 // ─── POST /admin/users ─────────────────────────────────
-router.post('/', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('platform.users.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, email, password, roles } = req.body;
     
@@ -175,7 +176,7 @@ router.post('/', requirePermission('platform.users.manage'), async (req: Request
 });
 
 // ─── PUT /admin/users/:id ──────────────────────────────
-router.put('/:id', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', requirePermission('platform.users.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     const { name, email, password, roles } = req.body;
@@ -243,7 +244,7 @@ router.put('/:id', requirePermission('platform.users.manage'), async (req: Reque
 });
 
 // ─── DELETE /admin/users/:id ───────────────────────────
-router.delete('/:id', requirePermission('platform.users.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', requirePermission('platform.users.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     // Prevent self-deletion

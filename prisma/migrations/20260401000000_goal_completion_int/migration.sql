@@ -13,6 +13,10 @@ BEGIN
        SET completion = '0'
      WHERE completion !~ '^[0-9]+$';
 
+    -- PostgreSQL cannot cast a column while its text default is attached.
+    ALTER TABLE performance_goals
+      ALTER COLUMN completion DROP DEFAULT;
+
     ALTER TABLE performance_goals
       ALTER COLUMN completion TYPE INTEGER
       USING completion::INTEGER;

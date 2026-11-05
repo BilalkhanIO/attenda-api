@@ -118,4 +118,26 @@ describe('computePeriodPayroll', () => {
     expect(t.pension_deduction).toBeCloseTo(8);
     expect(t.net_pay).toBeCloseTo(160 - 16 - 8);
   });
+
+  it('calculates daily pay from attended 8-hour equivalents and deducts unpaid days at the daily rate', () => {
+    const t = computePeriodPayroll({
+      ...periodBase, attendance: [{ net_hours_worked: 8, overtime_hours: 2, shift: { overtime_multiplier: 1.5 } }, { net_hours_worked: 8 }],
+      pay_basis: 'daily', pay_rate_amount: 100, hourly_rate: 12.5, unpaid_leave_days: 1,
+    }, 0, 0);
+    expect(t.base_pay).toBe(200);
+    expect(t.unpaid_deduction).toBe(100);
+    expect(t.overtime_pay).toBe(37.5);
+    expect(t.gross_pay).toBe(137.5);
+  });
+
+  it('uses the configurable monthly divisor for unpaid leave and overtime equivalents', () => {
+    const t = computePeriodPayroll({
+      ...periodBase, attendance: [{ net_hours_worked: 8, overtime_hours: 2, shift: { overtime_multiplier: 1.5 } }],
+      pay_basis: 'monthly', pay_rate_amount: 52000, monthly_pay_divisor: 26, hourly_rate: 250, unpaid_leave_days: 1,
+    }, 0, 0);
+    expect(t.base_pay).toBe(52000);
+    expect(t.unpaid_deduction).toBe(2000);
+    expect(t.overtime_pay).toBe(750);
+    expect(t.gross_pay).toBe(50750);
+  });
 });

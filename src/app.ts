@@ -14,6 +14,7 @@ import prisma from './utils/prisma';
 import authRouter       from './routes/auth';
 import usersRouter      from './routes/users';
 import attendanceRouter from './routes/attendance';
+import attendanceDevicesRouter from './routes/attendance-devices';
 import leaveRouter      from './routes/leave';
 import shiftsRouter     from './routes/shifts';
 import shiftFieldOpsRouter from './routes/shift-field-ops';
@@ -28,6 +29,9 @@ import expensesRouter from './routes/expenses';
 import documentsRouter from './routes/documents';
 import orgRbacRouter from './routes/org-rbac';
 import orgWebhooksRouter from './routes/org-webhooks';
+import apiKeysRouter from './routes/api-keys';
+import integrationsV1Router from './routes/integrations-v1';
+import calendarFeedRouter from './routes/calendar-feed';
 import webhooksRouter from './routes/webhooks';
 import adminRouter         from './routes/admin';
 import adminPlatformUsersRouter from './routes/admin-platform-users';
@@ -38,6 +42,13 @@ import kudosRouter         from './routes/kudos';
 import notificationsRouter from './routes/notifications';
 import publicRouter        from './routes/public';
 import projectsRouter      from './routes/projects';
+import timeTrackingRouter from './routes/time-tracking';
+import complianceRouter from './routes/compliance';
+import offboardingRouter from './routes/offboarding';
+import locationsRouter from './routes/locations';
+import cspReportRouter from './routes/csp-report';
+import dashboardRouter from './routes/dashboard';
+import myRequestsRouter from './routes/my-requests';
 import { errorHandler, notFound } from './middleware/errorHandler';
 import { verifyAccessToken } from './utils/auth';
 
@@ -48,6 +59,9 @@ app.set('trust proxy', 1);
 
 // ─── Security & Parsing ───────────────────────────────
 app.use(helmet());
+// This same-origin Next rewrite is a public browser report endpoint; it uses
+// its own Redis-backed IP limit and does not need API CORS headers.
+app.use('/csp-report', cspReportRouter);
 const allowedOrigins = new Set(
   (process.env.FRONTEND_URL || 'http://localhost:3000')
     .split(',')
@@ -107,8 +121,11 @@ const globalLimiter = rateLimit({
   keyGenerator: (req) => {
     const authorization = req.headers.authorization;
     if (authorization?.startsWith('Bearer ')) {
+      const credential = authorization.slice(7);
+      const apiKeyPrefix = /^attenda_([a-f0-9]{16})_/.exec(credential)?.[1];
+      if (apiKeyPrefix) return `api-key:${apiKeyPrefix}`;
       try {
-        const payload = verifyAccessToken(authorization.slice(7));
+        const payload = verifyAccessToken(credential);
         if (payload.sub) return `user:${payload.sub}`;
       } catch { /* fall back to the source IP for invalid tokens */ }
     }
@@ -174,31 +191,41 @@ const API = '/api/v1';
 // The mount table doubles as the OpenAPI generator's route source —
 // add new routers here and they appear in /api/v1/openapi.json.
 const MOUNTS: Array<[string, express.Router]> = [
+  [`${API}/dashboard`, dashboardRouter],
+  [`${API}/my-requests`, myRequestsRouter],
   [`${API}/auth`,            authRouter],
   [`${API}/users`,           usersRouter],
   // corrections mounts before the attendance router so its paths are not
   // swallowed by /attendance/:userId
   [`${API}/attendance/corrections`, correctionsRouter],
+  [`${API}/attendance/devices`, attendanceDevicesRouter],
   [`${API}/approvals`,          approvalsRouter],
   [`${API}/attendance`,      attendanceRouter],
   [`${API}/leave`,           leaveRouter],
   [`${API}/shifts/planning`, shiftPlanningRouter],
+  [`${API}/compliance`, complianceRouter],
   [`${API}/shifts`,          shiftFieldOpsRouter],
   [`${API}/shifts`,          shiftsRouter],
   [`${API}/payroll`,         payrollRouter],
   [`${API}/expenses`,        expensesRouter],
   [`${API}/documents`,       documentsRouter],
   [`${API}/onboarding`,      onboardingRouter],
+  [`${API}/offboarding`,     offboardingRouter],
   [`${API}/kudos`,           kudosRouter],
   [`${API}/performance`,     performanceRouter],
   [`${API}/projects`,        projectsRouter],
+  [`${API}/time`,            timeTrackingRouter],
   [`${API}/analytics`,       analyticsRouter],
   [`${API}/ai`,              aiRouter],
   [`${API}/org/departments`, departmentsRouter],
+  [`${API}/locations`, locationsRouter],
   [`${API}/org/holidays`,    holidaysRouter],
   // outbound-webhooks mounts before the generic /org routers so its paths
   // are not swallowed by their parameterised routes
   [`${API}/org/outbound-webhooks`, orgWebhooksRouter],
+  [`${API}/org/api-keys`, apiKeysRouter],
+  [`${API}/integrations/v1`, integrationsV1Router],
+  [`${API}/calendar`, calendarFeedRouter],
   [`${API}/org`,             orgRouter],
   [`${API}/org`,             orgRbacRouter],
   [`${API}/reports`,         reportsRouter],

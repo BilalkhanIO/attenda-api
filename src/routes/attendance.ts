@@ -7,17 +7,26 @@ import {
   attendanceReviewResolveSchema,
 } from '../schemas';
 import { ok, NotFoundError, ForbiddenError, ValidationError, AppError } from '../utils/response';
-import { startOfDay, calcHoursWorked, isOfficeNetwork } from '../utils/auth';
+import { calcHoursWorked, isOfficeNetwork } from '../utils/auth';
 import { lateThresholdFor, earlyOutMinutes, adherenceScore, scheduledWindow, scheduledInstant, dateOnlyInTz, hhmmToMins } from '../utils/shift';
 import { settleBreaks, netHoursWorked, netExtraMinutesAfterShift, calculateBreakTotals } from '../utils/attendance';
 import prisma from '../utils/prisma';
 import type { Shift, ShiftBreak } from '@prisma/client';
 import { recordAudit } from '../services/audit';
 import { createNotification, emitOrgEvent } from '../services/notifications';
-import { resolveUserPermissions } from '../services/authorization';
-import { evaluateCheckinLocation, parseAttendanceSecurity } from '../utils/attendanceSecurity';
+import { hasFeature, resolveOrgFeatures, resolveUserPermissions } from '../services/authorization';
+import { reviewableEmployeeIds, scopedEmployeeIds } from '../services/locationScope';
+import { reviewApproval } from '../services/approval-workflows';
+import { evaluateCheckinLocation, parseAttendanceSecurity, parseLocationGeofence } from '../utils/attendanceSecurity';
 import { issueAttendanceClockAnchor, verifyAttendanceClockAnchor } from '../utils/attendanceClock';
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey, timingSafeEqual, verify as verifySignature } from 'node:crypto';
+import { decodeCursor, encodeCursor, keysetAfter } from '../utils/cursor';
+import { idempotency } from '../middleware/idempotency';
+import { resolveAttendanceEventTime } from '../utils/offlineAttendanceEvent';
+import { fromZonedTime } from 'date-fns-tz';
+import { randomUUID } from 'node:crypto';
+import redis from '../utils/redis';
+import { attendanceSyncSchema } from '../schemas/attendance-sync';
 
 const router = Router();
 router.use(authenticate);
@@ -27,6 +36,162 @@ const RECORD_INCLUDE = {
   shift: { select: { id: true, name: true, start_time: true, end_time: true, color: true, overtime_enabled: true, overtime_requires_approval: true, extra_time_label: true } },
   break_records: { orderBy: { break_start: 'asc' } },
 } as const;
+
+const syncActionPath = { checkin: '/checkin', checkout: '/checkout', break_start: '/break/start', break_end: '/break/end' } as const;
+
+router.post('/sync', validate({ body: attendanceSyncSchema }), async (req, res, next) => {
+  const owner = randomUUID();
+  const lockKey = `attendance-sync:${req.user!.org_id}:${req.user!.sub}`;
+  let lockAcquired = false;
+  try {
+    const authorization = req.get('authorization');
+    if (!authorization?.startsWith('Bearer ')) throw new AppError('Batch attendance sync requires bearer-token authentication.', 401, 'UNAUTHENTICATED');
+    let lock: string | null;
+    try { lock = await redis.set(lockKey, owner, 'PX', 10 * 60_000, 'NX'); }
+    catch { throw new AppError('Attendance sync coordination is temporarily unavailable. Keep the events queued and retry.', 503, 'SYNC_COORDINATION_UNAVAILABLE'); }
+    if (lock !== 'OK') throw new AppError('An attendance sync is already running for this account.', 409, 'ATTENDANCE_SYNC_IN_PROGRESS');
+    lockAcquired = true;
+    const events = req.body.events as Array<{ sequence: number; idempotency_key: string; type: keyof typeof syncActionPath; payload: Record<string, unknown> }>;
+    const now = new Date();
+    const previous = await prisma.attendanceSyncWatermark.findUnique({ where: { org_id_user_id: { org_id: req.user!.org_id, user_id: req.user!.sub } }, select: { last_sequence: true } });
+    await prisma.attendanceSyncWatermark.upsert({
+      where: { org_id_user_id: { org_id: req.user!.org_id, user_id: req.user!.sub } },
+      create: { org_id: req.user!.org_id, user_id: req.user!.sub, last_sequence: Math.max(...events.map(event => event.sequence)), pending_until: new Date(now.getTime() + 5 * 60_000) },
+      update: { last_sequence: Math.max(previous?.last_sequence ?? 0, ...events.map(event => event.sequence)), pending_until: new Date(now.getTime() + 5 * 60_000) },
+    });
+
+    const internalOrigin = (process.env.API_INTERNAL_ORIGIN || `http://127.0.0.1:${process.env.PORT || '5000'}`).replace(/\/$/, '');
+    const outcomes: Array<Record<string, unknown>> = [];
+    let stopReason: string | null = null;
+    for (const event of events) {
+      if (stopReason) {
+        outcomes.push({ sequence: event.sequence, idempotency_key: event.idempotency_key, result: 'not_attempted', reason: stopReason });
+        continue;
+      }
+      try {
+        await prisma.attendanceSyncWatermark.update({ where: { org_id_user_id: { org_id: req.user!.org_id, user_id: req.user!.sub } }, data: { pending_until: new Date(Date.now() + 5 * 60_000) } });
+        const actionBody: Record<string, unknown> = { ...event.payload, offline: true, idempotency_key: event.idempotency_key };
+        if (event.type === 'checkin') actionBody.type = 'manual';
+        const response = await fetch(`${internalOrigin}/api/v1/attendance${syncActionPath[event.type]}`, {
+          method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(15_000),
+          headers: {
+            authorization,
+            'content-type': 'application/json',
+            'idempotency-key': event.idempotency_key,
+            'x-forwarded-for': req.ip || '',
+            'user-agent': 'Attenda-Offline-Sync/1.0',
+          },
+          body: JSON.stringify(actionBody),
+        });
+        const raw = await response.text();
+        let body: any = null;
+        try { body = raw ? JSON.parse(raw) : null; } catch { body = null; }
+        if (response.ok && body?.success !== false) {
+          outcomes.push({ sequence: event.sequence, idempotency_key: event.idempotency_key, result: body?.data?.idempotent || body?.data?.action === 'already_recorded' ? 'duplicate' : 'applied', data: body?.data ?? null });
+          continue;
+        }
+        const code = typeof body?.code === 'string' ? body.code : `HTTP_${response.status}`;
+        const rejected = response.status === 400 || response.status === 422;
+        const permanent = response.status >= 400 && response.status < 500 && response.status !== 401 && response.status !== 408 && response.status !== 429;
+        const result = rejected ? 'rejected' : permanent ? 'parked_for_review' : 'retry';
+        outcomes.push({ sequence: event.sequence, idempotency_key: event.idempotency_key, result, status: response.status, code, message: body?.error ?? 'Attendance event sync failed.' });
+        stopReason = `Sequence ${event.sequence} was ${result}; later actions were held to preserve order.`;
+      } catch (error) {
+        outcomes.push({ sequence: event.sequence, idempotency_key: event.idempotency_key, result: 'retry', code: 'SYNC_TRANSPORT_ERROR', message: 'The event outcome could not be confirmed; retrying uses the same idempotency key.' });
+        stopReason = `Sequence ${event.sequence} could not be confirmed; later actions were held to preserve order.`;
+      }
+    }
+    const pending = outcomes.some(item => ['retry', 'not_attempted'].includes(String(item.result)));
+    await prisma.attendanceSyncWatermark.update({
+      where: { org_id_user_id: { org_id: req.user!.org_id, user_id: req.user!.sub } },
+      data: { pending_until: pending ? new Date(Date.now() + 5 * 60_000) : null, last_sync_at: new Date() },
+    });
+    ok(res, { outcomes, last_sequence: Math.max(previous?.last_sequence ?? 0, ...events.map(event => event.sequence)), pending });
+  } catch (error) {
+    // If the process aborts mid-batch, retain its short pending lease so
+    // late/absent detectors don't race events whose commit result is unknown.
+    next(error);
+  } finally {
+    if (lockAcquired) await redis.eval("if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end", 1, lockKey, owner).catch(() => {});
+  }
+});
+
+function actionEventTime(req: Request, receivedAt = new Date()) {
+  if (req.body?.offline && req.get('Idempotency-Key') !== req.body?.idempotency_key) {
+    throw new AppError('Offline attendance sync requires a matching Idempotency-Key header.', 400, 'IDEMPOTENCY_KEY_REQUIRED');
+  }
+  return resolveAttendanceEventTime(req.body ?? {}, req.user!.sub, req.user!.org_id, receivedAt);
+}
+
+function payloadHash(body: unknown): string {
+  const stableBody = body && typeof body === 'object'
+    ? Object.fromEntries(Object.entries(body).filter(([key]) => key !== 'offline'))
+    : body;
+  return createHash('sha256').update(JSON.stringify(stableBody)).digest('hex');
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${stableJson(object[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value) ?? 'null';
+}
+
+async function notifyOfflineAttendanceReview(userId: string, orgId: string, recordId: string, action: string) {
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { name: true, manager_id: true } });
+  if (!user?.manager_id) return;
+  await createNotification({
+    userId: user.manager_id, orgId, type: 'attendance_checkin_review',
+    title: 'Offline attendance needs review',
+    body: `${user.name} synced an offline ${action} with uncertain timing. Review the attendance evidence before using it for payroll decisions.`,
+    actionType: 'attendance', actionId: recordId,
+  }).catch((error) => console.error('[Attendance] Could not notify manager about offline review:', error));
+}
+
+async function resolvePriorNoShowAlerts(userId: string, orgId: string, recordId: string, attendanceDate: Date, timezone: string) {
+  const date = attendanceDate.toISOString().slice(0, 10);
+  const start = fromZonedTime(`${date}T00:00:00`, timezone);
+  const nextDate = new Date(`${date}T00:00:00.000Z`);
+  nextDate.setUTCDate(nextDate.getUTCDate() + 1);
+  const end = fromZonedTime(`${nextDate.toISOString().slice(0, 10)}T00:00:00`, timezone);
+  const alerts = await prisma.inAppNotification.findMany({
+    where: {
+      org_id: orgId, action_id: userId,
+      type: { in: ['attendance_late', 'attendance_late_escalation', 'attendance_absent'] },
+      created_at: { gte: start, lt: end },
+    },
+    take: 100,
+  });
+  const noShowAlerts = alerts.filter(alert =>
+    alert.title === 'Employee late' ||
+    alert.title === 'Employee late (past expected time)' ||
+    alert.title === '1-hour late escalation' ||
+    alert.title === 'Employee absent',
+  );
+  const resolvedAt = new Date();
+  await Promise.all(noShowAlerts.filter(alert => !alert.title.startsWith('Resolved · ')).map(alert => {
+    const metadata = alert.metadata && typeof alert.metadata === 'object' && !Array.isArray(alert.metadata)
+      ? alert.metadata as Record<string, unknown>
+      : {};
+    return prisma.inAppNotification.update({
+      where: { id: alert.id },
+      data: {
+        title: `Resolved · ${alert.title}`,
+        body: `${alert.body}\n\nResolved: the employee's check-in for this work date has now been received. The original alert is retained for context.`,
+        metadata: { ...metadata, resolved_reason: 'attendance_checkin_reconciled', resolved_at: resolvedAt.toISOString() },
+      },
+    });
+  }));
+  const resolvedIds = noShowAlerts.filter(alert => !alert.title.startsWith('Resolved · ')).map(alert => alert.id);
+  if (resolvedIds.length) await recordAudit({
+    orgId, actorId: userId, action: 'attendance.no_show_alerts.resolved',
+    entityType: 'attendance_record', entityId: recordId,
+    before: { stale_notification_ids: resolvedIds },
+    after: { reason: 'attendance_checkin_reconciled', work_date: date },
+  });
+}
 
 router.get('/reviews', requirePermission('attendance.review_flags'), async (req, res, next) => {
   try {
@@ -41,7 +206,7 @@ router.get('/reviews', requirePermission('attendance.review_flags'), async (req,
   } catch (e) { next(e); }
 });
 
-router.put('/reviews/:id/resolve', requirePermission('attendance.review_flags'), validate({ body: attendanceReviewResolveSchema }), async (req, res, next) => {
+router.put('/reviews/:id/resolve', requirePermission('attendance.review_flags'), idempotency, validate({ body: attendanceReviewResolveSchema }), async (req, res, next) => {
   try {
     const id = String(req.params.id);
     const { decision, note } = req.body as { decision: 'approve' | 'reject' | 'request_recheck'; note: string };
@@ -71,13 +236,22 @@ router.put('/reviews/:id/resolve', requirePermission('attendance.review_flags'),
   } catch (e) { next(e); }
 });
 
-async function orgTimeContext(orgId: string) {
+async function orgTimeContext(orgId: string, userId?: string) {
   const org = await prisma.organisation.findUnique({
     where: { id: orgId },
-    select: { timezone: true, late_threshold: true, gap_forgiveness_mins: true, attendance_security: true },
+    select: { timezone: true, late_threshold: true, gap_forgiveness_mins: true, attendance_security: true, wifi_auto_checkin_enabled: true, wifi_auto_checkout_enabled: true, heartbeat_grace_mins: true },
   });
-  const timezone = org?.timezone ?? 'UTC';
-  return { org, timezone, today: dateOnlyInTz(new Date(), timezone) };
+  const employee = userId ? await prisma.user.findFirst({
+    where: { id: userId, org_id: orgId },
+    select: { primary_location: { select: { id: true, timezone: true, office_ips: true, office_ssids: true, geofence: true } } },
+  }) : null;
+  const mainLocation = !employee?.primary_location ? await prisma.location.findFirst({
+    where: { org_id: orgId, is_main: true, is_active: true },
+    select: { id: true, timezone: true, office_ips: true, office_ssids: true, geofence: true },
+  }) : null;
+  const location = employee?.primary_location ?? mainLocation;
+  const timezone = location?.timezone ?? org?.timezone ?? 'UTC';
+  return { org, location, timezone, today: dateOnlyInTz(new Date(), timezone) };
 }
 
 function parseDateOnly(value: string, field = 'date'): Date {
@@ -194,17 +368,44 @@ async function createAwayGapBreak(record: any, reentryTime: Date, opts: { countA
 router.get('/today', requirePermission('attendance.view_team'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rawDate = req.query.date as string | undefined;
-    const { today } = await orgTimeContext(req.user!.org_id);
-    const date = rawDate ? parseDateOnly(rawDate) : today;
-    const where: Record<string, unknown> = { org_id: req.user!.org_id, date };
+    let visibleUserIds: string[] | undefined;
     if (!req.permissions?.has('employees.view')) {
-      const teamIds = await prisma.user.findMany({
-        where: { manager_id: req.user!.sub, is_active: true },
-        select: { id: true },
-      });
-      where.user_id = { in: teamIds.map((u: { id: string }) => u.id) };
+      const [directReports, managedLocations] = await Promise.all([
+        req.permissions?.has('employees.view_team')
+          ? prisma.user.findMany({ where: { org_id: req.user!.org_id, manager_id: req.user!.sub, is_active: true, deleted_at: null }, select: { id: true } })
+          : Promise.resolve([] as { id: string }[]),
+        req.permissions?.has('employees.view_location')
+          ? prisma.locationManager.findMany({ where: { user_id: req.user!.sub, location: { org_id: req.user!.org_id, is_active: true } }, select: { location_id: true } })
+          : Promise.resolve([] as { location_id: string }[]),
+      ]);
+      const locationUsers = managedLocations.length ? await prisma.user.findMany({ where: { org_id: req.user!.org_id, primary_location_id: { in: managedLocations.map(item => item.location_id) }, is_active: true, deleted_at: null }, select: { id: true } }) : [];
+      visibleUserIds = [...new Set([...directReports, ...locationUsers].map(user => user.id))];
     }
-    const records = await prisma.attendanceRecord.findMany({ where, include: RECORD_INCLUDE, orderBy: { check_in_at: 'asc' } });
+    let dateWhere: Record<string, unknown>;
+    if (rawDate) {
+      dateWhere = { date: parseDateOnly(rawDate), ...(visibleUserIds ? { user_id: { in: visibleUserIds } } : {}) };
+    } else {
+      const employees = await prisma.user.findMany({
+        where: { org_id: req.user!.org_id, is_active: true, deleted_at: null, ...(visibleUserIds ? { id: { in: visibleUserIds } } : {}) },
+        select: { id: true, primary_location: { select: { id: true, timezone: true } } },
+      });
+      const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { timezone: true } });
+      const localDates = new Map<string, { locationId: string | null; date: Date; users: string[] }>();
+      for (const employee of employees) {
+        const locationId = employee.primary_location?.id ?? null;
+        const timezone = employee.primary_location?.timezone ?? org?.timezone ?? 'UTC';
+        const date = dateOnlyInTz(new Date(), timezone);
+        const key = `${locationId ?? 'legacy'}:${date.toISOString()}`;
+        const group = localDates.get(key) ?? { locationId, date, users: [] };
+        group.users.push(employee.id);
+        localDates.set(key, group);
+      }
+      dateWhere = { OR: [...localDates.values()].map(group => ({
+        user_id: { in: group.users }, date: group.date,
+        ...(group.locationId ? { location_id: group.locationId } : {}),
+      })) };
+    }
+    const records = await prisma.attendanceRecord.findMany({ where: { org_id: req.user!.org_id, ...dateWhere }, include: RECORD_INCLUDE, orderBy: { check_in_at: 'asc' } });
     ok(res, records);
   } catch (e) { next(e); }
 });
@@ -258,15 +459,16 @@ router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
     const parsedLimit = Number.parseInt(String(req.query.limit ?? '50'), 10);
     const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 50;
     const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+    const position = cursorMode && cursor ? decodeCursor(cursor, where) : null;
 
-    if (cursorMode && cursor) {
+    if (cursorMode && cursor && !position) {
       const anchor = await prisma.attendanceRecord.findFirst({ where: { ...where, id: cursor }, select: { id: true } });
       if (!anchor) throw new ValidationError('Invalid attendance cursor');
     }
 
     const records = await prisma.attendanceRecord.findMany({
-      where,
-      ...(cursorMode && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      where: position ? { ...where, AND: [keysetAfter(position, 'date')] } : where,
+      ...(!position && cursorMode && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
       orderBy: [{ date: 'desc' }, { id: 'desc' }],
       ...(cursorMode ? { take: limit + 1 } : {}),
       include: {
@@ -279,7 +481,8 @@ router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
     }
     const hasMore = records.length > limit;
     const items = hasMore ? records.slice(0, limit) : records;
-    ok(res, { items, next_cursor: hasMore ? items[items.length - 1]?.id ?? null : null, has_more: hasMore, limit });
+    const last = items[items.length - 1];
+    ok(res, { items, next_cursor: hasMore && last ? encodeCursor({ at: last.date, id: last.id }, where) : null, has_more: hasMore, limit });
   } catch (e) { next(e); }
 });
 
@@ -288,14 +491,12 @@ router.get('/me', async (req: Request, res: Response, next: NextFunction) => {
 router.get('/remote/sessions', requirePermission('remote.approve'), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { status } = req.query as { status?: string };
-
-    const teamIds = !req.permissions?.has('employees.view')
-      ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
-      : null;
-
-    const where: Record<string, unknown> = { user: { org_id: req.user!.org_id } };
-    if (status) where.status = status;
-    if (teamIds) where.user_id = { in: teamIds };
+    const permissions = req.permissions ?? await resolveUserPermissions(req.user!.sub, req.user!.org_id);
+    const employeeIds = await reviewableEmployeeIds(req.user!.org_id, req.user!.sub, permissions, 'employees.view');
+    const where = {
+      user: { org_id: req.user!.org_id, ...(employeeIds !== null && { id: { in: employeeIds } }) },
+      ...(status ? { status } : {}),
+    };
 
     const sessions = await prisma.remoteSession.findMany({
       where,
@@ -311,82 +512,27 @@ router.get('/remote/sessions', requirePermission('remote.approve'), async (req: 
 });
 
 // ─── PUT /attendance/remote/sessions/:id/approve ──────
-router.put('/remote/sessions/:id/approve', requirePermission('remote.approve'), async (req, res, next) => {
+router.put('/remote/sessions/:id/approve', requirePermission('remote.approve'), idempotency, async (req, res, next) => {
   try {
-    const session = await prisma.remoteSession.findUnique({
-      where: { id: String(req.params.id) },
-      include: { user: true },
-    });
-    if (!session || session.user.org_id !== req.user!.org_id) throw new NotFoundError('Remote session');
-    if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
-
-    await prisma.remoteSession.update({
-      where: { id: session.id },
-      data: { status: 'approved', approved_by: req.user!.sub },
-    });
-
-    // Notify team group via WhatsApp
+    const result = await reviewApproval(
+      { userId: req.user!.sub, orgId: req.user!.org_id },
+      { type: 'remote', id: String(req.params.id), action: 'approve' },
+    );
     const { notifyRemote } = await import('../services/whatsapp');
-    await notifyRemote(session.user.org_id, session.user.name).catch(console.error);
-
-    // In-app notification to employee
-    const { createNotification } = await import('../services/notifications');
-    createNotification({
-      userId: session.user.id, orgId: session.user.org_id,
-      type: 'remote_approved',
-      title: 'Remote work approved',
-      body: `Your remote work request for today has been approved`,
-      actionType: 'remote_session', actionId: session.id,
-    }).catch(console.error);
-
-    emitOrgEvent(req.user!.org_id, 'remote_changed');
-    ok(res, { message: 'Remote session approved' });
+    await notifyRemote(req.user!.org_id, result.requester).catch(console.error);
+    ok(res, { message: result.summary });
   } catch (e) { next(e); }
 });
 
 // ─── PUT /attendance/remote/sessions/:id/reject ───────
-router.put('/remote/sessions/:id/reject', requirePermission('remote.approve'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/remote/sessions/:id/reject', requirePermission('remote.approve'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const session = await prisma.remoteSession.findFirst({ where: { id: String(req.params.id), user: { org_id: req.user!.org_id } } });
-    if (!session) throw new NotFoundError('Remote session');
-    if (session.status !== 'pending') throw new ValidationError('Session is not pending approval');
-
-    await prisma.remoteSession.update({
-      where: { id: session.id },
-      data: { status: 'rejected', approved_by: req.user!.sub },
-    });
-
-    // Only mark absent if the employee never physically checked in; if they
-    // already have a check_in_at (e.g. QR'd in before the manager reviewed),
-    // leave the record as-is so we don't erase a real attendance day.
-    const linkedRecord = await prisma.attendanceRecord.findUnique({
-      where: { id: session.attendance_id },
-      select: { check_in_at: true },
-    });
-    if (linkedRecord && !linkedRecord.check_in_at) {
-      await prisma.attendanceRecord.update({
-        where: { id: session.attendance_id },
-        data: { status: 'absent' },
-      });
-    }
-
-    // In-app notification to employee
-    const rejectedSession = await prisma.remoteSession.findUnique({
-      where: { id: session.id }, select: { user: { select: { id: true, org_id: true } } },
-    });
-    if (rejectedSession?.user) {
-      const { createNotification } = await import('../services/notifications');
-      createNotification({
-        userId: rejectedSession.user.id, orgId: rejectedSession.user.org_id,
-        type: 'remote_rejected',
-        title: 'Remote work rejected',
-        body: `Your remote work request for today was not approved`,
-        actionType: 'remote_session', actionId: session.id,
-      }).catch(console.error);
-    }
-
-    emitOrgEvent(req.user!.org_id, 'remote_changed');
-    ok(res, { message: 'Remote session rejected' });
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+    const result = await reviewApproval(
+      { userId: req.user!.sub, orgId: req.user!.org_id },
+      { type: 'remote', id: String(req.params.id), action: 'reject', reason },
+    );
+    ok(res, { message: result.summary });
   } catch (e) { next(e); }
 });
 
@@ -411,22 +557,38 @@ router.get('/remote/sessions/me', async (req: Request, res: Response, next: Next
 // Live dashboard: today's sessions with nudge logs & computed online status
 router.get('/remote/monitor', requirePermission('remote.approve'), async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const today = startOfDay(new Date());
     const now   = new Date();
+    const orgTimezone = await prisma.organisation.findUnique({
+      where: { id: req.user!.org_id },
+      select: { timezone: true },
+    });
+    // Attendance.date is stored as a UTC-midnight date-only value representing
+    // the employee's work date. Query a broad UTC window, then select today's
+    // records using each employee's assigned location timezone.
+    const dateWindowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 2));
+    const dateWindowEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 3));
 
-    const isManager = !req.permissions?.has('employees.view');
-    const teamIds = isManager
-      ? (await prisma.user.findMany({ where: { manager_id: req.user!.sub, org_id: req.user!.org_id }, select: { id: true } })).map((u: { id: string }) => u.id)
-      : null;
+    const permissions = req.permissions ?? await resolveUserPermissions(req.user!.sub, req.user!.org_id);
+    const employeeIds = await reviewableEmployeeIds(req.user!.org_id, req.user!.sub, permissions, 'employees.view');
 
-    const where: Record<string, unknown> = { user: { org_id: req.user!.org_id }, created_at: { gte: today } };
-    if (teamIds) where.user_id = { in: teamIds };
+    const where: Record<string, unknown> = {
+      user: { org_id: req.user!.org_id },
+      attendance: { date: { gte: dateWindowStart, lt: dateWindowEnd } },
+    };
+    if (employeeIds !== null) where.user_id = { in: employeeIds };
 
     const sessions = await prisma.remoteSession.findMany({
       where,
       include: {
         user:         { select: { id: true, name: true, department: true, avatar_url: true, phone: true } },
-        attendance:   { select: { date: true } },
+        attendance:   { select: {
+          date: true,
+          location: { select: { timezone: true } },
+          user: { select: {
+            primary_location: { select: { timezone: true } },
+            org: { select: { timezone: true } },
+          } },
+        } },
         checkin_logs: { orderBy: { nudge_sent_at: 'asc' } },
       },
       orderBy: { created_at: 'desc' },
@@ -434,7 +596,15 @@ router.get('/remote/monitor', requirePermission('remote.approve'), async (req: R
 
     const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
 
-    const enriched = sessions.map(s => {
+    const todaysSessions = sessions.filter((session) => {
+      const timezone = session.attendance.location?.timezone
+        || session.attendance.user.primary_location?.timezone
+        || session.attendance.user.org.timezone
+        || 'UTC';
+      return dateOnlyInTz(now, timezone).toISOString() === session.attendance.date.toISOString();
+    });
+
+    const enriched = todaysSessions.map(s => {
       const logs      = s.checkin_logs;
       const replies   = logs.filter(l => l.reply_at);
       const lastReply = replies.sort((a, b) => new Date(b.reply_at!).getTime() - new Date(a.reply_at!).getTime())[0];
@@ -463,7 +633,7 @@ router.get('/remote/monitor', requirePermission('remote.approve'), async (req: R
       : 'neutral';
 
     ok(res, {
-      date:  today,
+      date:  dateOnlyInTz(now, orgTimezone?.timezone || 'UTC'),
       stats: { total, responded, no_reply: noReply, avg_sentiment: avgSentiment },
       sessions: enriched,
     });
@@ -475,10 +645,16 @@ router.get('/remote/monitor', requirePermission('remote.approve'), async (req: R
 router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const permissions = await resolveUserPermissions(req.user!.sub, req.user!.org_id);
+    const canReviewRemote = permissions.has('remote.approve');
     const canViewTeam = permissions.has('attendance.view_team') || permissions.has('attendance.override');
+    const teamIds = canReviewRemote
+      ? await reviewableEmployeeIds(req.user!.org_id, req.user!.sub, permissions, 'employees.view')
+      : canViewTeam
+        ? await scopedEmployeeIds(req.user!.org_id, req.user!.sub, permissions, 'employees.view')
+        : null;
     const session = await prisma.remoteSession.findFirst({
-      where: canViewTeam
-        ? { id: String(req.params.id), user: { org_id: req.user!.org_id } }
+      where: (canReviewRemote || canViewTeam)
+        ? { id: String(req.params.id), user: { org_id: req.user!.org_id, ...(teamIds !== null && { id: { in: teamIds } }) } }
         : { id: String(req.params.id), user_id: req.user!.sub },
       include: {
         user:         { select: { id: true, name: true, department: true, avatar_url: true } },
@@ -490,20 +666,37 @@ router.get('/remote/sessions/:id/logs', async (req: Request, res: Response, next
     ok(res, session);
   } catch (e) { next(e); }
 });
-router.post('/break/start', validate({ body: breakStartSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/break/start', validate({ body: breakStartSchema }), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { break_type = 'rest', shift_break_id } = req.body;
     const { today } = await orgTimeContext(req.user!.org_id);
-    const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      include: { break_records: true, shift: { include: { breaks: true } } },
-    });
+    const { eventAt, requiresReview } = actionEventTime(req);
+    const key = req.body?.idempotency_key as string | undefined;
+    const hash = key ? payloadHash(req.body) : null;
+    if (key) {
+      const previous = await prisma.breakRecord.findFirst({ where: { start_idempotency_key: key }, include: { attendance: true, shift_break: true } });
+      if (previous) {
+        if (previous.start_request_hash !== hash || previous.attendance.user_id !== req.user!.sub || previous.attendance.org_id !== req.user!.org_id) throw new AppError('This idempotency key was already used with a different break-start payload.', 409, 'IDEMPOTENCY_KEY_REUSED');
+        return ok(res, { ...previous, action: 'already_recorded', idempotent: true });
+      }
+    }
+    const record = req.body?.offline
+      ? await prisma.attendanceRecord.findFirst({
+          where: { org_id: req.user!.org_id, user_id: req.user!.sub, check_in_at: { lte: eventAt }, check_out_at: null },
+          orderBy: { check_in_at: 'desc' },
+          include: { break_records: true, shift: { include: { breaks: true } } },
+        })
+      : await prisma.attendanceRecord.findUnique({
+          where: { user_id_date: { user_id: req.user!.sub, date: today } },
+          include: { break_records: true, shift: { include: { breaks: true } } },
+        });
     if (!record || !record.check_in_at) throw new AppError('Not checked in', 400, 'NOT_CHECKED_IN');
     if (record.check_out_at) throw new AppError('Already checked out', 400, 'CHECKED_OUT');
+    if (eventAt < record.check_in_at) throw new AppError('Break start is before check-in. This event needs review.', 409, 'OFFLINE_EVENT_REVIEW');
     if (record.break_records.some(b => !b.break_end)) throw new AppError('Break already in progress', 400, 'BREAK_IN_PROGRESS');
 
     const shift = record.shift ?? await effectiveShiftForUser(req.user!.sub, req.user!.org_id, today, new Date(), true);
-    const availableBreaks = (shift?.breaks ?? []).filter(b => dayMatchesBreak(b, today));
+    const availableBreaks = (shift?.breaks ?? []).filter(b => dayMatchesBreak(b, req.body?.offline ? record.date : today));
     const policy = shift_break_id
       ? availableBreaks.find(b => b.id === shift_break_id)
       : availableBreaks.find(b => b.name === break_type || b.id === break_type);
@@ -524,15 +717,18 @@ router.post('/break/start', validate({ body: breakStartSchema }), async (req: Re
     const breakRecord = await prisma.breakRecord.create({
       data: {
         attendance_id: record.id,
-        break_start: new Date(),
+        break_start: eventAt,
         break_type: policy?.name ?? break_type,
         is_paid: isPaid,
         shift_break_id: policy?.id ?? undefined,
         limit_exceeded: limitExceeded,
         counted_as_extra: limitExceeded,
-        source: 'manual',
+        source: req.body?.offline ? 'offline' : 'manual',
+        ...(key && { start_idempotency_key: key, start_request_hash: hash }),
       },
     });
+    if (req.body?.offline) await prisma.attendanceRecord.update({ where: { id: record.id }, data: { offline_reconciled: true, ...(requiresReview && { checkin_requires_review: true }) } });
+    if (req.body?.offline && requiresReview) await notifyOfflineAttendanceReview(req.user!.sub, req.user!.org_id, record.id, 'break start');
     ok(res, {
       ...breakRecord,
       warning: limitExceeded ? 'This is an extra break and may be unpaid by policy.' : null,
@@ -546,25 +742,27 @@ router.post('/break/start', validate({ body: breakStartSchema }), async (req: Re
 // wifi_connected = true when the device was on the office WiFi at the moment
 // the employee tapped "End Break". Used to populate wifi_on_at_end on the
 // break record for history and analytics.
-router.post('/break/end', validate({ body: breakEndSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/break/end', validate({ body: breakEndSchema }), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { wifi_connected } = req.body as { wifi_connected?: boolean };
     const { today, timezone: tz } = await orgTimeContext(req.user!.org_id);
-
-    const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      include: {
-        break_records: {
-          where: { break_end: null },
-          include: { shift_break: true },
-        },
-      },
-    });
+    const { eventAt: now, requiresReview } = actionEventTime(req);
+    const key = req.body?.idempotency_key as string | undefined;
+    const hash = key ? payloadHash(req.body) : null;
+    if (key) {
+      const previous = await prisma.breakRecord.findFirst({ where: { end_idempotency_key: key }, include: { attendance: true, shift_break: true } });
+      if (previous) {
+        if (previous.end_request_hash !== hash || previous.attendance.user_id !== req.user!.sub || previous.attendance.org_id !== req.user!.org_id) throw new AppError('This idempotency key was already used with a different break-end payload.', 409, 'IDEMPOTENCY_KEY_REUSED');
+        return ok(res, { ...previous, action: 'already_recorded', idempotent: true });
+      }
+    }
+    const record = req.body?.offline
+      ? await prisma.attendanceRecord.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, check_in_at: { lte: now }, check_out_at: null }, orderBy: { check_in_at: 'desc' }, include: { break_records: { where: { break_end: null }, include: { shift_break: true } } } })
+      : await prisma.attendanceRecord.findUnique({ where: { user_id_date: { user_id: req.user!.sub, date: today } }, include: { break_records: { where: { break_end: null }, include: { shift_break: true } } } });
     if (!record) throw new AppError('Not checked in today', 400, 'NOT_CHECKED_IN');
     const activeBreak = record.break_records[0];
     if (!activeBreak) throw new AppError('No break in progress', 400, 'NO_BREAK');
-
-    const now          = new Date();
+    if (now <= activeBreak.break_start) throw new AppError('Break end must be after break start. This event needs review.', 409, 'OFFLINE_EVENT_REVIEW');
     const durationMins = Math.max(0, Math.round((now.getTime() - activeBreak.break_start.getTime()) / 60000));
 
     // ── Compute late_return_minutes ──────────────────────────────────────────
@@ -595,6 +793,8 @@ router.post('/break/end', validate({ body: breakEndSchema }), async (req: Reques
         duration_mins:       durationMins,
         late_return_minutes: lateReturnMins,
         wifi_on_at_end:      wifi_connected ?? null,
+        ...(key && { end_idempotency_key: key, end_request_hash: hash }),
+        ...(req.body?.offline && { source: 'offline' }),
       },
     });
 
@@ -611,8 +811,10 @@ router.post('/break/end', validate({ body: breakEndSchema }), async (req: Reques
         break_minutes: breakTotals.totalMins,
         paid_break_minutes: breakTotals.paidMins,
         net_hours_worked: parseFloat(((totalMins - breakTotals.unpaidMins) / 60).toFixed(2)),
+        ...(req.body?.offline && { offline_reconciled: true, ...(requiresReview && { checkin_requires_review: true }) }),
       },
     });
+    if (req.body?.offline && requiresReview) await notifyOfflineAttendanceReview(req.user!.sub, req.user!.org_id, record.id, 'break end');
 
     ok(res, ended);
   } catch (e) { next(e); }
@@ -637,7 +839,7 @@ router.get('/late-notice/me', async (req: Request, res: Response, next: NextFunc
 // ─── POST /attendance/late-notice ─────────────────────
 // Employee submits an advance notice that they will arrive late.
 // The scheduler respects this: no manager alert until expected_time passes.
-router.post('/late-notice', validate({ body: lateNoticeSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/late-notice', idempotency, validate({ body: lateNoticeSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { date, expected_time, reason } = req.body;
     if (!date || !expected_time || !reason) throw new ValidationError('date, expected_time and reason required');
@@ -712,7 +914,7 @@ router.get('/late-notices', requirePermission('attendance.late_notices.manage'),
 });
 
 // ─── PUT /attendance/late-notice/:id/acknowledge ──────
-router.put('/late-notice/:id/acknowledge', requirePermission('attendance.late_notices.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/late-notice/:id/acknowledge', requirePermission('attendance.late_notices.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const notice = await prisma.lateArrivalNotice.findFirst({
       where: { id: String(req.params.id), org_id: req.user!.org_id },
@@ -741,7 +943,7 @@ router.put('/late-notice/:id/acknowledge', requirePermission('attendance.late_no
 });
 
 // ─── DELETE /attendance/late-notice/:id ───────────────
-router.delete('/late-notice/:id', async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/late-notice/:id', idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const notice = await prisma.lateArrivalNotice.findFirst({
       where: { id: String(req.params.id), user_id: req.user!.sub },
@@ -764,8 +966,8 @@ router.delete('/late-notice/:id', async (req: Request, res: Response, next: Next
 router.get('/today-status', async (req: Request, res: Response, next: NextFunction) => {
   try {
     const now   = new Date();
-    const { org, timezone: tz, today } = await orgTimeContext(req.user!.org_id);
-    const attendanceSecurity = parseAttendanceSecurity(org?.attendance_security);
+    const { org, location, timezone: tz, today } = await orgTimeContext(req.user!.org_id, req.user!.sub);
+    const attendanceSecurity = parseLocationGeofence(location?.geofence) ?? parseAttendanceSecurity(org?.attendance_security);
 
     // Find today's attendance record (with active break)
     const record = await prisma.attendanceRecord.findUnique({
@@ -952,15 +1154,19 @@ router.get('/leave-check', async (req: Request, res: Response, next: NextFunctio
 });
 
 // ─── POST /attendance/checkin ──────────────────────────
-router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/checkin', idempotency, validate({ body: checkinSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const {
       type = 'manual', qr_code, duration_type = 'full_day', count_away_as_break,
       away_shift_break_id, idempotency_key, client_event_at, offline = false,
       latitude, longitude, accuracy_m, is_mocked = false,
       device_uptime_ms, server_anchor_uptime_ms, clock_epoch, server_anchor_epoch, attendance_clock_anchor,
+      device_proof,
     } = req.body;
-    const { org: orgInfo, timezone: orgTimezone, today: orgToday } = await orgTimeContext(req.user!.org_id);
+    if (type === 'remote' && !hasFeature(await resolveOrgFeatures(req.user!.org_id), 'remote_work')) {
+      throw new ForbiddenError('Remote work is not enabled for this organization');
+    }
+    const { org: orgInfo, location, timezone: orgTimezone } = await orgTimeContext(req.user!.org_id, req.user!.sub);
     const receivedAt = new Date();
     const clientEventAt = client_event_at ? new Date(client_event_at) : null;
     if (offline && (!idempotency_key || !clientEventAt || !attendance_clock_anchor || device_uptime_ms === undefined || server_anchor_uptime_ms === undefined || !clock_epoch || !server_anchor_epoch)) {
@@ -970,6 +1176,9 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
     const requestHash = idempotency_key ? createHash('sha256').update(JSON.stringify(hashBody)).digest('hex') : null;
     let checkInAt = receivedAt;
     let requiresCheckinReview = false;
+    let deviceProofStatus = 'missing';
+    let verifiedDeviceId: string | null = null;
+    let deviceSignatureVerified = false;
     if (offline && clientEventAt) {
       const anchor = verifyAttendanceClockAnchor(attendance_clock_anchor!, req.user!.sub, req.user!.org_id);
       const anchorAt = new Date(anchor.server_time);
@@ -987,12 +1196,68 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
         requiresCheckinReview = true;
       }
     }
+    if (device_proof) {
+      const proof = device_proof as { device_id: string; challenge: string; signature: string; signed_payload: string };
+      const device = await prisma.attendanceDevice.findFirst({
+        where: { id: proof.device_id, org_id: req.user!.org_id, user_id: req.user!.sub, status: 'approved' },
+        select: { id: true, public_key: true },
+      });
+      const challengeHash = createHash('sha256').update(proof.challenge).digest();
+      const challengeRecord = device ? await prisma.attendanceDeviceChallenge.findFirst({
+        where: { org_id: req.user!.org_id, user_id: req.user!.sub, device_id: device.id, challenge_hash: challengeHash.toString('hex') },
+        select: { id: true, challenge_hash: true, expires_at: true, consumed_at: true },
+      }) : null;
+      const proofRequest = Object.fromEntries(Object.entries(req.body as Record<string, unknown>)
+        .filter(([key]) => key !== 'offline' && key !== 'device_proof')
+        .sort(([a], [b]) => a.localeCompare(b)));
+      let signedPayloadMatches = false;
+      try {
+        const signedPayload = JSON.parse(proof.signed_payload) as unknown;
+        signedPayloadMatches = !!signedPayload && typeof signedPayload === 'object' && !Array.isArray(signedPayload) && stableJson(signedPayload) === stableJson(proofRequest);
+      } catch { signedPayloadMatches = false; }
+      const expectedChallengeHash = challengeRecord ? Buffer.from(challengeRecord.challenge_hash, 'hex') : Buffer.alloc(0);
+      const challengeMatches = !!device && !!challengeRecord && expectedChallengeHash.length === challengeHash.length && timingSafeEqual(expectedChallengeHash, challengeHash);
+      const requestMatches = signedPayloadMatches;
+      const challengeFresh = !!challengeRecord && !challengeRecord.consumed_at && challengeRecord.expires_at.getTime() > receivedAt.getTime();
+      let signatureValid = false;
+      if (device && challengeMatches && requestMatches && challengeFresh) {
+        try {
+          const publicKey = createPublicKey({ key: Buffer.from(device.public_key, 'base64'), format: 'der', type: 'spki' });
+          const signingPrefix = ['attenda-checkin-v2', req.user!.org_id, req.user!.sub, device.id, proof.challenge, ''].join('\n');
+          const message = `${signingPrefix}${proof.signed_payload}`;
+          signatureValid = verifySignature('sha256', Buffer.from(message, 'utf8'), publicKey, Buffer.from(proof.signature, 'base64'));
+        } catch { signatureValid = false; }
+      }
+      if (device && challengeMatches && requestMatches && challengeFresh && signatureValid) {
+        const consumed = await prisma.attendanceDeviceChallenge.updateMany({
+          where: { id: challengeRecord!.id, org_id: req.user!.org_id, user_id: req.user!.sub, device_id: device.id, consumed_at: null, expires_at: { gt: receivedAt } },
+          data: { consumed_at: receivedAt },
+        });
+        if (consumed.count) {
+          verifiedDeviceId = device.id;
+          deviceSignatureVerified = true;
+          deviceProofStatus = 'verified';
+          await prisma.attendanceDevice.update({ where: { id: device.id }, data: { last_used_at: receivedAt } })
+            .catch(error => console.error('[Attendance] Could not update trusted-device last-used time:', error));
+        } else {
+          deviceProofStatus = 'replayed';
+          requiresCheckinReview = true;
+        }
+      } else {
+        deviceProofStatus = !device ? 'untrusted' : challengeRecord?.consumed_at ? 'replayed' : challengeRecord && !challengeFresh ? 'expired' : 'invalid';
+        requiresCheckinReview = true;
+      }
+    }
     const attendanceDate = dateOnlyInTz(checkInAt, orgTimezone);
     const serverAnchorAt = offline ? new Date(verifyAttendanceClockAnchor(attendance_clock_anchor!, req.user!.sub, req.user!.org_id).server_time) : null;
     const checkinTrustData = {
       checkin_request_hash: requestHash,
       checkin_source: offline ? 'offline' : type,
       checkin_requires_review: requiresCheckinReview,
+      checkin_review_reason: null as string | null,
+      attendance_device_id: verifiedDeviceId,
+      device_proof_status: deviceProofStatus,
+      device_signature_verified: deviceSignatureVerified,
       ...(offline && { device_uptime_ms, server_anchor_uptime_ms, server_anchor_at: serverAnchorAt, clock_epoch }),
     };
 
@@ -1006,8 +1271,16 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
         return ok(res, { ...duplicate, action: 'already_recorded', idempotent: true });
       }
     }
-    const locationPolicy = type === 'remote' ? null : parseAttendanceSecurity(orgInfo?.attendance_security);
+    const locationPolicy = type === 'remote' ? null : (parseLocationGeofence(location?.geofence) ?? parseAttendanceSecurity(orgInfo?.attendance_security));
     const locationCheck = evaluateCheckinLocation(locationPolicy, { latitude, longitude, accuracy_m, is_mocked });
+    const locationReviewReason = locationPolicy?.geofence_enabled && locationCheck && locationCheck.status !== 'inside'
+      ? `geofence_${locationCheck.status}`
+      : null;
+    if (locationReviewReason) {
+      requiresCheckinReview = true;
+      checkinTrustData.checkin_requires_review = true;
+      checkinTrustData.checkin_review_reason = locationReviewReason;
+    }
     // Capture client IP — prefer X-Forwarded-For (behind proxy/load balancer)
     const rawIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.ip || null;
 
@@ -1031,6 +1304,7 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
           where: { id: existing.id },
           data: {
             check_out_at:      null,
+            location_id:       location?.id ?? existing.location_id,
             hours_worked:      null,
             net_hours_worked:  null,
             early_out_minutes: 0,
@@ -1194,7 +1468,7 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
         })
       : await prisma.attendanceRecord.create({
           data: {
-            user_id: req.user!.sub, org_id: req.user!.org_id,
+            user_id: req.user!.sub, org_id: req.user!.org_id, location_id: location?.id,
             date: attendanceDate, check_in_at: now, check_in_type: type, status,
             checkin_idempotency_key: idempotency_key ?? undefined,
             client_checkin_at: clientEventAt ?? undefined,
@@ -1233,6 +1507,11 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
         action: 'already_recorded',
         idempotent: !!idempotency_key && concurrentRecord.checkin_idempotency_key === idempotency_key,
       });
+    }
+
+    if (type !== 'remote') {
+      await resolvePriorNoShowAlerts(req.user!.sub, req.user!.org_id, record.id, attendanceDate, orgTimezone)
+        .catch(error => console.error('[Attendance] Could not reconcile prior no-show notifications:', error));
     }
 
     if (requiresCheckinReview) {
@@ -1361,17 +1640,26 @@ router.post('/checkin', validate({ body: checkinSchema }), async (req: Request, 
 });
 
 // ─── POST /attendance/checkout ─────────────────────────
-router.post('/checkout', validate({ body: checkoutSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/checkout', validate({ body: checkoutSchema }), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { timezone: orgTimezone, today } = await orgTimeContext(req.user!.org_id);
-    const record = await prisma.attendanceRecord.findUnique({
-      where: { user_id_date: { user_id: req.user!.sub, date: today } },
-      include: { shift: true },
-    });
+    const { timezone: orgTimezone, today } = await orgTimeContext(req.user!.org_id, req.user!.sub);
+    const receivedAt = new Date();
+    const { eventAt: now, requiresReview } = actionEventTime(req, receivedAt);
+    const key = req.body?.idempotency_key as string | undefined;
+    const hash = key ? payloadHash(req.body) : null;
+    if (key) {
+      const previous = await prisma.attendanceRecord.findFirst({ where: { user_id: req.user!.sub, checkout_idempotency_key: key }, include: RECORD_INCLUDE });
+      if (previous) {
+        if (previous.checkout_request_hash !== hash) throw new AppError('This idempotency key was already used with a different check-out payload.', 409, 'IDEMPOTENCY_KEY_REUSED');
+        return ok(res, { ...previous, action: 'already_recorded', idempotent: true });
+      }
+    }
+    const record = req.body?.offline
+      ? await prisma.attendanceRecord.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, check_in_at: { lte: now }, check_out_at: null }, orderBy: { check_in_at: 'desc' }, include: { shift: true } })
+      : await prisma.attendanceRecord.findUnique({ where: { user_id_date: { user_id: req.user!.sub, date: today } }, include: { shift: true } });
     if (!record?.check_in_at) throw new ValidationError('No check-in found for today');
     if (record.check_out_at)  throw new ValidationError('Already checked out today');
-
-    const now          = new Date();
+    if (now < record.check_in_at) throw new AppError('Check-out time is before check-in. This event needs review.', 409, 'OFFLINE_EVENT_REVIEW');
     const hoursWorked  = calcHoursWorked(record.check_in_at, now);
 
     // Settle breaks (close any open break) and compute net hours
@@ -1411,10 +1699,23 @@ router.post('/checkout', validate({ body: checkoutSchema }), async (req: Request
         extra_office_minutes: autoCountOvertime ? 0 : extraOfficeMins,
         break_minutes: breaks.totalMins, paid_break_minutes: breaks.paidMins,
         early_out_minutes: earlyMins,
+        ...(key && { checkout_idempotency_key: key, checkout_request_hash: hash }),
+        ...(req.body?.offline && { offline_reconciled: true, checkin_requires_review: record.checkin_requires_review || requiresReview }),
         ...(score != null && { adherence_score: score }),
       },
       include: RECORD_INCLUDE,
     });
+    // Attendance checkout is the authoritative end of the employee's work
+    // session. Close a running project timer at that same server-resolved time.
+    const runningTimer = await prisma.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null }, select: { id: true, started_at: true } }).catch(() => null);
+    if (runningTimer) {
+      const closed = await prisma.timeEntry.updateMany({
+        where: { id: runningTimer.id, ended_at: null, status: 'draft' },
+        data: { ended_at: now, minutes: Math.max(1, Math.round((now.getTime() - runningTimer.started_at.getTime()) / 60000)), attendance_id: record.id },
+      }).catch(() => ({ count: 0 }));
+      if (closed.count) recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'time.timer.auto_stop', entityType: 'time_entry', entityId: runningTimer.id, after: { attendance_id: record.id, ended_at: now.toISOString() } });
+    }
+    if (req.body?.offline && requiresReview) await notifyOfflineAttendanceReview(req.user!.sub, req.user!.org_id, record.id, 'check-out');
 
     // Fire WhatsApp notification (non-blocking)
     if (updated.user) {
@@ -1465,10 +1766,10 @@ router.post('/heartbeat', validate({ body: heartbeatSchema }), async (req: Reque
   try {
     const { ip, ssid } = req.body;
     if (!ip && !ssid) throw new ValidationError('ip or ssid is required');
-    const { today } = await orgTimeContext(req.user!.org_id);
-    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
-    const officeIps   = org?.office_ips   ?? [];
-    const officeSsids = org?.office_ssids ?? [];
+    const { today, location } = await orgTimeContext(req.user!.org_id, req.user!.sub);
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { heartbeat_grace_mins: true } });
+    const officeIps   = location?.office_ips   ?? [];
+    const officeSsids = location?.office_ssids ?? [];
 
     if (officeIps.length === 0 && officeSsids.length === 0) {
       return ok(res, { action: 'no_networks_configured' });
@@ -1505,12 +1806,11 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
     const { event, ip, ssid, count_away_as_break, away_shift_break_id } = req.body;
     if (!event) throw new ValidationError('event is required');
     if (!ip && !ssid) throw new ValidationError('ip or ssid is required');
-    const { today } = await orgTimeContext(req.user!.org_id);
+    const { org, today, location, timezone } = await orgTimeContext(req.user!.org_id, req.user!.sub);
 
     // Check against org's registered office networks (SSID first, then IP/CIDR)
-    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id } });
-    const officeIps   = org?.office_ips   ?? [];
-    const officeSsids = org?.office_ssids ?? [];
+    const officeIps   = location?.office_ips   ?? [];
+    const officeSsids = location?.office_ssids ?? [];
 
     // Distinguish "admin never configured networks" from "device is on wrong network"
     if (officeIps.length === 0 && officeSsids.length === 0) {
@@ -1528,7 +1828,7 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
 
       if (!existing?.check_in_at) {
         if (!org?.wifi_auto_checkin_enabled) return ok(res, { action: 'disabled' });
-        const attendanceSecurity = parseAttendanceSecurity(org.attendance_security);
+        const attendanceSecurity = parseLocationGeofence(location?.geofence) ?? parseAttendanceSecurity(org?.attendance_security);
         if (attendanceSecurity?.geofence_enabled) {
           return ok(res, { action: 'manual_checkin_required', reason: 'Location verification must be completed in the app.' });
         }
@@ -1546,7 +1846,7 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
         });
         if (shift) {
           shiftId  = shift.id;
-          const win = adjustedWindowForLeave(shift, org?.timezone ?? 'UTC', now, approvedLeave);
+          const win = adjustedWindowForLeave(shift, timezone, now, approvedLeave);
           scheduledStart = win.start;
           scheduledEnd   = win.end;
           const rawIpLateMins = Math.max(0, Math.round((now.getTime() - scheduledStart.getTime()) / 60000));
@@ -1572,8 +1872,8 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
           last_heartbeat_ssid: ssid ?? null,
         };
         const record = existing
-          ? await prisma.attendanceRecord.update({ where: { id: existing.id }, data: checkInData })
-          : await prisma.attendanceRecord.create({ data: { user_id: req.user!.sub, org_id: req.user!.org_id, date: today, ...checkInData } });
+          ? await prisma.attendanceRecord.update({ where: { id: existing.id }, data: { ...checkInData, location_id: location?.id ?? existing.location_id } })
+          : await prisma.attendanceRecord.create({ data: { user_id: req.user!.sub, org_id: req.user!.org_id, location_id: location?.id, date: today, ...checkInData } });
 
         // Notify WhatsApp
         const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
@@ -1719,7 +2019,7 @@ router.post('/ip-event', validate({ body: ipEventSchema }), async (req: Request,
 });
 
 // ─── PUT /attendance/:id/override ─────────────────────
-router.put('/:id/override', requirePermission('attendance.override'), validate({ body: attendanceOverrideSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id/override', requirePermission('attendance.override'), idempotency, validate({ body: attendanceOverrideSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = String(req.params.id);
     const { check_in_at, check_out_at, reason } = req.body;
@@ -1799,6 +2099,15 @@ router.get('/:userId', requirePermission('attendance.view_team'), async (req: Re
 
     const user = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id } });
     if (!user) throw new NotFoundError('User');
+    if (userId !== req.user!.sub && !req.permissions?.has('employees.view')) {
+      const [directReport, locationMembership] = await Promise.all([
+        prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id, manager_id: req.user!.sub }, select: { id: true } }),
+        req.permissions?.has('employees.view_location') && user.primary_location_id
+          ? prisma.locationManager.findFirst({ where: { user_id: req.user!.sub, location_id: user.primary_location_id }, select: { location_id: true } })
+          : Promise.resolve(null),
+      ]);
+      if (!directReport && !locationMembership) throw new ForbiddenError();
+    }
 
     const where: Record<string, unknown> = { user_id: userId };
     if (start || end) {

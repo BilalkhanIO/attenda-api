@@ -34,6 +34,13 @@ export interface ValidationSchemas {
   params?: ZodType;
 }
 
+/** Documents a successful `{ success: true, data }` response without changing runtime behavior. */
+export function documentResponse(schema: ZodType) {
+  const middleware = (_req: Request, _res: Response, next: NextFunction) => next();
+  (middleware as typeof middleware & { __openapiResponseSchema?: ZodType }).__openapiResponseSchema = schema;
+  return middleware;
+}
+
 export function validate(schemas: ValidationSchemas) {
   const middleware = (req: Request, _res: Response, next: NextFunction) => {
     try {

@@ -7,182 +7,553 @@ datasource db {
 }
 
 model Organisation {
-  id                         String    @id @default(uuid())
-  name                       String    @db.VarChar(255)
-  logo_url                   String?
-  timezone                   String    @db.VarChar(100)
-  currency                   String    @default("USD") @db.VarChar(10)
-  office_ips                 String[]  @default([])
-  office_ssids               String[]  @default([])
-  wifi_auto_checkin_enabled  Boolean   @default(true)
-  wifi_auto_checkout_enabled Boolean   @default(false)
-  wa_enabled                 Boolean   @default(false)
-  wa_phone_number_id         String?
-  wa_access_token            String?
-  wa_groups                  Json      @default("[]")
-  wa_events                  Json      @default("{}")
-  wa_dept_groups             Json      @default("{}")
-  payroll_day                Int       @default(28)
-  tax_rate                   Float     @default(0)
-  pension_rate               Float     @default(0)
-  late_threshold             Int       @default(15)
-  heartbeat_grace_mins       Int       @default(20)
-  gap_forgiveness_mins       Int       @default(15)
-  attendance_security        Json?
-  leave_accrual              Json?
-  late_policy                Json?
-  plan                       String    @default("trial") @db.VarChar(50)
-  status                     String    @default("active") @db.VarChar(20)
-  subscription_status        String    @default("active") @db.VarChar(30)
-  trial_started_at           DateTime?
-  trial_ends_at              DateTime?
-  seats_limit                Int?
-  features_override          Json?
-  admin_notes                String?   @db.Text
-  billing_email              String?   @db.VarChar(255)
-  contact_name               String?   @db.VarChar(255)
-  contact_email              String?   @db.VarChar(255)
-  company_size               String?   @db.VarChar(50)
-  totp_required              Boolean   @default(false)
-  address                    String?   @db.Text
-  phone                      String?   @db.VarChar(50)
-  website                    String?   @db.VarChar(255)
-  industry                   String?   @db.VarChar(100)
-  registration_number        String?   @db.VarChar(100)
-  created_at                 DateTime  @default(now())
+  id                            String    @id @default(uuid())
+  name                          String    @db.VarChar(255)
+  logo_url                      String?
+  timezone                      String    @db.VarChar(100)
+  currency                      String    @default("USD") @db.VarChar(10)
+  country_code                  String?   @db.Char(2)
+  office_ips                    String[]  @default([])
+  office_ssids                  String[]  @default([])
+  wifi_auto_checkin_enabled     Boolean   @default(true)
+  wifi_auto_checkout_enabled    Boolean   @default(false)
+  wa_enabled                    Boolean   @default(false)
+  wa_phone_number_id            String?
+  wa_access_token               String?
+  wa_groups                     Json      @default("[]")
+  wa_events                     Json      @default("{}")
+  wa_dept_groups                Json      @default("{}")
+  wa_monthly_message_limit      Int?
+  wa_alert_threshold_percent    Int       @default(80)
+  wa_estimated_cost_per_message Decimal?  @db.Decimal(10, 4)
+  ai_enabled                    Boolean   @default(true)
+  ai_monthly_request_limit      Int?
+  payroll_day                   Int       @default(28)
+  monthly_pay_divisor           Int       @default(26)
+  tax_rate                      Float     @default(0)
+  pension_rate                  Float     @default(0)
+  late_threshold                Int       @default(15)
+  heartbeat_grace_mins          Int       @default(20)
+  gap_forgiveness_mins          Int       @default(15)
+  compliance_pack_key           String    @default("unconfigured") @db.VarChar(80)
+  attendance_security           Json?
+  leave_accrual                 Json?
+  late_policy                   Json?
+  plan                          String    @default("trial") @db.VarChar(50)
+  status                        String    @default("active") @db.VarChar(20)
+  subscription_status           String    @default("active") @db.VarChar(30)
+  trial_started_at              DateTime?
+  trial_ends_at                 DateTime?
+  seats_limit                   Int?
+  features_override             Json?
+  admin_notes                   String?   @db.Text
+  billing_email                 String?   @db.VarChar(255)
+  contact_name                  String?   @db.VarChar(255)
+  contact_email                 String?   @db.VarChar(255)
+  company_size                  String?   @db.VarChar(50)
+  totp_required                 Boolean   @default(false)
+  address                       String?   @db.Text
+  phone                         String?   @db.VarChar(50)
+  website                       String?   @db.VarChar(255)
+  industry                      String?   @db.VarChar(100)
+  registration_number           String?   @db.VarChar(100)
+  created_at                    DateTime  @default(now())
 
-  users                  User[]
-  attendance_records     AttendanceRecord[]
-  attendance_corrections AttendanceCorrection[]
-  leave_requests         LeaveRequest[]
-  leave_balances         LeaveBalance[]
-  shifts                 Shift[]
-  emergency_shift_offers EmergencyShiftOffer[]
-  shift_checkpoints      ShiftCheckpoint[]
-  checkpoint_scans       ShiftCheckpointScan[]
-  shift_availability     ShiftAvailability[]
-  shift_coverage_rules   ShiftCoverageRule[]
-  shift_schedule_events  ShiftScheduleEvent[]
-  payroll_records        PayrollRecord[]
-  whatsapp_logs          WhatsappLog[]
-  performance_reviews    PerformanceReview[]
-  overtime_rules         OvertimeRule[]
-  overtime_requests      OvertimeRequest[]
-  notifications          InAppNotification[]
-  late_arrival_notices   LateArrivalNotice[]
-  org_roles              OrgRole[]
-  user_permission_grants UserPermissionGrant[]
-  departments            Department[]
-  holidays               OrgHoliday[]
-  expense_claims         ExpenseClaim[]
-  outbound_webhooks      OrgWebhook[]
-  webhook_deliveries     OrgWebhookDelivery[]
-  employee_documents     EmployeeDocument[]
-  announcements          Announcement[]
-  onboarding_templates   OnboardingTemplate[]
-  onboarding_tasks       OnboardingTask[]
-  kudos                  Kudos[]
-  projects               Project[]
-  leave_accrual_runs     LeaveAccrualRun[]
-  outbox_events          OutboxEvent[]
+  users                        User[]
+  locations                    Location[]
+  attendance_records           AttendanceRecord[]
+  attendance_corrections       AttendanceCorrection[]
+  leave_requests               LeaveRequest[]
+  leave_balances               LeaveBalance[]
+  leave_ledger_entries         LeaveLedgerEntry[]          @relation("LeaveLedgerOrg")
+  shifts                       Shift[]
+  emergency_shift_offers       EmergencyShiftOffer[]
+  shift_checkpoints            ShiftCheckpoint[]
+  checkpoint_scans             ShiftCheckpointScan[]
+  shift_availability           ShiftAvailability[]
+  shift_coverage_rules         ShiftCoverageRule[]
+  shift_schedule_events        ShiftScheduleEvent[]
+  payroll_records              PayrollRecord[]
+  pay_rates                    PayRate[]
+  statutory_parameter_sets     StatutoryParameterSet[]
+  whatsapp_logs                WhatsappLog[]
+  whatsapp_usage_periods       WhatsAppUsagePeriod[]
+  ai_usage_periods             AiUsagePeriod[]
+  ai_tool_audits               AiToolAudit[]
+  performance_reviews          PerformanceReview[]
+  overtime_rules               OvertimeRule[]
+  overtime_requests            OvertimeRequest[]
+  notifications                InAppNotification[]
+  late_arrival_notices         LateArrivalNotice[]
+  org_roles                    OrgRole[]
+  user_permission_grants       UserPermissionGrant[]
+  departments                  Department[]
+  holidays                     OrgHoliday[]
+  expense_claims               ExpenseClaim[]
+  outbound_webhooks            OrgWebhook[]
+  webhook_deliveries           OrgWebhookDelivery[]
+  employee_documents           EmployeeDocument[]
+  announcements                Announcement[]
+  onboarding_templates         OnboardingTemplate[]
+  onboarding_tasks             OnboardingTask[]
+  kudos                        Kudos[]
+  projects                     Project[]
+  time_entries                 TimeEntry[]
+  timesheets                   Timesheet[]
+  leave_accrual_runs           LeaveAccrualRun[]
+  leave_accrual_grants         LeaveAccrualGrant[]
+  outbox_events                OutboxEvent[]
+  labor_budgets                LaborBudget[]
+  compliance_rules             ComplianceRule[]
+  compliance_violations        ComplianceViolation[]
+  report_schedules             ReportSchedule[]
+  report_runs                  ReportRun[]
+  report_definitions           ReportDefinition[]
+  notification_deliveries      NotificationDelivery[]
+  offboarding_cases            OffboardingCase[]
+  offboarding_settlements      OffboardingSettlement[]
+  scheduler_job_markers        SchedulerJobMarker[]
+  scheduled_jobs               OrganizationJobSchedule[]
+  api_keys                     PublicApiKey[]
+  calendar_feeds               CalendarFeed[]
+  attendance_sync_watermarks   AttendanceSyncWatermark[]
+  attendance_devices           AttendanceDevice[]
+  attendance_device_challenges AttendanceDeviceChallenge[]
 
   @@map("organisations")
 }
 
+model ReportSchedule {
+  id          String    @id @default(uuid())
+  org_id      String
+  owner_id    String
+  name        String    @db.VarChar(160)
+  report_type String    @db.VarChar(32)
+  params      Json
+  frequency   String    @db.VarChar(16)
+  local_time  String    @db.VarChar(5)
+  timezone    String    @db.VarChar(100)
+  recipients  String[]  @default([])
+  status      String    @default("active") @db.VarChar(16)
+  next_run_at DateTime
+  last_run_at DateTime?
+  created_at  DateTime  @default(now())
+  updated_at  DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  owner        User         @relation(fields: [owner_id], references: [id], onDelete: Cascade)
+  runs         ReportRun[]
+
+  @@index([status, next_run_at])
+  @@index([org_id, owner_id, created_at])
+  @@map("report_schedules")
+}
+
+model ReportDefinition {
+  id         String   @id @default(uuid())
+  org_id     String
+  owner_id   String
+  name       String   @db.VarChar(120)
+  definition Json
+  created_at DateTime @default(now())
+  updated_at DateTime @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  owner        User         @relation(fields: [owner_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, owner_id, name])
+  @@index([org_id, owner_id, updated_at(sort: Desc)])
+  @@map("report_definitions")
+}
+
+model ReportRun {
+  id            String    @id @default(uuid())
+  org_id        String
+  owner_id      String
+  schedule_id   String?
+  report_type   String    @db.VarChar(32)
+  params        Json
+  status        String    @default("queued") @db.VarChar(16)
+  scheduled_for DateTime?
+  download_url  String?   @db.Text
+  row_count     Int?
+  error         String?   @db.Text
+  started_at    DateTime?
+  completed_at  DateTime?
+  created_at    DateTime  @default(now())
+
+  organisation Organisation    @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  owner        User            @relation(fields: [owner_id], references: [id], onDelete: Cascade)
+  schedule     ReportSchedule? @relation(fields: [schedule_id], references: [id], onDelete: SetNull)
+
+  @@unique([schedule_id, scheduled_for])
+  @@index([org_id, owner_id, created_at])
+  @@map("report_runs")
+}
+
+model NotificationDelivery {
+  id           String    @id @default(uuid())
+  org_id       String
+  user_id      String
+  event_id     String    @db.VarChar(36)
+  event_type   String    @db.VarChar(60)
+  channel      String    @db.VarChar(16)
+  title        String    @db.VarChar(255)
+  body         String    @db.Text
+  action_type  String?   @db.VarChar(60)
+  action_id    String?
+  status       String    @default("queued") @db.VarChar(16)
+  attempts     Int       @default(0)
+  available_at DateTime  @default(now())
+  last_error   String?   @db.Text
+  provider_ref String?   @db.VarChar(255)
+  sent_at      DateTime?
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([event_id, channel])
+  @@index([status, available_at])
+  @@index([org_id, user_id, created_at])
+  @@map("notification_deliveries")
+}
+
+model SchedulerJobState {
+  job_key         String    @id @db.VarChar(100)
+  last_started_at DateTime?
+  last_success_at DateTime?
+  last_error      String?   @db.Text
+  updated_at      DateTime  @updatedAt
+
+  @@map("scheduler_job_states")
+}
+
+model SchedulerJobMarker {
+  id         String    @id @default(uuid())
+  org_id     String
+  job_key    String    @db.VarChar(100)
+  subject_id String    @db.VarChar(100)
+  period_key String    @db.VarChar(80)
+  status     String    @default("processing") @db.VarChar(16)
+  attempts   Int       @default(1)
+  locked_at  DateTime  @default(now())
+  sent_at    DateTime?
+  last_error String?   @db.Text
+  created_at DateTime  @default(now())
+  updated_at DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, job_key, subject_id, period_key])
+  @@index([status, locked_at])
+  @@index([created_at])
+  @@map("scheduler_job_markers")
+}
+
+model OrganizationJobSchedule {
+  org_id          String
+  job_key         String    @db.VarChar(100)
+  timezone        String    @db.VarChar(100)
+  schedule_config String    @db.VarChar(160)
+  next_run_at     DateTime
+  last_run_at     DateTime?
+  updated_at      DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@id([org_id, job_key])
+  @@index([job_key, next_run_at, org_id])
+  @@map("organization_job_schedules")
+}
+
+model OffboardingCase {
+  id                  String    @id @default(uuid())
+  org_id              String
+  user_id             String
+  opened_by           String
+  case_type           String    @db.VarChar(24)
+  notice_at           DateTime  @default(now())
+  last_working_day    DateTime  @db.Date
+  status              String    @default("planning") @db.VarChar(24)
+  confidential_reason String?   @db.Text
+  cancellation_reason String?   @db.Text
+  access_revoked_at   DateTime?
+  sessions_revoked_at DateTime?
+  completed_at        DateTime?
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+
+  organisation Organisation           @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  subject      User                   @relation("OffboardingSubject", fields: [user_id], references: [id])
+  opener       User                   @relation("OffboardingOpener", fields: [opened_by], references: [id])
+  tasks        OffboardingTask[]
+  assets       OffboardingAsset[]
+  settlement   OffboardingSettlement?
+
+  @@index([org_id, status, last_working_day])
+  @@index([org_id, user_id, created_at])
+  @@map("offboarding_cases")
+}
+
+model OffboardingTask {
+  id           String    @id @default(uuid())
+  case_id      String
+  title        String    @db.VarChar(200)
+  description  String?   @db.Text
+  owner_id     String?
+  due_date     DateTime? @db.Date
+  status       String    @default("pending") @db.VarChar(20)
+  completed_at DateTime?
+  completed_by String?
+  created_at   DateTime  @default(now())
+
+  offboarding OffboardingCase @relation(fields: [case_id], references: [id], onDelete: Cascade)
+  owner       User?           @relation("OffboardingTaskOwner", fields: [owner_id], references: [id], onDelete: SetNull)
+  completer   User?           @relation("OffboardingTaskCompleter", fields: [completed_by], references: [id], onDelete: SetNull)
+
+  @@index([case_id, status])
+  @@map("offboarding_tasks")
+}
+
+model OffboardingAsset {
+  id            String    @id @default(uuid())
+  case_id       String
+  asset_name    String    @db.VarChar(200)
+  serial_number String?   @db.VarChar(120)
+  status        String    @default("outstanding") @db.VarChar(20)
+  due_date      DateTime? @db.Date
+  resolved_at   DateTime?
+  note          String?   @db.Text
+  created_at    DateTime  @default(now())
+
+  offboarding OffboardingCase @relation(fields: [case_id], references: [id], onDelete: Cascade)
+
+  @@index([case_id, status])
+  @@map("offboarding_assets")
+}
+
+model OffboardingSettlement {
+  id            String    @id @default(uuid())
+  org_id        String
+  case_id       String    @unique
+  currency      String    @default("PKR") @db.VarChar(3)
+  items         Json
+  total_amount  Int
+  status        String    @default("draft") @db.VarChar(16)
+  created_by    String
+  submitted_at  DateTime?
+  reviewed_by   String?
+  reviewed_at   DateTime?
+  reviewer_note String?   @db.Text
+  locked_by     String?
+  locked_at     DateTime?
+  waiver_reason String?   @db.Text
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  organisation Organisation    @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  offboarding  OffboardingCase @relation(fields: [case_id], references: [id], onDelete: Cascade)
+  creator      User            @relation("OffboardingSettlementCreator", fields: [created_by], references: [id])
+  reviewer     User?           @relation("OffboardingSettlementReviewer", fields: [reviewed_by], references: [id])
+  locker       User?           @relation("OffboardingSettlementLocker", fields: [locked_by], references: [id])
+
+  @@index([org_id, status, created_at])
+  @@map("offboarding_settlements")
+}
+
+model IdempotencyRecord {
+  id            String   @id @default(uuid())
+  org_id        String
+  user_id       String
+  key           String   @db.VarChar(128)
+  request_hash  String   @db.VarChar(64)
+  state         String   @default("processing") @db.VarChar(20)
+  status_code   Int?
+  response_body Json?
+  expires_at    DateTime
+  created_at    DateTime @default(now())
+  updated_at    DateTime @updatedAt
+
+  @@unique([org_id, user_id, key])
+  @@index([expires_at])
+  @@map("idempotency_records")
+}
+
 model User {
-  id                      String    @id @default(uuid())
+  id                      String                 @id @default(uuid())
   org_id                  String
-  name                    String    @db.VarChar(255)
-  email                   String    @unique @db.VarChar(255)
+  name                    String                 @db.VarChar(255)
+  email                   String                 @unique @db.VarChar(255)
   password_hash           String
-  role                    String    @db.VarChar(50)
-  department              String?   @db.VarChar(100)
+  role                    String                 @db.VarChar(50)
+  department              String?                @db.VarChar(100)
   department_id           String?
-  job_title               String?   @db.VarChar(100)
-  phone                   String?   @db.VarChar(30)
+  job_title               String?                @db.VarChar(100)
+  phone                   String?                @db.VarChar(30)
   manager_id              String?
-  hourly_rate             Decimal   @default(0) @db.Decimal(10, 2)
+  hourly_rate             Decimal                @default(0) @db.Decimal(10, 2)
   avatar_url              String?
-  is_active               Boolean   @default(true)
-  setup_complete          Boolean   @default(false)
-  invite_token            String?   @unique
+  is_active               Boolean                @default(true)
+  setup_complete          Boolean                @default(false)
+  invite_token            String?                @unique
   invite_expires          DateTime?
-  reset_token             String?   @unique
+  reset_token             String?                @unique
   reset_expires           DateTime?
-  login_attempts          Int       @default(0)
+  login_attempts          Int                    @default(0)
   locked_until            DateTime?
   totp_secret             String?
-  totp_enabled            Boolean   @default(false)
-  notification_prefs      Json      @default("{\"check_in\":true,\"leave_updates\":true,\"shift_reminders\":true,\"payroll\":true,\"announcements\":true,\"late_alerts\":true}")
-  google_id               String?   @unique
-  date_of_birth           DateTime? @db.Date
-  gender                  String?   @db.VarChar(20)
-  address                 String?   @db.Text
-  city                    String?   @db.VarChar(100)
-  country                 String?   @db.VarChar(100)
-  emergency_contact_name  String?   @db.VarChar(255)
-  emergency_contact_phone String?   @db.VarChar(50)
-  employment_type         String?   @db.VarChar(30)
-  joined_at               DateTime? @db.Date
-  national_id             String?   @db.VarChar(100)
+  totp_enabled            Boolean                @default(false)
+  notification_prefs      Json                   @default("{\"categories\":{\"attendance\":true,\"requests\":true,\"shifts\":true,\"projects\":true,\"payroll\":true,\"announcements\":true,\"documents\":true,\"security\":true},\"channels\":{\"in_app\":true,\"push\":true,\"email\":false,\"whatsapp\":false},\"quiet_hours\":{\"enabled\":false,\"start\":\"22:00\",\"end\":\"08:00\"},\"digest\":\"off\"}")
+  report_schedules        ReportSchedule[]
+  report_runs             ReportRun[]
+  report_definitions      ReportDefinition[]
+  notification_deliveries NotificationDelivery[]
+  google_id               String?                @unique
+  date_of_birth           DateTime?              @db.Date
+  gender                  String?                @db.VarChar(20)
+  address                 String?                @db.Text
+  city                    String?                @db.VarChar(100)
+  country                 String?                @db.VarChar(100)
+  primary_location_id     String?
+  emergency_contact_name  String?                @db.VarChar(255)
+  emergency_contact_phone String?                @db.VarChar(50)
+  employment_type         String?                @db.VarChar(30)
+  joined_at               DateTime?              @db.Date
+  national_id             String?                @db.VarChar(100)
   fcm_token               String?
   fcm_token_updated_at    DateTime?
-  created_at              DateTime  @default(now())
+  whatsapp_opted_in_at    DateTime?
+  created_at              DateTime               @default(now())
   deleted_at              DateTime?
 
-  org                          Organisation           @relation(fields: [org_id], references: [id])
-  department_ref               Department?            @relation(fields: [department_id], references: [id], onDelete: SetNull)
-  manager                      User?                  @relation("UserManager", fields: [manager_id], references: [id])
-  direct_reports               User[]                 @relation("UserManager")
-  attendance_records           AttendanceRecord[]
-  corrections_requested        AttendanceCorrection[] @relation("CorrectionUser")
-  corrections_reviewed         AttendanceCorrection[] @relation("CorrectionReviewer")
-  expense_claims               ExpenseClaim[]         @relation("ExpenseClaimant")
-  expenses_reviewed            ExpenseClaim[]         @relation("ExpenseReviewer")
-  documents                    EmployeeDocument[]     @relation("DocumentOwner")
-  documents_uploaded           EmployeeDocument[]     @relation("DocumentUploader")
-  announcements_authored       Announcement[]         @relation("AnnouncementAuthor")
-  announcement_receipts        AnnouncementReceipt[]
-  onboarding_templates_created OnboardingTemplate[]   @relation("OnboardingTemplateCreator")
-  onboarding_tasks             OnboardingTask[]       @relation("OnboardingHire")
-  onboarding_tasks_assigned    OnboardingTask[]       @relation("OnboardingAssignee")
-  kudos_given                  Kudos[]                @relation("KudosGiver")
-  kudos_received               Kudos[]                @relation("KudosRecipient")
-  leave_requests               LeaveRequest[]
-  leave_balances               LeaveBalance[]
-  reviewed_leaves              LeaveRequest[]         @relation("LeaveReviewer")
-  shift_assignments            ShiftAssignment[]
-  checkpoint_scans             ShiftCheckpointScan[]
-  emergency_offers_created     EmergencyShiftOffer[]  @relation("EmergencyShiftCreator")
-  emergency_offers_claimed     EmergencyShiftOffer[]  @relation("EmergencyShiftClaimer")
-  shift_availability           ShiftAvailability[]
-  shift_events                 ShiftScheduleEvent[]   @relation("ShiftEventActor")
-  swap_requests_sent           ShiftSwap[]            @relation("SwapRequester")
-  swap_requests_received       ShiftSwap[]            @relation("SwapTarget")
-  payroll_records              PayrollRecord[]
-  processed_payrolls           PayrollRecord[]        @relation("PayrollProcessor")
-  performance_reviews          PerformanceReview[]    @relation("ReviewSubject")
-  submitted_reviews            PerformanceReview[]    @relation("ReviewSubmitter")
-  performance_goals            PerformanceGoal[]
-  remote_sessions              RemoteSession[]
-  notifications                InAppNotification[]
-  late_arrival_notices         LateArrivalNotice[]
-  overtime_requests            OvertimeRequest[]
-  org_role_assignment          UserOrgRole?
-  permission_grants            UserPermissionGrant[]
-  refresh_tokens               RefreshToken[]
-  sessions                     UserSession[]
-  platform_role_assignments    PlatformUserRole[]
-  projects_owned               Project[]              @relation("ProjectOwner")
-  project_memberships          ProjectMember[]
-  project_tasks_assigned       ProjectTask[]          @relation("ProjectTaskAssignee")
-  project_tasks_created        ProjectTask[]          @relation("ProjectTaskCreator")
-  project_attachments          ProjectAttachment[]
-  project_task_comments        ProjectTaskComment[]
-  ai_conversations             AiConversation[]
+  org                                Organisation                @relation(fields: [org_id], references: [id])
+  primary_location                   Location?                   @relation("UserPrimaryLocation", fields: [primary_location_id], references: [id], onDelete: SetNull)
+  locations_created                  Location[]                  @relation("LocationCreator")
+  department_ref                     Department?                 @relation(fields: [department_id], references: [id], onDelete: SetNull)
+  manager                            User?                       @relation("UserManager", fields: [manager_id], references: [id])
+  direct_reports                     User[]                      @relation("UserManager")
+  attendance_records                 AttendanceRecord[]
+  corrections_requested              AttendanceCorrection[]      @relation("CorrectionUser")
+  corrections_reviewed               AttendanceCorrection[]      @relation("CorrectionReviewer")
+  expense_claims                     ExpenseClaim[]              @relation("ExpenseClaimant")
+  expenses_reviewed                  ExpenseClaim[]              @relation("ExpenseReviewer")
+  documents                          EmployeeDocument[]          @relation("DocumentOwner")
+  documents_uploaded                 EmployeeDocument[]          @relation("DocumentUploader")
+  announcements_authored             Announcement[]              @relation("AnnouncementAuthor")
+  announcement_receipts              AnnouncementReceipt[]
+  onboarding_templates_created       OnboardingTemplate[]        @relation("OnboardingTemplateCreator")
+  onboarding_tasks                   OnboardingTask[]            @relation("OnboardingHire")
+  onboarding_tasks_assigned          OnboardingTask[]            @relation("OnboardingAssignee")
+  kudos_given                        Kudos[]                     @relation("KudosGiver")
+  kudos_received                     Kudos[]                     @relation("KudosRecipient")
+  leave_requests                     LeaveRequest[]
+  leave_balances                     LeaveBalance[]
+  leave_ledger_entries               LeaveLedgerEntry[]          @relation("LeaveLedgerSubject")
+  leave_ledger_actions               LeaveLedgerEntry[]          @relation("LeaveLedgerActor")
+  leave_accrual_grants               LeaveAccrualGrant[]
+  reviewed_leaves                    LeaveRequest[]              @relation("LeaveReviewer")
+  shift_assignments                  ShiftAssignment[]
+  checkpoint_scans                   ShiftCheckpointScan[]
+  emergency_offers_created           EmergencyShiftOffer[]       @relation("EmergencyShiftCreator")
+  emergency_offers_claimed           EmergencyShiftOffer[]       @relation("EmergencyShiftClaimer")
+  shift_availability                 ShiftAvailability[]
+  shift_events                       ShiftScheduleEvent[]        @relation("ShiftEventActor")
+  swap_requests_sent                 ShiftSwap[]                 @relation("SwapRequester")
+  swap_requests_received             ShiftSwap[]                 @relation("SwapTarget")
+  payroll_records                    PayrollRecord[]
+  processed_payrolls                 PayrollRecord[]             @relation("PayrollProcessor")
+  generated_payrolls                 PayrollRecord[]             @relation("PayrollGenerator")
+  statutory_parameter_sets_created   StatutoryParameterSet[]     @relation("StatutorySetCreator")
+  statutory_parameter_sets_activated StatutoryParameterSet[]     @relation("StatutorySetActivator")
+  pay_rates                          PayRate[]                   @relation("PayRateEmployee")
+  pay_rates_created                  PayRate[]                   @relation("PayRateCreator")
+  locations_managed                  LocationManager[]           @relation("LocationManagerUser")
+  performance_reviews                PerformanceReview[]         @relation("ReviewSubject")
+  submitted_reviews                  PerformanceReview[]         @relation("ReviewSubmitter")
+  performance_goals                  PerformanceGoal[]
+  remote_sessions                    RemoteSession[]
+  notifications                      InAppNotification[]
+  late_arrival_notices               LateArrivalNotice[]
+  overtime_requests                  OvertimeRequest[]
+  org_role_assignment                UserOrgRole?
+  permission_grants                  UserPermissionGrant[]
+  refresh_tokens                     RefreshToken[]
+  sessions                           UserSession[]
+  api_keys                           PublicApiKey[]
+  calendar_feed                      CalendarFeed?
+  attendance_sync_watermarks         AttendanceSyncWatermark[]
+  attendance_devices_owned           AttendanceDevice[]          @relation("AttendanceDeviceOwner")
+  attendance_devices_approved        AttendanceDevice[]          @relation("AttendanceDeviceApprover")
+  attendance_device_challenges       AttendanceDeviceChallenge[] @relation("AttendanceDeviceChallengeOwner")
+  platform_role_assignments          PlatformUserRole[]
+  projects_owned                     Project[]                   @relation("ProjectOwner")
+  time_entries                       TimeEntry[]
+  timesheets                         Timesheet[]                 @relation("TimesheetOwner")
+  timesheets_reviewed                Timesheet[]                 @relation("TimesheetReviewer")
+  project_memberships                ProjectMember[]
+  project_tasks_assigned             ProjectTask[]               @relation("ProjectTaskAssignee")
+  project_tasks_created              ProjectTask[]               @relation("ProjectTaskCreator")
+  project_attachments                ProjectAttachment[]
+  project_task_comments              ProjectTaskComment[]
+  ai_conversations                   AiConversation[]
+  offboarding_subjects               OffboardingCase[]           @relation("OffboardingSubject")
+  offboarding_opened                 OffboardingCase[]           @relation("OffboardingOpener")
+  offboarding_tasks_owned            OffboardingTask[]           @relation("OffboardingTaskOwner")
+  offboarding_tasks_done             OffboardingTask[]           @relation("OffboardingTaskCompleter")
+  offboarding_settlements_created    OffboardingSettlement[]     @relation("OffboardingSettlementCreator")
+  offboarding_settlements_reviewed   OffboardingSettlement[]     @relation("OffboardingSettlementReviewer")
+  offboarding_settlements_locked     OffboardingSettlement[]     @relation("OffboardingSettlementLocker")
 
   @@index([org_id])
+  @@index([org_id, created_at(sort: Desc), id])
+  @@index([org_id, primary_location_id, is_active, deleted_at])
+  @@index([primary_location_id])
   @@map("users")
+}
+
+model Location {
+  id           String   @id @default(uuid())
+  org_id       String
+  name         String   @db.VarChar(120)
+  address      String?  @db.Text
+  timezone     String   @db.VarChar(100)
+  office_ips   String[] @default([])
+  office_ssids String[] @default([])
+  geofence     Json?
+  is_main      Boolean  @default(false)
+  is_active    Boolean  @default(true)
+  created_by   String?
+  created_at   DateTime @default(now())
+  updated_at   DateTime @updatedAt
+
+  org                Organisation       @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  creator            User?              @relation("LocationCreator", fields: [created_by], references: [id], onDelete: SetNull)
+  primary_users      User[]             @relation("UserPrimaryLocation")
+  managers           LocationManager[]
+  attendance_records AttendanceRecord[]
+  shift_assignments  ShiftAssignment[]
+  leave_requests     LeaveRequest[]
+  labor_budgets      LaborBudget[]
+  holidays           OrgHoliday[]
+
+  @@unique([org_id, name])
+  @@index([org_id, is_active, name])
+  @@map("locations")
+}
+
+model LocationManager {
+  location_id String
+  user_id     String
+  created_at  DateTime @default(now())
+
+  location Location @relation(fields: [location_id], references: [id], onDelete: Cascade)
+  user     User     @relation("LocationManagerUser", fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([location_id, user_id])
+  @@index([user_id, location_id])
+  @@map("location_managers")
 }
 
 model AttendanceCorrection {
@@ -210,16 +581,18 @@ model AttendanceCorrection {
 }
 
 model OrgHoliday {
-  id         String   @id @default(uuid())
-  org_id     String
-  date       DateTime @db.Date
-  name       String   @db.VarChar(120)
-  recurring  Boolean  @default(false)
-  created_at DateTime @default(now())
+  id          String   @id @default(uuid())
+  org_id      String
+  location_id String?
+  date        DateTime @db.Date
+  name        String   @db.VarChar(120)
+  recurring   Boolean  @default(false)
+  created_at  DateTime @default(now())
 
-  org Organisation @relation(fields: [org_id], references: [id])
+  org      Organisation @relation(fields: [org_id], references: [id])
+  location Location?    @relation(fields: [location_id], references: [id], onDelete: SetNull)
 
-  @@unique([org_id, date])
+  @@index([org_id, location_id, date])
   @@map("org_holidays")
 }
 
@@ -227,16 +600,18 @@ model OrgHoliday {
 // (same event types the SSE bus emits). Deliveries are HMAC-SHA256 signed
 // with the per-hook secret; 20 consecutive failures auto-disable the hook.
 model OrgWebhook {
-  id              String    @id @default(uuid())
-  org_id          String
-  url             String
-  secret          String
-  events          String[]  @default([])
-  is_active       Boolean   @default(true)
-  last_success_at DateTime?
-  last_failure_at DateTime?
-  failure_count   Int       @default(0)
-  created_at      DateTime  @default(now())
+  id                         String    @id @default(uuid())
+  org_id                     String
+  url                        String
+  secret                     String
+  previous_secret            String?
+  previous_secret_expires_at DateTime?
+  events                     String[]  @default([])
+  is_active                  Boolean   @default(true)
+  last_success_at            DateTime?
+  last_failure_at            DateTime?
+  failure_count              Int       @default(0)
+  created_at                 DateTime  @default(now())
 
   org        Organisation         @relation(fields: [org_id], references: [id], onDelete: Cascade)
   deliveries OrgWebhookDelivery[]
@@ -246,27 +621,30 @@ model OrgWebhook {
 }
 
 model OrgWebhookDelivery {
-  id              String    @id @default(uuid())
-  webhook_id      String?
-  outbox_event_id String?
-  org_id          String
-  event           String    @db.VarChar(60)
-  endpoint_url    String
-  payload         String    @db.Text
-  signature       String    @db.VarChar(64)
-  status          String    @default("queued") @db.VarChar(20)
-  attempts        Int       @default(0)
-  next_attempt_at DateTime  @default(now())
-  last_attempt_at DateTime?
-  delivered_at    DateTime?
-  response_status Int?
-  last_error      String?   @db.Text
-  created_at      DateTime  @default(now())
-  updated_at      DateTime  @updatedAt
+  id                            String    @id @default(uuid())
+  webhook_id                    String?
+  outbox_event_id               String?
+  org_id                        String
+  event                         String    @db.VarChar(60)
+  schema_version                Int       @default(1)
+  endpoint_url                  String
+  payload                       String    @db.Text
+  signature                     String    @db.VarChar(64)
+  previous_signature            String?   @db.VarChar(64)
+  previous_signature_expires_at DateTime?
+  status                        String    @default("queued") @db.VarChar(20)
+  attempts                      Int       @default(0)
+  next_attempt_at               DateTime  @default(now())
+  last_attempt_at               DateTime?
+  delivered_at                  DateTime?
+  response_status               Int?
+  last_error                    String?   @db.Text
+  created_at                    DateTime  @default(now())
+  updated_at                    DateTime  @updatedAt
 
-  webhook OrgWebhook?  @relation(fields: [webhook_id], references: [id], onDelete: SetNull)
+  webhook      OrgWebhook?  @relation(fields: [webhook_id], references: [id], onDelete: SetNull)
   outbox_event OutboxEvent? @relation(fields: [outbox_event_id], references: [id], onDelete: SetNull)
-  org     Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  org          Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
 
   @@unique([outbox_event_id, webhook_id])
   @@index([status, next_attempt_at])
@@ -276,23 +654,26 @@ model OrgWebhookDelivery {
 }
 
 model OutboxEvent {
-  id             String    @id @default(uuid())
-  org_id         String
-  event_type     String    @db.VarChar(60)
-  entity_type    String    @db.VarChar(60)
-  entity_id      String
-  payload        Json      @default("{}")
-  created_at     DateTime  @default(now())
-  published_at   DateTime?
-  claimed_at     DateTime?
-  claim_token    String?   @db.VarChar(80)
-  attempts       Int       @default(0)
-  last_error     String?   @db.Text
+  id               String    @id @default(uuid())
+  org_id           String
+  event_type       String    @db.VarChar(60)
+  entity_type      String    @db.VarChar(60)
+  entity_id        String
+  payload          Json      @default("{}")
+  schema_version   Int       @default(1)
+  created_at       DateTime  @default(now())
+  published_at     DateTime?
+  claimed_at       DateTime?
+  claim_token      String?   @db.VarChar(80)
+  attempts         Int       @default(0)
+  last_error       String?   @db.Text
+  next_attempt_at  DateTime  @default(now())
+  dead_lettered_at DateTime?
 
   org        Organisation         @relation(fields: [org_id], references: [id], onDelete: Cascade)
   deliveries OrgWebhookDelivery[]
 
-  @@index([published_at, claimed_at, created_at])
+  @@index([published_at, dead_lettered_at, next_attempt_at, claimed_at, created_at])
   @@index([org_id, created_at])
   @@map("outbox_events")
 }
@@ -352,6 +733,110 @@ model UserSession {
   @@map("user_sessions")
 }
 
+model PublicApiKey {
+  id           String    @id @default(uuid())
+  org_id       String
+  user_id      String
+  name         String    @db.VarChar(120)
+  key_prefix   String    @unique @db.VarChar(16)
+  key_hash     String    @unique @db.VarChar(64)
+  scopes       String[]  @default([])
+  last_used_at DateTime?
+  expires_at   DateTime?
+  revoked_at   DateTime?
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  owner        User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([org_id, created_at(sort: Desc)])
+  @@index([org_id, revoked_at, expires_at])
+  @@index([user_id, revoked_at])
+  @@map("public_api_keys")
+}
+
+model CalendarFeed {
+  id           String    @id @default(uuid())
+  org_id       String
+  user_id      String    @unique
+  token_hash   String    @unique @db.VarChar(64)
+  created_at   DateTime  @default(now())
+  revoked_at   DateTime?
+  last_used_at DateTime?
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@index([org_id, revoked_at])
+  @@map("calendar_feeds")
+}
+
+model AttendanceSyncWatermark {
+  org_id        String
+  user_id       String
+  last_sequence Int       @default(0)
+  pending_until DateTime?
+  last_sync_at  DateTime?
+  updated_at    DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@id([org_id, user_id])
+  @@index([org_id, pending_until])
+  @@map("attendance_sync_watermarks")
+}
+
+model AttendanceDevice {
+  id                        String    @id @default(uuid())
+  org_id                    String
+  user_id                   String
+  label                     String    @db.VarChar(100)
+  platform                  String    @db.VarChar(20)
+  public_key                String    @db.Text
+  fingerprint               String    @db.VarChar(64)
+  status                    String    @default("pending") @db.VarChar(16)
+  enrollment_challenge_hash String?   @db.VarChar(64)
+  challenge_expires_at      DateTime?
+  key_proven_at             DateTime?
+  approved_by               String?
+  approved_at               DateTime?
+  revoked_at                DateTime?
+  last_used_at              DateTime?
+  created_at                DateTime  @default(now())
+  updated_at                DateTime  @updatedAt
+
+  organisation       Organisation                @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user               User                        @relation("AttendanceDeviceOwner", fields: [user_id], references: [id], onDelete: Cascade)
+  approver           User?                       @relation("AttendanceDeviceApprover", fields: [approved_by], references: [id], onDelete: SetNull)
+  checkin_challenges AttendanceDeviceChallenge[]
+
+  @@unique([user_id, fingerprint])
+  @@index([org_id, status, created_at])
+  @@index([user_id, status])
+  @@map("attendance_devices")
+}
+
+model AttendanceDeviceChallenge {
+  id             String    @id @default(uuid())
+  org_id         String
+  user_id        String
+  device_id      String
+  challenge_hash String    @unique @db.VarChar(64)
+  expires_at     DateTime
+  consumed_at    DateTime?
+  created_at     DateTime  @default(now())
+
+  organisation Organisation     @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user         User             @relation("AttendanceDeviceChallengeOwner", fields: [user_id], references: [id], onDelete: Cascade)
+  device       AttendanceDevice @relation(fields: [device_id], references: [id], onDelete: Cascade)
+
+  @@index([org_id, user_id, device_id, expires_at])
+  @@index([device_id, consumed_at, expires_at])
+  @@map("attendance_device_challenges")
+}
+
 model AuditLog {
   id          String   @id @default(uuid())
   org_id      String
@@ -370,45 +855,52 @@ model AuditLog {
 }
 
 model AttendanceRecord {
-  id                      String    @id @default(uuid())
-  user_id                 String
-  org_id                  String
-  date                    DateTime  @db.Date
-  check_in_at             DateTime?
-  client_checkin_at       DateTime?
-  checkin_received_at     DateTime?
-  checkin_idempotency_key String?   @db.VarChar(100)
-  checkin_request_hash    String?   @db.VarChar(64)
-  checkin_source          String?   @db.VarChar(20)
-  checkin_requires_review Boolean   @default(false)
-  device_uptime_ms        Float?
-  server_anchor_at        DateTime?
-  server_anchor_uptime_ms Float?
-  clock_epoch             String?   @db.VarChar(80)
-  checkin_reviewed_at     DateTime?
-  checkin_reviewed_by     String?   @db.Text
-  checkin_review_decision String?   @db.VarChar(20)
-  checkin_review_note     String?   @db.Text
-  offline_reconciled      Boolean   @default(false)
-  latitude                Float?
-  longitude               Float?
-  location_accuracy_m     Float?
-  mock_location_detected  Boolean   @default(false)
-  geofence_status         String?   @db.VarChar(20)
-  geofence_distance_m     Float?
-  check_out_at            DateTime?
-  check_in_type           String    @db.VarChar(20)
-  status                  String    @db.VarChar(20)
-  hours_worked            Decimal?  @db.Decimal(5, 2)
-  overtime_hours          Decimal   @default(0) @db.Decimal(5, 2)
-  extra_office_minutes    Int       @default(0)
-  ip_detected             String?   @db.VarChar(50)
-  is_overridden           Boolean   @default(false)
-  override_by             String?
-  override_reason         String?
-  shift_id                String?
-  ip_checkout_pending_at  DateTime?
-  created_at              DateTime  @default(now())
+  id                        String    @id @default(uuid())
+  user_id                   String
+  org_id                    String
+  location_id               String?
+  date                      DateTime  @db.Date
+  check_in_at               DateTime?
+  client_checkin_at         DateTime?
+  checkin_received_at       DateTime?
+  checkin_idempotency_key   String?   @db.VarChar(100)
+  checkin_request_hash      String?   @db.VarChar(64)
+  checkout_idempotency_key  String?   @db.VarChar(100)
+  checkout_request_hash     String?   @db.VarChar(64)
+  checkin_source            String?   @db.VarChar(20)
+  attendance_device_id      String?
+  device_proof_status       String?   @db.VarChar(20)
+  device_signature_verified Boolean   @default(false)
+  checkin_requires_review   Boolean   @default(false)
+  device_uptime_ms          Float?
+  server_anchor_at          DateTime?
+  server_anchor_uptime_ms   Float?
+  clock_epoch               String?   @db.VarChar(80)
+  checkin_reviewed_at       DateTime?
+  checkin_reviewed_by       String?   @db.Text
+  checkin_review_decision   String?   @db.VarChar(20)
+  checkin_review_note       String?   @db.Text
+  checkin_review_reason     String?   @db.VarChar(60)
+  offline_reconciled        Boolean   @default(false)
+  latitude                  Float?
+  longitude                 Float?
+  location_accuracy_m       Float?
+  mock_location_detected    Boolean   @default(false)
+  geofence_status           String?   @db.VarChar(20)
+  geofence_distance_m       Float?
+  check_out_at              DateTime?
+  check_in_type             String    @db.VarChar(20)
+  status                    String    @db.VarChar(20)
+  hours_worked              Decimal?  @db.Decimal(5, 2)
+  overtime_hours            Decimal   @default(0) @db.Decimal(5, 2)
+  extra_office_minutes      Int       @default(0)
+  ip_detected               String?   @db.VarChar(50)
+  is_overridden             Boolean   @default(false)
+  override_by               String?
+  override_reason           String?
+  shift_id                  String?
+  ip_checkout_pending_at    DateTime?
+  created_at                DateTime  @default(now())
 
   scheduled_start       DateTime?
   scheduled_end         DateTime?
@@ -431,40 +923,53 @@ model AttendanceRecord {
 
   user             User                   @relation(fields: [user_id], references: [id])
   org              Organisation           @relation(fields: [org_id], references: [id])
+  location         Location?              @relation(fields: [location_id], references: [id], onDelete: SetNull)
   shift            Shift?                 @relation(fields: [shift_id], references: [id])
   late_notice      LateArrivalNotice?     @relation(fields: [late_notice_id], references: [id], onDelete: SetNull)
   remote_session   RemoteSession?
   break_records    BreakRecord[]
+  time_entries     TimeEntry[]
   corrections      AttendanceCorrection[]
   overtime_request OvertimeRequest?
 
   @@unique([user_id, date])
   @@unique([user_id, checkin_idempotency_key])
+  @@unique([user_id, checkout_idempotency_key])
   @@index([org_id, date])
+  @@index([location_id, date])
+  @@index([check_out_at, last_heartbeat_at, status])
+  @@index([check_out_at, date, status])
+  @@index([user_id, date(sort: Desc), id])
   @@index([org_id, checkin_requires_review, checkin_received_at])
   @@map("attendance_records")
 }
 
 model BreakRecord {
-  id                  String    @id @default(uuid())
-  attendance_id       String
-  break_start         DateTime
-  break_end           DateTime?
-  is_paid             Boolean   @default(false)
-  break_type          String    @db.VarChar(50)
-  duration_mins       Int?
-  auto_ended          Boolean   @default(false)
-  auto_started        Boolean   @default(false)
-  shift_break_id      String?
-  limit_exceeded      Boolean   @default(false)
-  counted_as_extra    Boolean   @default(false)
-  source              String    @default("manual") @db.VarChar(30)
-  late_return_minutes Int?
-  wifi_on_at_end      Boolean?
+  id                    String    @id @default(uuid())
+  attendance_id         String
+  break_start           DateTime
+  break_end             DateTime?
+  is_paid               Boolean   @default(false)
+  break_type            String    @db.VarChar(50)
+  duration_mins         Int?
+  auto_ended            Boolean   @default(false)
+  auto_started          Boolean   @default(false)
+  shift_break_id        String?
+  limit_exceeded        Boolean   @default(false)
+  counted_as_extra      Boolean   @default(false)
+  source                String    @default("manual") @db.VarChar(30)
+  start_idempotency_key String?   @db.VarChar(100)
+  start_request_hash    String?   @db.VarChar(64)
+  end_idempotency_key   String?   @db.VarChar(100)
+  end_request_hash      String?   @db.VarChar(64)
+  late_return_minutes   Int?
+  wifi_on_at_end        Boolean?
 
   attendance  AttendanceRecord @relation(fields: [attendance_id], references: [id], onDelete: Cascade)
   shift_break ShiftBreak?      @relation(fields: [shift_break_id], references: [id], onDelete: SetNull)
 
+  @@unique([start_idempotency_key])
+  @@unique([end_idempotency_key])
   @@map("break_records")
 }
 
@@ -512,6 +1017,7 @@ model LeaveRequest {
   id               String    @id @default(uuid())
   user_id          String
   org_id           String
+  location_id      String?
   leave_type       String    @db.VarChar(50)
   start_date       DateTime  @db.Date
   end_date         DateTime  @db.Date
@@ -529,9 +1035,14 @@ model LeaveRequest {
 
   user     User         @relation(fields: [user_id], references: [id])
   org      Organisation @relation(fields: [org_id], references: [id])
+  location Location?    @relation(fields: [location_id], references: [id], onDelete: SetNull)
   reviewer User?        @relation("LeaveReviewer", fields: [reviewed_by], references: [id])
 
   @@index([user_id, status, start_date, end_date])
+  @@index([user_id, created_at(sort: Desc), id])
+  @@index([org_id, status, created_at(sort: Desc), id])
+  @@index([org_id, created_at(sort: Desc), id])
+  @@index([location_id, start_date, end_date])
   @@map("leave_requests")
 }
 
@@ -552,6 +1063,30 @@ model LeaveBalance {
   @@map("leave_balances")
 }
 
+model LeaveLedgerEntry {
+  id             String   @id @default(uuid())
+  user_id        String
+  org_id         String
+  leave_type     String   @db.VarChar(50)
+  year           Int
+  total_delta    Decimal  @db.Decimal(8, 2)
+  used_delta     Decimal  @db.Decimal(8, 2)
+  reason         String   @db.VarChar(24)
+  note           String?  @db.Text
+  ref_id         String?
+  actor_id       String?
+  effective_date DateTime @db.Date
+  created_at     DateTime @default(now())
+
+  user  User         @relation("LeaveLedgerSubject", fields: [user_id], references: [id], onDelete: Cascade)
+  org   Organisation @relation("LeaveLedgerOrg", fields: [org_id], references: [id], onDelete: Cascade)
+  actor User?        @relation("LeaveLedgerActor", fields: [actor_id], references: [id], onDelete: SetNull)
+
+  @@index([org_id, user_id, year, leave_type, effective_date])
+  @@index([user_id, created_at(sort: Desc), id])
+  @@map("leave_ledger_entries")
+}
+
 model LeaveAccrualRun {
   id         String   @id @default(uuid())
   org_id     String
@@ -563,6 +1098,26 @@ model LeaveAccrualRun {
 
   @@unique([org_id, year, month])
   @@map("leave_accrual_runs")
+}
+
+model LeaveAccrualGrant {
+  id          String   @id @default(uuid())
+  org_id      String
+  user_id     String
+  leave_type  String   @db.VarChar(50)
+  year        Int
+  month       Int
+  days        Decimal  @db.Decimal(6, 2)
+  location_id String?
+  created_at  DateTime @default(now())
+
+  org  Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, user_id, leave_type, year, month])
+  @@index([org_id, year, month])
+  @@index([user_id, year, month])
+  @@map("leave_accrual_grants")
 }
 
 model Shift {
@@ -628,22 +1183,102 @@ model ShiftBreak {
 }
 
 model ShiftAssignment {
-  id           String   @id @default(uuid())
-  shift_id     String
-  user_id      String
-  date         DateTime @db.Date
-  is_published Boolean  @default(false)
-  created_at   DateTime @default(now())
+  id                     String    @id @default(uuid())
+  shift_id               String
+  user_id                String
+  location_id            String?
+  date                   DateTime  @db.Date
+  is_published           Boolean   @default(false)
+  acknowledgement_status String    @default("not_required") @db.VarChar(20)
+  acknowledgement_due_at DateTime?
+  acknowledged_at        DateTime?
+  acknowledgement_note   String?   @db.VarChar(1000)
+  created_at             DateTime  @default(now())
 
   shift             Shift                 @relation(fields: [shift_id], references: [id])
   user              User                  @relation(fields: [user_id], references: [id])
+  location          Location?             @relation(fields: [location_id], references: [id], onDelete: SetNull)
   swap_as_requester ShiftSwap?            @relation("RequesterAssignment")
   swap_as_target    ShiftSwap?            @relation("TargetAssignment")
   checkpoint_scans  ShiftCheckpointScan[]
   emergency_offer   EmergencyShiftOffer?  @relation("EmergencyShiftAssignment")
 
   @@unique([user_id, date])
+  @@index([date, user_id])
+  @@index([location_id, date])
+  @@index([user_id, is_published, acknowledgement_status, date])
   @@map("shift_assignments")
+}
+
+model LaborBudget {
+  id          String   @id @default(uuid())
+  org_id      String
+  location_id String?
+  week_start  DateTime @db.Date
+  department  String   @default("") @db.VarChar(100)
+  amount      Decimal  @db.Decimal(14, 2)
+  currency    String   @default("PKR") @db.VarChar(10)
+  created_by  String
+  updated_by  String
+  created_at  DateTime @default(now())
+  updated_at  DateTime @updatedAt
+
+  org      Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  location Location?    @relation(fields: [location_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, week_start, department])
+  @@unique([org_id, week_start, department, location_id])
+  @@index([org_id, week_start])
+  @@index([location_id, week_start])
+  @@map("labor_budgets")
+}
+
+model ComplianceRule {
+  id             String    @id @default(uuid())
+  org_id         String
+  code           String    @db.VarChar(80)
+  params         Json
+  severity       String    @db.VarChar(10)
+  source_ref     String?   @db.VarChar(500)
+  effective_from DateTime  @db.Date
+  effective_to   DateTime? @db.Date
+  created_by     String
+  created_at     DateTime  @default(now())
+
+  org        Organisation          @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  violations ComplianceViolation[]
+
+  @@unique([org_id, code, effective_from])
+  @@index([org_id, code, effective_from, effective_to])
+  @@map("compliance_rules")
+}
+
+model ComplianceViolation {
+  id              String    @id @default(uuid())
+  org_id          String
+  rule_id         String?
+  rule_code       String    @db.VarChar(80)
+  dedupe_key      String    @db.VarChar(200)
+  week_start      DateTime  @db.Date
+  assignment_id   String?
+  user_id         String?
+  severity        String    @db.VarChar(10)
+  details         Json
+  status          String    @default("open") @db.VarChar(20)
+  override_reason String?   @db.VarChar(1000)
+  override_by     String?
+  override_at     DateTime?
+  resolved_at     DateTime?
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  org  Organisation    @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  rule ComplianceRule? @relation(fields: [rule_id], references: [id], onDelete: SetNull)
+
+  @@unique([org_id, dedupe_key])
+  @@index([org_id, week_start, status])
+  @@index([org_id, user_id, week_start])
+  @@map("compliance_violations")
 }
 
 model ShiftCheckpoint {
@@ -820,38 +1455,99 @@ model OvertimeRequest {
 }
 
 model PayrollRecord {
-  id                String    @id @default(uuid())
-  user_id           String
-  org_id            String
-  period_month      Int
-  period_year       Int
-  regular_hours     Decimal   @db.Decimal(6, 2)
-  overtime_hours    Decimal   @default(0) @db.Decimal(6, 2)
-  hourly_rate       Decimal   @db.Decimal(10, 2)
-  base_pay          Decimal   @db.Decimal(12, 2)
-  overtime_pay      Decimal   @default(0) @db.Decimal(12, 2)
-  unpaid_deduction  Decimal   @default(0) @db.Decimal(12, 2)
-  manual_adjustment Decimal   @default(0) @db.Decimal(12, 2)
-  adjustment_reason String?
-  gross_pay         Decimal   @db.Decimal(12, 2)
-  tax_deduction     Decimal   @default(0) @db.Decimal(12, 2)
-  pension_deduction Decimal   @default(0) @db.Decimal(12, 2)
-  net_pay           Decimal   @default(0) @db.Decimal(12, 2)
-  status            String    @default("draft")
-  is_incomplete     Boolean   @default(false)
-  payslip_url       String?
-  processed_at      DateTime?
-  processed_by      String?
-  created_at        DateTime  @default(now())
+  id                               String    @id @default(uuid())
+  user_id                          String
+  org_id                           String
+  period_month                     Int
+  period_year                      Int
+  regular_hours                    Decimal   @db.Decimal(6, 2)
+  overtime_hours                   Decimal   @default(0) @db.Decimal(6, 2)
+  hourly_rate                      Decimal   @db.Decimal(10, 2)
+  pay_basis                        String    @default("hourly") @db.VarChar(16)
+  pay_rate_amount                  Decimal   @default(0) @db.Decimal(12, 2)
+  pay_monthly_divisor              Int       @default(26)
+  base_pay                         Decimal   @db.Decimal(12, 2)
+  overtime_pay                     Decimal   @default(0) @db.Decimal(12, 2)
+  unpaid_deduction                 Decimal   @default(0) @db.Decimal(12, 2)
+  manual_adjustment                Decimal   @default(0) @db.Decimal(12, 2)
+  adjustment_reason                String?
+  gross_pay                        Decimal   @db.Decimal(12, 2)
+  tax_deduction                    Decimal   @default(0) @db.Decimal(12, 2)
+  pension_deduction                Decimal   @default(0) @db.Decimal(12, 2)
+  net_pay                          Decimal   @default(0) @db.Decimal(12, 2)
+  status                           String    @default("draft")
+  is_incomplete                    Boolean   @default(false)
+  inputs_hash                      String?   @db.VarChar(64)
+  inputs_stale                     Boolean   @default(false)
+  statutory_parameter_set_id       String?
+  pay_rate_id                      String?
+  tax_calculation_method           String?   @db.VarChar(30)
+  employee_statutory_deductions    Json      @default("[]")
+  employer_statutory_contributions Json      @default("[]")
+  payslip_url                      String?
+  generated_by                     String?
+  processed_at                     DateTime?
+  processed_by                     String?
+  created_at                       DateTime  @default(now())
 
-  user                User           @relation(fields: [user_id], references: [id])
-  org                 Organisation   @relation(fields: [org_id], references: [id])
-  processor           User?          @relation("PayrollProcessor", fields: [processed_by], references: [id])
-  reimbursed_expenses ExpenseClaim[]
+  user                    User                   @relation(fields: [user_id], references: [id])
+  org                     Organisation           @relation(fields: [org_id], references: [id])
+  processor               User?                  @relation("PayrollProcessor", fields: [processed_by], references: [id])
+  generator               User?                  @relation("PayrollGenerator", fields: [generated_by], references: [id], onDelete: SetNull)
+  reimbursed_expenses     ExpenseClaim[]
+  statutory_parameter_set StatutoryParameterSet? @relation(fields: [statutory_parameter_set_id], references: [id], onDelete: SetNull)
+  pay_rate                PayRate?               @relation(fields: [pay_rate_id], references: [id], onDelete: SetNull)
 
   @@unique([user_id, period_month, period_year])
   @@index([org_id, period_year, period_month])
+  @@index([generated_by])
   @@map("payroll_records")
+}
+
+model PayRate {
+  id              String          @id @default(uuid())
+  org_id          String
+  user_id         String
+  amount          Decimal         @db.Decimal(12, 2)
+  basis           String          @default("hourly") @db.VarChar(16)
+  currency        String          @db.VarChar(10)
+  effective_from  DateTime        @db.Date
+  effective_to    DateTime?       @db.Date
+  source          String          @default("manual") @db.VarChar(24)
+  created_by      String?
+  created_at      DateTime        @default(now())
+  org             Organisation    @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user            User            @relation("PayRateEmployee", fields: [user_id], references: [id], onDelete: Cascade)
+  creator         User?           @relation("PayRateCreator", fields: [created_by], references: [id], onDelete: SetNull)
+  payroll_records PayrollRecord[]
+
+  @@unique([user_id, effective_from])
+  @@index([org_id, user_id, effective_from, effective_to])
+  @@map("pay_rates")
+}
+
+model StatutoryParameterSet {
+  id               String          @id @default(uuid())
+  org_id           String
+  country_code     String          @db.Char(2)
+  effective_from   DateTime        @db.Date
+  effective_to     DateTime?       @db.Date
+  status           String          @default("draft") @db.VarChar(16)
+  annual_tax_slabs Json            @default("[]")
+  contributions    Json            @default("[]")
+  source_reference String          @db.Text
+  created_by       String
+  activated_by     String?
+  activated_at     DateTime?
+  created_at       DateTime        @default(now())
+  org              Organisation    @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  creator          User            @relation("StatutorySetCreator", fields: [created_by], references: [id], onDelete: Restrict)
+  activator        User?           @relation("StatutorySetActivator", fields: [activated_by], references: [id], onDelete: Restrict)
+  payroll_records  PayrollRecord[]
+
+  @@index([org_id, country_code, status, effective_from])
+  @@index([org_id, created_at(sort: Desc)])
+  @@map("statutory_parameter_sets")
 }
 
 // Employee expense claims: submit → approve/reject → reimburse through the
@@ -879,6 +1575,7 @@ model ExpenseClaim {
   reimbursed_in PayrollRecord? @relation(fields: [reimbursed_in_payroll_id], references: [id])
 
   @@index([org_id, status])
+  @@index([org_id, created_at(sort: Desc), id])
   @@map("expense_claims")
 }
 
@@ -956,16 +1653,18 @@ model Project {
   status         String    @default("planning") @db.VarChar(30)
   status_options String[]  @default(["todo", "in_progress", "blocked", "done"])
   priority       String    @default("medium") @db.VarChar(20)
+  budget_hours   Decimal?  @db.Decimal(10, 2)
   start_date     DateTime? @db.Date
   due_date       DateTime? @db.Date
   created_at     DateTime  @default(now())
   updated_at     DateTime  @updatedAt
 
-  org         Organisation        @relation(fields: [org_id], references: [id], onDelete: Cascade)
-  owner       User                @relation("ProjectOwner", fields: [owner_id], references: [id])
-  members     ProjectMember[]
-  tasks       ProjectTask[]
-  attachments ProjectAttachment[]
+  org          Organisation        @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  owner        User                @relation("ProjectOwner", fields: [owner_id], references: [id])
+  members      ProjectMember[]
+  tasks        ProjectTask[]
+  attachments  ProjectAttachment[]
+  time_entries TimeEntry[]
 
   @@index([org_id, status])
   @@map("projects")
@@ -1013,10 +1712,63 @@ model ProjectTask {
   comments         ProjectTaskComment[]
   dependencies     ProjectTaskDependency[] @relation("TaskBlockedBy")
   blocking         ProjectTaskDependency[] @relation("TaskBlocks")
+  time_entries     TimeEntry[]
 
   @@index([project_id, status])
   @@index([assignee_id, status])
   @@map("project_tasks")
+}
+
+model TimeEntry {
+  id            String    @id @default(uuid())
+  org_id        String
+  user_id       String
+  project_id    String?
+  task_id       String?
+  attendance_id String?
+  started_at    DateTime
+  ended_at      DateTime?
+  minutes       Int       @default(0)
+  source        String    @default("manual") @db.VarChar(20)
+  billable      Boolean   @default(false)
+  status        String    @default("draft") @db.VarChar(20)
+  description   String?   @db.VarChar(500)
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+
+  org        Organisation      @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user       User              @relation(fields: [user_id], references: [id], onDelete: Cascade)
+  attendance AttendanceRecord? @relation(fields: [attendance_id], references: [id], onDelete: SetNull)
+  project    Project?          @relation(fields: [project_id], references: [id], onDelete: SetNull)
+  task       ProjectTask?      @relation(fields: [task_id], references: [id], onDelete: SetNull)
+
+  @@index([org_id, user_id, started_at(sort: Desc), id])
+  @@index([org_id, project_id, started_at])
+  @@index([org_id, status, started_at])
+  @@index([attendance_id])
+  @@map("time_entries")
+}
+
+model Timesheet {
+  id           String    @id @default(uuid())
+  org_id       String
+  user_id      String
+  week_start   DateTime  @db.Date
+  status       String    @default("draft") @db.VarChar(20)
+  submitted_at DateTime?
+  reviewed_by  String?
+  reviewed_at  DateTime?
+  review_note  String?   @db.VarChar(1000)
+  created_at   DateTime  @default(now())
+  updated_at   DateTime  @updatedAt
+
+  org      Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+  user     User         @relation("TimesheetOwner", fields: [user_id], references: [id], onDelete: Cascade)
+  reviewer User?        @relation("TimesheetReviewer", fields: [reviewed_by], references: [id], onDelete: SetNull)
+
+  @@unique([org_id, user_id, week_start])
+  @@index([org_id, status, submitted_at])
+  @@map("timesheets")
 }
 
 model ProjectTaskDependency {
@@ -1084,21 +1836,46 @@ model ProjectAttachment {
 }
 
 model WhatsappLog {
-  id             String    @id @default(uuid())
-  org_id         String
-  event_type     String    @db.VarChar(50)
-  recipient_type String    @db.VarChar(20)
-  recipient_id   String    @db.VarChar(255)
-  message_body   String    @db.Text
-  status         String    @default("pending")
-  error_message  String?   @db.Text
-  attempts       Int       @default(0)
-  sent_at        DateTime?
-  created_at     DateTime  @default(now())
+  id                  String    @id @default(uuid())
+  org_id              String
+  event_type          String    @db.VarChar(50)
+  recipient_type      String    @db.VarChar(20)
+  recipient_id        String    @db.VarChar(255)
+  message_body        String    @db.Text
+  status              String    @default("pending")
+  error_message       String?   @db.Text
+  attempts            Int       @default(0)
+  sent_at             DateTime?
+  provider_message_id String?   @unique @db.VarChar(255)
+  provider_status     String?   @db.VarChar(20)
+  provider_status_at  DateTime?
+  pricing_category    String?   @db.VarChar(40)
+  pricing_model       String?   @db.VarChar(40)
+  pricing_billable    Boolean?
+  created_at          DateTime  @default(now())
 
   org Organisation @relation(fields: [org_id], references: [id])
 
   @@map("whatsapp_notification_logs")
+}
+
+model WhatsAppUsagePeriod {
+  id                   String    @id @default(uuid())
+  org_id               String
+  period_start         DateTime  @db.Date
+  messages_reserved    Int       @default(0)
+  priced_messages      Int       @default(0)
+  estimated_cost       Decimal   @default(0) @db.Decimal(14, 4)
+  threshold_alerted_at DateTime?
+  quota_alerted_at     DateTime?
+  created_at           DateTime  @default(now())
+  updated_at           DateTime  @updatedAt
+
+  organisation Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, period_start])
+  @@index([org_id, period_start(sort: Desc)])
+  @@map("whatsapp_usage_periods")
 }
 
 model InAppNotification {
@@ -1111,14 +1888,17 @@ model InAppNotification {
   action_type String?   @db.VarChar(50)
   action_id   String?   @db.VarChar(36)
   metadata    Json?     @default("{}")
+  dedupe_key  String?   @db.VarChar(120)
   read_at     DateTime?
   created_at  DateTime  @default(now())
 
   user User         @relation(fields: [user_id], references: [id], onDelete: Cascade)
   org  Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
 
+  @@unique([org_id, user_id, dedupe_key])
   @@index([user_id, read_at])
   @@index([user_id, created_at(sort: Desc)])
+  @@index([user_id, created_at(sort: Desc), id])
   @@map("in_app_notifications")
 }
 
@@ -1432,4 +2212,38 @@ model AiMessage {
 
   @@index([conversationId])
   @@map("ai_messages")
+}
+
+model AiUsagePeriod {
+  id                String       @id @default(uuid())
+  org_id            String
+  period_start      DateTime     @db.Date
+  request_count     Int          @default(0)
+  prompt_tokens     BigInt       @default(0)
+  completion_tokens BigInt       @default(0)
+  total_tokens      BigInt       @default(0)
+  created_at        DateTime     @default(now())
+  updated_at        DateTime     @updatedAt
+  org               Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@unique([org_id, period_start])
+  @@index([org_id, period_start(sort: Desc)])
+  @@map("ai_usage_periods")
+}
+
+model AiToolAudit {
+  id              String       @id @default(uuid())
+  org_id          String
+  actor_user_id   String
+  on_behalf_of    String
+  conversation_id String
+  tool_name       String       @db.VarChar(120)
+  arguments_hash  String       @db.Char(64)
+  success         Boolean
+  created_at      DateTime     @default(now())
+  org             Organisation @relation(fields: [org_id], references: [id], onDelete: Cascade)
+
+  @@index([org_id, created_at(sort: Desc)])
+  @@index([org_id, actor_user_id, created_at(sort: Desc)])
+  @@map("ai_tool_audits")
 }

@@ -97,6 +97,15 @@ export async function generatePerformanceCsv(
   return uploadCsv(orgId, `performance-${year}-${String(month).padStart(2,'0')}`, rows);
 }
 
+export async function generateCustomCsv(
+  orgId: string,
+  dataset: string,
+  headers: string[],
+  rows: unknown[][],
+): Promise<string> {
+  return uploadCsv(orgId, `custom-${dataset}`, [headers, ...rows]);
+}
+
 // ─── Core upload helper ───────────────────────────────
 async function uploadCsv(orgId: string, type: string, rows: any[][]): Promise<string> {
   const csv    = stringify(rows, { quoted: true });

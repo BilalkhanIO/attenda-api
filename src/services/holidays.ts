@@ -58,22 +58,22 @@ export function workingDaysExcluding(start: Date, end: Date, holidays: Set<strin
 }
 
 /** Concrete holiday dates for an org inside [start, end]. */
-export async function holidaySetForRange(orgId: string, start: Date, end: Date): Promise<Set<string>> {
+export async function holidaySetForRange(orgId: string, start: Date, end: Date, locationId?: string | null): Promise<Set<string>> {
   const rows = await prisma.orgHoliday.findMany({
-    where: { org_id: orgId },
+    where: { org_id: orgId, ...(locationId ? { OR: [{ location_id: null }, { location_id: locationId }] } : { location_id: null }) },
     select: { date: true, name: true, recurring: true },
   });
   return expandHolidays(rows, start, end);
 }
 
 /** Org-aware working days: weekdays minus the org's holidays. */
-export async function workingDaysForOrg(orgId: string, start: Date, end: Date): Promise<number> {
-  const holidays = await holidaySetForRange(orgId, start, end);
+export async function workingDaysForOrg(orgId: string, start: Date, end: Date, locationId?: string | null): Promise<number> {
+  const holidays = await holidaySetForRange(orgId, start, end, locationId);
   return workingDaysExcluding(start, end, holidays);
 }
 
 /** True when the given org-local date (UTC-anchored date-only) is a holiday. */
-export async function isOrgHoliday(orgId: string, date: Date): Promise<boolean> {
-  const set = await holidaySetForRange(orgId, date, date);
+export async function isOrgHoliday(orgId: string, date: Date, locationId?: string | null): Promise<boolean> {
+  const set = await holidaySetForRange(orgId, date, date, locationId);
   return set.size > 0;
 }

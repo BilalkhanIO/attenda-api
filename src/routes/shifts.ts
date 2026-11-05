@@ -11,11 +11,13 @@ import {
   NotFoundError,
   ValidationError,
   AppError,
+  ForbiddenError,
 } from "../utils/response";
 import { createNotification, emitOrgEvent } from "../services/notifications";
 import prisma from "../utils/prisma";
 import { resolveUserPermissions } from "../services/authorization";
 import { validate } from "../middleware/validate";
+import { idempotency } from "../middleware/idempotency";
 import {
   createShiftSchema,
   updateShiftSchema,
@@ -24,12 +26,18 @@ import {
   shiftAssignmentSchema,
   bulkAssignmentSchema,
   publishScheduleSchema,
+  shiftAcknowledgementSchema,
   swapRequestSchema,
 } from "../schemas";
+import { dateOnlyInTz } from "../utils/shift";
 import { generateGeminiJson } from "../services/ai/gemini-json";
+import { evaluateScheduleCompliance } from "../services/compliance/evaluateSchedule";
+import { isInEmployeeScope, scopedEmployeeIds } from "../services/locationScope";
+import { intersectAssignmentEmployeeIds } from "../services/shiftAssignmentScope";
 
 const router = Router();
 router.use(authenticate);
+const SHIFT_ACK_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 // Employee self-service routes (visible without shifts plan feature)
 
@@ -63,6 +71,7 @@ function addUtcDays(date: Date, days: number): Date {
 
 const ASSIGN_INCLUDE = {
   shift: true,
+  location: { select: { id: true, name: true, timezone: true } },
   user: {
     select: { id: true, name: true, avatar_url: true, department: true },
   },
@@ -185,6 +194,7 @@ router.post(
   "/",
   requireOrgFeature("shifts"),
   requirePermission("shifts.manage"),
+  idempotency,
   validate({ body: createShiftSchema }),
   async (req, res, next) => {
     try {
@@ -283,6 +293,7 @@ router.post(
   "/ai-template",
   requireOrgFeature("shifts"),
   requirePermission("shifts.manage"),
+  idempotency,
   async (req, res, next) => {
     try {
       const description =
@@ -453,6 +464,7 @@ router.post(
 router.post(
   "/:id/breaks",
   requirePermission("shifts.breaks.manage"),
+  idempotency,
   validate({ body: shiftBreakSchema }),
   async (req, res, next) => {
     try {
@@ -478,6 +490,7 @@ router.post(
 router.put(
   "/:shiftId/breaks/:breakId",
   requirePermission("shifts.breaks.manage"),
+  idempotency,
   validate({ body: updateShiftBreakSchema }),
   async (req, res, next) => {
     try {
@@ -510,6 +523,7 @@ router.put(
 router.delete(
   "/:shiftId/breaks/:breakId",
   requirePermission("shifts.breaks.manage"),
+  idempotency,
   async (req, res, next) => {
     try {
       const b = await prisma.shiftBreak.findFirst({
@@ -531,6 +545,7 @@ router.delete(
 router.put(
   "/:id",
   requirePermission("shifts.manage"),
+  idempotency,
   validate({ body: updateShiftSchema }),
   async (req, res, next) => {
     try {
@@ -630,6 +645,7 @@ router.put(
 router.put(
   "/:id/set-default",
   requirePermission("shifts.manage"),
+  idempotency,
   async (req, res, next) => {
     try {
       const id = req.params.id as string;
@@ -664,6 +680,7 @@ router.put(
 router.put(
   "/:id/set-org-wide",
   requirePermission("shifts.manage"),
+  idempotency,
   async (req, res, next) => {
     try {
       const id = req.params.id as string;
@@ -702,6 +719,7 @@ router.put(
 router.delete(
   "/:id",
   requirePermission("shifts.manage"),
+  idempotency,
   async (req, res, next) => {
     try {
       const id = req.params.id as string;
@@ -728,11 +746,13 @@ router.get(
         ? parseDateOnly(week_start, "week_start")
         : startOfCurrentWeek();
       const we = addUtcDays(ws, 6);
+      const employeeIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
 
       const assignments = await prisma.shiftAssignment.findMany({
         where: {
           date: { gte: ws, lte: we },
           shift: { org_id: req.user!.org_id },
+          ...(employeeIds ? { user_id: { in: employeeIds } } : {}),
         },
         include: ASSIGN_INCLUDE,
         orderBy: { date: "asc" },
@@ -752,6 +772,10 @@ router.get(
     try {
       const { week_start, department, employee_id, published } =
         req.query as Record<string, string>;
+      if (req.query.location_id !== undefined && typeof req.query.location_id !== 'string') {
+        throw new ValidationError('location_id must be a string');
+      }
+      const locationId = typeof req.query.location_id === 'string' ? req.query.location_id.trim() : '';
       const search =
         typeof req.query.search === "string"
           ? req.query.search.trim().slice(0, 100)
@@ -760,19 +784,30 @@ router.get(
         ? parseDateOnly(week_start, "week_start")
         : startOfCurrentWeek();
       const we = addUtcDays(ws, 6);
+      const employeeIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
 
       const where: Record<string, unknown> = {
         date: { gte: ws, lte: we },
         shift: { org_id: req.user!.org_id },
       };
+      let departmentIds: string[] | undefined;
       if (department) {
         const users = await prisma.user.findMany({
-          where: { org_id: req.user!.org_id, department },
+          where: { org_id: req.user!.org_id, department, is_active: true, deleted_at: null },
           select: { id: true },
         });
-        where.user_id = { in: users.map((u) => u.id) };
+        departmentIds = users.map((u) => u.id);
       }
-      if (employee_id) where.user_id = employee_id;
+      const visibleEmployeeIds = intersectAssignmentEmployeeIds(employeeIds, departmentIds, employee_id);
+      if (visibleEmployeeIds !== null) where.user_id = { in: visibleEmployeeIds };
+      if (locationId) {
+        if (locationId === 'unassigned') where.location_id = null;
+        else {
+          const location = await prisma.location.findFirst({ where: { id: locationId, org_id: req.user!.org_id, is_active: true }, select: { id: true } });
+          if (!location) throw new NotFoundError('Location');
+          where.location_id = location.id;
+        }
+      }
       if (published === "true" || published === "false")
         where.is_published = published === "true";
       if (search) {
@@ -800,6 +835,7 @@ router.get(
 router.post(
   "/assignments",
   requirePermission("shifts.assign"),
+  idempotency,
   validate({ body: shiftAssignmentSchema }),
   async (req, res, next) => {
     try {
@@ -820,6 +856,8 @@ router.post(
       ]);
       if (!user) throw new NotFoundError("Employee");
       if (!shift) throw new NotFoundError("Shift");
+      const scopedIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
+      if (!isInEmployeeScope(user.id, scopedIds)) throw new ForbiddenError('You may only assign shifts to employees in your managed locations or team');
 
       // Conflict check (scoped to org via the shift relation above)
       const conflict = await prisma.shiftAssignment.findFirst({
@@ -887,7 +925,7 @@ router.post(
       });
 
       const assignment = await prisma.shiftAssignment.create({
-        data: { shift_id, user_id, date: assignDate },
+        data: { shift_id, user_id, date: assignDate, location_id: user.primary_location_id },
         include: ASSIGN_INCLUDE,
       });
       await prisma.shiftScheduleEvent.create({
@@ -931,6 +969,7 @@ router.post(
 router.put(
   "/assignments/:id",
   requirePermission("shifts.assign"),
+  idempotency,
   async (req, res, next) => {
     try {
       const id = req.params.id as string;
@@ -938,6 +977,8 @@ router.put(
         where: { id, shift: { org_id: req.user!.org_id } },
       });
       if (!assignment) throw new NotFoundError("Assignment");
+      const scopedIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
+      if (!isInEmployeeScope(assignment.user_id, scopedIds)) throw new ForbiddenError('You may only change assignments in your managed locations or team');
 
       const { shift_id, date } = req.body;
       const updateData: Record<string, unknown> = {};
@@ -971,6 +1012,15 @@ router.put(
       if (!shift_id && !date)
         throw new ValidationError("shift_id or date required");
 
+      // A material change to an already published assignment requires the
+      // employee to review the updated shift again, with a fresh 24-hour SLA.
+      if (assignment.is_published) {
+        updateData.acknowledgement_status = 'pending';
+        updateData.acknowledgement_due_at = new Date(Date.now() + SHIFT_ACK_WINDOW_MS);
+        updateData.acknowledged_at = null;
+        updateData.acknowledgement_note = null;
+      }
+
       const updated = await prisma.shiftAssignment.update({
         where: { id: assignment.id },
         data: updateData,
@@ -996,6 +1046,18 @@ router.put(
         },
       });
       emitOrgEvent(req.user!.org_id, "shift_changed");
+      if (assignment.is_published) {
+        await createNotification({
+          userId: assignment.user_id,
+          orgId: req.user!.org_id,
+          type: 'shift_reminder',
+          title: 'Your published shift changed',
+          body: `Your shift details changed. Please review and confirm, flag a conflict, or request help within 24 hours.`,
+          actionType: 'shift_schedule',
+          actionId: updated.id,
+          dedupeKey: updated.id,
+        });
+      }
       ok(res, updated);
     } catch (e) {
       next(e);
@@ -1075,6 +1137,7 @@ router.get("/assignments/:id/detail", async (req, res, next) => {
 router.post(
   "/assignments/bulk",
   requirePermission("shifts.assign"),
+  idempotency,
   validate({ body: bulkAssignmentSchema }),
   async (req, res, next) => {
     try {
@@ -1094,7 +1157,7 @@ router.post(
             org_id: req.user!.org_id,
             is_active: true,
           },
-          select: { id: true, name: true },
+          select: { id: true, name: true, primary_location_id: true },
         }),
         prisma.shift.findMany({
           where: { id: { in: shiftIds }, org_id: req.user!.org_id },
@@ -1107,8 +1170,9 @@ router.post(
           },
         }),
       ]);
-      const userMap = new Map(users.map((u) => [u.id, u.name]));
+      const userMap = new Map(users.map((u) => [u.id, u]));
       const shiftMap = new Map(shifts.map((s) => [s.id, s]));
+      const scopedIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
 
       const parsedDates = assignments.map((a) => parseDateOnly(a.date, "date"));
       const minDate = new Date(
@@ -1167,13 +1231,17 @@ router.post(
         const dateStr = assignDate.toISOString().split("T")[0];
         const row: RowRef = {
           user_id: a.user_id,
-          user_name: userMap.get(a.user_id) ?? a.user_id,
+          user_name: userMap.get(a.user_id)?.name ?? a.user_id,
           shift_id: a.shift_id,
           date: dateStr,
         };
 
         if (!userMap.has(a.user_id)) {
           conflicts.push({ ...row, reason: "user_not_found" });
+          continue;
+        }
+        if (!isInEmployeeScope(a.user_id, scopedIds)) {
+          conflicts.push({ ...row, reason: "employee_outside_managed_location" });
           continue;
         }
         const shift = shiftMap.get(a.shift_id);
@@ -1246,6 +1314,7 @@ router.post(
               data: creatable.map((c) => ({
                 shift_id: c.row.shift_id,
                 user_id: c.row.user_id,
+                location_id: userMap.get(c.row.user_id)?.primary_location_id ?? null,
                 date: c.assignDate,
               })),
               skipDuplicates: true,
@@ -1328,6 +1397,7 @@ router.post(
 router.delete(
   "/assignments/:id",
   requirePermission("shifts.assign"),
+  idempotency,
   async (req, res, next) => {
     try {
       const id = req.params.id as string;
@@ -1362,6 +1432,7 @@ router.delete(
 router.post(
   "/schedule/publish",
   requirePermission("shifts.assign"),
+  idempotency,
   validate({ body: publishScheduleSchema }),
   async (req, res, next) => {
     try {
@@ -1369,47 +1440,67 @@ router.post(
       const we = parseDateOnly(req.body.to_date, "to_date");
       if (we.getTime() - ws.getTime() > 6 * 86400000)
         throw new ValidationError("Publish one schedule week at a time");
+      const scopedIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
 
-      // Get all assignments for the week and notify employees
-      const assignments = await prisma.shiftAssignment.findMany({
+      // Load one adjacent day on each side for overnight and minimum-rest evaluation.
+      const surroundingAssignments = await prisma.shiftAssignment.findMany({
         where: {
-          date: { gte: ws, lte: we },
+          date: { gte: addUtcDays(ws, -1), lte: addUtcDays(we, 1) },
           shift: { org_id: req.user!.org_id },
+          ...(scopedIds ? { user_id: { in: scopedIds } } : {}),
         },
         include: {
           user: { select: { id: true, name: true, phone: true, org_id: true } },
-          shift: { select: { name: true, start_time: true } },
+          shift: { include: { breaks: true } },
         },
       });
+      const assignments = surroundingAssignments.filter(item => item.date >= ws && item.date <= we);
+
+      const activeRules = await prisma.complianceRule.findMany({
+        where: { org_id: req.user!.org_id, effective_from: { lte: we }, OR: [{ effective_to: null }, { effective_to: { gte: ws } }] },
+        orderBy: { effective_from: 'desc' },
+      });
+      const findings = evaluateScheduleCompliance(surroundingAssignments, activeRules, ws, we);
+      const blockingFindings = findings.filter(item => item.severity === 'block');
+      const overrideReason = typeof req.body?.override_reason === 'string' ? req.body.override_reason.trim().slice(0, 1000) : '';
+      const canOverride = req.permissions?.has('compliance.override') ?? false;
+      if (blockingFindings.length && (!canOverride || overrideReason.length < 8)) {
+        await prisma.$transaction(async tx => {
+          await tx.complianceViolation.updateMany({ where: { org_id: req.user!.org_id, week_start: ws, status: 'open' }, data: { status: 'resolved', resolved_at: new Date() } });
+          for (const finding of findings) {
+            await tx.complianceViolation.upsert({
+              where: { org_id_dedupe_key: { org_id: req.user!.org_id, dedupe_key: finding.dedupe_key } },
+              create: { org_id: req.user!.org_id, rule_id: finding.rule_id || null, rule_code: finding.code, dedupe_key: finding.dedupe_key, week_start: ws, assignment_id: finding.assignment_id, user_id: finding.user_id, severity: finding.severity, details: { ...finding.details, message: finding.message }, status: 'open' },
+              update: { rule_id: finding.rule_id || null, severity: finding.severity, details: { ...finding.details, message: finding.message }, status: 'open', override_reason: null, override_by: null, override_at: null, resolved_at: null },
+            });
+          }
+          await tx.shiftScheduleEvent.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, event_type: 'schedule_publish_blocked', entity_type: 'schedule', details: { week_start: ws.toISOString().slice(0, 10), blocking_findings: blockingFindings.length, rule_codes: [...new Set(blockingFindings.map(item => item.code))] } } });
+        });
+        throw new AppError(`Schedule has ${blockingFindings.length} blocking compliance finding(s). Review the schedule or provide an override reason (minimum 8 characters) with compliance.override permission.`, 409, 'COMPLIANCE_BLOCK');
+      }
 
       // Mark only the shift templates that appear in this week as published
       const shiftIds = [...new Set(assignments.map((a) => a.shift_id))];
       if (shiftIds.length > 0) {
-        await prisma.shift.updateMany({
-          where: { id: { in: shiftIds }, org_id: req.user!.org_id },
-          data: { is_published: true },
-        });
-        await prisma.shiftAssignment.updateMany({
-          where: {
-            shift_id: { in: shiftIds },
-            date: { gte: ws, lte: we },
-            shift: { org_id: req.user!.org_id },
-          },
-          data: { is_published: true },
+        await prisma.$transaction(async tx => {
+          await tx.complianceViolation.updateMany({ where: { org_id: req.user!.org_id, week_start: ws, status: 'open' }, data: { status: 'resolved', resolved_at: new Date() } });
+          for (const finding of findings) {
+            const overridden = finding.severity === 'block' && blockingFindings.length > 0;
+            await tx.complianceViolation.upsert({
+              where: { org_id_dedupe_key: { org_id: req.user!.org_id, dedupe_key: finding.dedupe_key } },
+              create: { org_id: req.user!.org_id, rule_id: finding.rule_id || null, rule_code: finding.code, dedupe_key: finding.dedupe_key, week_start: ws, assignment_id: finding.assignment_id, user_id: finding.user_id, severity: finding.severity, details: { ...finding.details, message: finding.message }, status: overridden ? 'overridden' : 'open', override_reason: overridden ? overrideReason : null, override_by: overridden ? req.user!.sub : null, override_at: overridden ? new Date() : null },
+              update: { severity: finding.severity, details: { ...finding.details, message: finding.message }, status: overridden ? 'overridden' : 'open', override_reason: overridden ? overrideReason : null, override_by: overridden ? req.user!.sub : null, override_at: overridden ? new Date() : null, resolved_at: null },
+            });
+          }
+          if (!scopedIds) await tx.shift.updateMany({ where: { id: { in: shiftIds }, org_id: req.user!.org_id }, data: { is_published: true } });
+          await tx.shiftAssignment.updateMany({ where: { shift_id: { in: shiftIds }, date: { gte: ws, lte: we }, shift: { org_id: req.user!.org_id }, ...(scopedIds ? { user_id: { in: scopedIds } } : {}) }, data: { is_published: true } });
+          await tx.shiftAssignment.updateMany({ where: { shift_id: { in: shiftIds }, date: { gte: ws, lte: we }, shift: { org_id: req.user!.org_id }, acknowledgement_status: 'not_required', ...(scopedIds ? { user_id: { in: scopedIds } } : {}) }, data: { acknowledgement_status: 'pending', acknowledgement_due_at: new Date(Date.now() + SHIFT_ACK_WINDOW_MS), acknowledged_at: null, acknowledgement_note: null } });
+          await tx.shiftScheduleEvent.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, event_type: 'schedule_published', entity_type: 'schedule', details: { week_start: ws.toISOString().slice(0, 10), assignments: assignments.length, shift_ids: shiftIds, compliance_findings: findings.length, override_reason: blockingFindings.length ? overrideReason : null } } });
         });
       }
-      await prisma.shiftScheduleEvent.create({
-        data: {
-          org_id: req.user!.org_id,
-          actor_id: req.user!.sub,
-          event_type: "schedule_published",
-          entity_type: "schedule",
-          details: {
-            week_start: ws.toISOString().slice(0, 10),
-            assignments: assignments.length,
-            shift_ids: shiftIds,
-          },
-        },
+      else await prisma.$transaction(async tx => {
+        await tx.complianceViolation.updateMany({ where: { org_id: req.user!.org_id, week_start: ws, status: 'open' }, data: { status: 'resolved', resolved_at: new Date() } });
+        await tx.shiftScheduleEvent.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, event_type: 'schedule_published', entity_type: 'schedule', details: { week_start: ws.toISOString().slice(0, 10), assignments: 0, shift_ids: [], compliance_findings: 0 } } });
       });
 
       let notified = 0;
@@ -1423,7 +1514,7 @@ router.post(
             orgId: req.user!.org_id,
             type: "shift_reminder",
             title: "Schedule published",
-            body: `Your shift schedule for the week of ${ws.toISOString().slice(0, 10)} is published.`,
+            body: `Your shift schedule for the week of ${ws.toISOString().slice(0, 10)} is published. Please confirm your assigned shifts or report a conflict within 24 hours.`,
             actionType: "shift_schedule",
             actionId: a.id,
           });
@@ -1445,6 +1536,7 @@ router.post(
         week_start: ws.toISOString().split("T")[0],
         week_end: we.toISOString().split("T")[0],
         assignments: assignments.length,
+        compliance_findings: findings.length,
         notified,
       });
     } catch (e) {
@@ -1487,6 +1579,86 @@ router.get("/assignments/me", async (req, res, next) => {
     next(e);
   }
 });
+
+router.post(
+  '/assignments/me/:id/acknowledgement',
+  idempotency,
+  validate({ body: shiftAcknowledgementSchema }),
+  async (req, res, next) => {
+    try {
+      const assignment = await prisma.shiftAssignment.findFirst({
+        where: { id: req.params.id as string, user_id: req.user!.sub, shift: { org_id: req.user!.org_id } },
+        include: {
+          shift: { select: { id: true, name: true, start_time: true, end_time: true } },
+          location: { select: { timezone: true } },
+          user: { select: { id: true, name: true, primary_location: { select: { timezone: true } } } },
+        },
+      });
+      if (!assignment) throw new NotFoundError('Shift assignment');
+      if (!assignment.is_published || assignment.acknowledgement_status === 'not_required') {
+        throw new AppError('This shift has not been published for acknowledgement.', 409, 'SHIFT_NOT_PUBLISHED');
+      }
+      const timezone = assignment.location?.timezone ?? assignment.user.primary_location?.timezone ?? 'UTC';
+      const localToday = dateOnlyInTz(new Date(), timezone);
+      if (assignment.date < localToday) throw new AppError('Past shifts cannot be acknowledged.', 409, 'SHIFT_ACKNOWLEDGEMENT_EXPIRED');
+
+      const { status, note } = req.body as { status: 'acknowledged' | 'conflict' | 'help_requested'; note?: string };
+      const cleanNote = note?.trim() || null;
+      if (assignment.acknowledgement_status === status && assignment.acknowledgement_note === cleanNote) {
+        ok(res, assignment);
+        return;
+      }
+      const updated = await prisma.$transaction(async tx => {
+        const record = await tx.shiftAssignment.update({
+          where: { id: assignment.id },
+          data: { acknowledgement_status: status, acknowledged_at: new Date(), acknowledgement_note: cleanNote },
+          include: ASSIGN_INCLUDE,
+        });
+        await tx.shiftScheduleEvent.create({ data: {
+          org_id: req.user!.org_id,
+          actor_id: req.user!.sub,
+          event_type: 'assignment_acknowledgement',
+          entity_type: 'assignment',
+          entity_id: assignment.id,
+          details: {
+            before: { status: assignment.acknowledgement_status, note: assignment.acknowledgement_note },
+            after: { status, note: cleanNote },
+            acknowledgement_due_at: assignment.acknowledgement_due_at?.toISOString() ?? null,
+          },
+        } });
+        return record;
+      });
+
+      if (status !== 'acknowledged') {
+        const candidates = await prisma.user.findMany({
+          where: { org_id: req.user!.org_id, is_active: true, deleted_at: null, id: { not: req.user!.sub } },
+          select: { id: true },
+        });
+        const visibleManagers = (await Promise.all(candidates.map(async candidate => {
+          const permissions = await resolveUserPermissions(candidate.id, req.user!.org_id);
+          const orgScopePermission = permissions.has('shifts.manage') ? 'shifts.manage' : permissions.has('shifts.assign') ? 'shifts.assign' : null;
+          if (!orgScopePermission) return null;
+          const visibleIds = await scopedEmployeeIds(req.user!.org_id, candidate.id, permissions, orgScopePermission);
+          return isInEmployeeScope(req.user!.sub, visibleIds) ? candidate.id : null;
+        }))).filter((userId): userId is string => !!userId);
+        const title = status === 'conflict' ? 'Shift conflict reported' : 'Employee requested shift help';
+        const body = `${assignment.user.name} reported ${status === 'conflict' ? 'a conflict' : 'a need for help'} for ${assignment.shift.name} on ${assignment.date.toISOString().slice(0, 10)}${cleanNote ? `: ${cleanNote}` : '.'}`;
+        await Promise.all(visibleManagers.map(userId => createNotification({
+          userId,
+          orgId: req.user!.org_id,
+          type: 'shift_reminder',
+          title,
+          body,
+          actionType: 'shift_schedule',
+          actionId: assignment.id,
+          dedupeKey: `${assignment.id}:${status}`,
+        })));
+      }
+      emitOrgEvent(req.user!.org_id, 'shift_changed');
+      ok(res, updated);
+    } catch (error) { next(error); }
+  },
+);
 
 // ─── GET /shifts/swaps/me ──────────────────────────────
 router.get("/swaps/me", async (req, res, next) => {
@@ -1540,6 +1712,7 @@ router.get(
 // ─── POST /shifts/swaps ────────────────────────────────
 router.post(
   "/swaps",
+  idempotency,
   validate({ body: swapRequestSchema }),
   async (req, res, next) => {
     try {
@@ -1561,6 +1734,7 @@ router.post(
 router.put(
   "/swaps/:id/approve",
   requirePermission("shifts.swaps.approve"),
+  idempotency,
   async (req, res, next) => {
     try {
       const id = req.params.id as string;
@@ -1597,6 +1771,7 @@ router.put(
 router.put(
   "/swaps/:id/reject",
   requirePermission("shifts.swaps.approve"),
+  idempotency,
   async (req, res, next) => {
     try {
       const id = req.params.id as string;
@@ -1627,6 +1802,7 @@ router.put(
 router.post(
   "/ai-schedule",
   requirePermission("shifts.ai_schedule"),
+  idempotency,
   async (req, res, next) => {
     try {
       const apiKey = process.env.GEMINI_API_KEY;

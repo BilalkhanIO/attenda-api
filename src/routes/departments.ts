@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { idempotency } from '../middleware/idempotency';
 import { validate } from '../middleware/validate';
 import { departmentSchema, updateDepartmentSchema } from '../schemas';
 import { ok, created, NotFoundError, ValidationError } from '../utils/response';
@@ -66,7 +67,7 @@ router.get('/tree', async (req: Request, res: Response, next: NextFunction) => {
 });
 
 // ─── POST /org/departments ─────────────────────────────
-router.post('/', requirePermission('org.departments.manage'), validate({ body: departmentSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('org.departments.manage'), idempotency, validate({ body: departmentSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, parent_id } = req.body as { name?: string; parent_id?: string | null };
     if (!name?.trim()) throw new ValidationError('name is required');
@@ -92,7 +93,7 @@ router.post('/', requirePermission('org.departments.manage'), validate({ body: d
 });
 
 // ─── PUT /org/departments/:id ──────────────────────────
-router.put('/:id', requirePermission('org.departments.manage'), validate({ body: updateDepartmentSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:id', requirePermission('org.departments.manage'), idempotency, validate({ body: updateDepartmentSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, parent_id } = req.body as { name?: string; parent_id?: string | null };
     const department = await prisma.department.findFirst({
@@ -137,7 +138,7 @@ router.put('/:id', requirePermission('org.departments.manage'), validate({ body:
 });
 
 // ─── DELETE /org/departments/:id ───────────────────────
-router.delete('/:id', requirePermission('org.departments.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:id', requirePermission('org.departments.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const department = await prisma.department.findFirst({
       where: { id: req.params.id as string, org_id: req.user!.org_id },

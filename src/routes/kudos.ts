@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate } from '../middleware/auth';
+import { idempotency } from '../middleware/idempotency';
 import { validate } from '../middleware/validate';
 import { kudosCreateSchema } from '../schemas';
 import { ok, created, paginated, NotFoundError, ValidationError, AppError } from '../utils/response';
@@ -26,7 +27,7 @@ const KUDOS_INCLUDE = {
 } as const;
 
 // ─── POST /kudos ───────────────────────────────────────
-router.post('/', validate({ body: kudosCreateSchema }), async (req, res, next) => {
+router.post('/', idempotency, validate({ body: kudosCreateSchema }), async (req, res, next) => {
   try {
     const { to_user_id, message, emoji } = req.body as {
       to_user_id: string; message: string; emoji?: string;
@@ -125,7 +126,7 @@ router.get('/mine', async (req, res, next) => {
 
 // ─── DELETE /kudos/:id ─────────────────────────────────
 // Author may retract their own kudos; moderation needs org.settings.update.
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', idempotency, async (req, res, next) => {
   try {
     const kudos = await prisma.kudos.findFirst({
       where: { id: String(req.params.id), org_id: req.user!.org_id, deleted_at: null },

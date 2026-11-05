@@ -1,86 +1,24 @@
-# Database Schema
+# Database guide
 
-33 models, PostgreSQL, Prisma 7. Source of truth: `prisma/schema.prisma`.
-Migrations: append-only SQL in `prisma/migrations/`, registered in
-`scripts/migrate.js`, applied idempotently at container start.
+PostgreSQL is accessed through Prisma. The current schema source is [`prisma/schema.prisma`](../prisma/schema.prisma); applied SQL migrations are in [`prisma/migrations/`](../prisma/migrations/). Avoid maintaining model counts or copied schema diagrams here because both drift as features evolve.
 
-Conventions: UUID string PKs · `created_at` defaults · org scoping via
-`org_id` FK on every tenant entity (handlers always filter by
-`req.user.org_id`) · soft delete on `users.deleted_at` · money-affecting
-mutations mirrored to `audit_logs` (append-only) · statuses as constrained
-strings validated at the zod boundary.
+## Data rules
 
-## Core domain
+- Every tenant-owned record must be scoped to its organization in server queries and mutations. Foreign keys alone do not replace authorization checks.
+- Keep the feature's own table as the source of truth; shared approvals, notifications, audit history, and outbox rows reference or describe the source record.
+- Preserve audit/history records for security-sensitive and employment-impacting actions.
+- Use transactions or conditional updates for multi-row state changes, balance/payroll effects, and reviewer decisions.
+- Add indexes to match actual tenant-scoped filters and sort order; prefer cursor pagination for large feeds.
+- Use soft deletion or archival where retention/audit requirements apply.
 
-```mermaid
-erDiagram
-    Organisation ||--o{ User : employs
-    Organisation ||--o{ Department : has
-    Department   |o--o{ Department : "sub-departments"
-    Department   |o--o{ User : members
-    User         |o--o{ User : "manager / direct_reports"
+## Migrations
 
-    User ||--o{ AttendanceRecord : "daily record (unique user+date)"
-    AttendanceRecord ||--o{ BreakRecord : breaks
-    AttendanceRecord ||--o| RemoteSession : "remote day"
-    RemoteSession ||--o{ RemoteCheckinLog : "WhatsApp nudges"
-    User ||--o{ LateArrivalNotice : "running-late notices"
+Create additive SQL under `prisma/migrations/<timestamp>_<name>/migration.sql`, update the Prisma schema, regenerate Prisma Client, and apply migrations with the Prisma CLI. Migrations are append-only after they have been applied in a shared environment. The legacy completion-type migration was corrected to drop its text default before converting the column; retain its compatibility behavior and verify history warnings for databases that already recorded the earlier file checksum. Review `DATABASE_URL` carefully before applying a migration. Docker startup and manual deployments both use `prisma migrate deploy`. Existing databases created by the retired raw-SQL runner may need a carefully verified one-time baseline; see [Deployment](DEPLOYMENT.md).
 
-    User ||--o{ LeaveRequest : requests
-    User ||--o{ LeaveBalance : "per type+year"
-
-    Organisation ||--o{ Shift : templates
-    Shift ||--o{ ShiftBreak : "break policies"
-    Shift ||--o{ ShiftAssignment : "user+date"
-    User  ||--o{ ShiftAssignment : assigned
-    User  ||--o{ ShiftSwap : "requester/target"
-
-    AttendanceRecord ||--o| OvertimeRequest : "extra time"
-    Organisation ||--o{ OvertimeRule : rules
-    User ||--o{ PayrollRecord : "period month+year"
-    User ||--o{ PerformanceReview : reviews
-    PerformanceReview ||--o{ PerformanceGoal : goals
-
-    User ||--o{ InAppNotification : notifications
-    Organisation ||--o{ WhatsappLog : "delivery audit"
-    User ||--o{ RefreshToken : "rotating families"
-    Organisation ||--o{ AuditLog : "pay-affecting trail"
+```bash
+npx prisma migrate status
+npx prisma migrate deploy
+npx prisma generate
 ```
 
-## RBAC (dynamic; `users.role` is a denormalized mirror only)
-
-```mermaid
-erDiagram
-    Permission ||--o{ OrgRolePermission : grants
-    OrgRole ||--o{ OrgRolePermission : holds
-    Organisation ||--o{ OrgRole : "system + custom roles"
-    User ||--o| UserOrgRole : "assigned role (source of truth)"
-    OrgRole ||--o{ UserOrgRole : assignees
-    User ||--o{ UserPermissionGrant : "per-user allow/deny overrides"
-
-    Permission ||--o{ PlatformRolePermission : grants
-    PlatformRole ||--o{ PlatformRolePermission : holds
-    User ||--o{ PlatformUserRole : "platform staff (SYSTEM org)"
-```
-
-Effective org permissions = assigned role's keys (fallback: legacy-role map
-when unassigned) ∪ `allow` grants − `deny` grants. Platform permissions come
-from `PlatformUserRole` (fallback: full `platform.*` set for legacy
-`role=platform_admin` users with no assignments).
-
-## SaaS layer
-
-`PlanDefinition` (features JSON, pricing, trial days) → `Organisation.plan`
-+ `features_override` → resolved per-request by `resolveOrgFeatures` and
-gated by `requireOrgFeature`. `BlogPost` backs the public site CMS.
-
-## Key attendance columns worth knowing
-
-`AttendanceRecord`: `check_in_at/out_at`, `check_in_type`
-(auto_ip|qr|manual|remote), `status` (in|late|out|absent|leave|remote),
-`late_minutes`, `early_out_minutes`, `net_hours_worked`, `break_minutes`,
-`extra_office_minutes`, `auto_checked_out`, `last_heartbeat_at`,
-`challenge_sent_at` (FCM presence challenge), `is_overridden` +
-`override_reason` (audited). `Organisation` tuning:
-`late_threshold`, `heartbeat_grace_mins`, `gap_forgiveness_mins`,
-`payroll_day`, `tax_rate`, `pension_rate`, `totp_required`.
+Schema changes that affect attendance, payroll, leave, approvals, or organization scoping must also update [Backend API and Logic](../BACKEND_API_AND_LOGIC.md) and the [feature checklist](../../NON_PAYMENT_ROADMAP_CHECKLIST.md).

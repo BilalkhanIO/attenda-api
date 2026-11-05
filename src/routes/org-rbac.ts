@@ -1,5 +1,6 @@
 import { Router, Request, Response, NextFunction } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { idempotency } from '../middleware/idempotency';
 import { ok, created, NotFoundError, ValidationError, ForbiddenError } from '../utils/response';
 import prisma from '../utils/prisma';
 import { PERMISSION_CATALOG } from '../constants/rbac';
@@ -40,7 +41,7 @@ router.get('/roles', requirePermission('org.roles.manage'), async (req: Request,
 });
 
 // ─── POST /org/roles ───────────────────────────────────
-router.post('/roles', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/roles', requirePermission('org.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, slug, permission_keys } = req.body as {
       name?: string;
@@ -82,7 +83,7 @@ router.post('/roles', requirePermission('org.roles.manage'), async (req: Request
 });
 
 // ─── PUT /org/roles/:id ────────────────────────────────
-router.put('/roles/:id', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/roles/:id', requirePermission('org.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const roleId = String(req.params.id);
     const role = await prisma.orgRole.findFirst({
@@ -104,7 +105,7 @@ router.put('/roles/:id', requirePermission('org.roles.manage'), async (req: Requ
 });
 
 // ─── PUT /org/roles/:id/permissions ────────────────────
-router.put('/roles/:id/permissions', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/roles/:id/permissions', requirePermission('org.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const roleId = String(req.params.id);
     const role = await prisma.orgRole.findFirst({
@@ -136,7 +137,7 @@ router.put('/roles/:id/permissions', requirePermission('org.roles.manage'), asyn
 });
 
 // ─── DELETE /org/roles/:id ─────────────────────────────
-router.delete('/roles/:id', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/roles/:id', requirePermission('org.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const roleId = String(req.params.id);
     const role = await prisma.orgRole.findFirst({
@@ -153,7 +154,7 @@ router.delete('/roles/:id', requirePermission('org.roles.manage'), async (req: R
 });
 
 // ─── PUT /org/users/:userId/role — assign org role ─────
-router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/users/:userId/role', requirePermission('org.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { org_role_id, sync_legacy_role } = req.body as { org_role_id?: string; sync_legacy_role?: boolean };
     if (!org_role_id) throw new ValidationError('org_role_id is required');
@@ -191,7 +192,7 @@ router.put('/users/:userId/role', requirePermission('org.roles.manage'), async (
 });
 
 // Ensure system roles exist (lazy init for orgs created before RBAC)
-router.post('/roles/ensure-system', requirePermission('org.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/roles/ensure-system', requirePermission('org.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     await seedRbacCatalog();
     await seedOrgRbacForOrganisation(req.user!.org_id);

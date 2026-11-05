@@ -2,15 +2,20 @@ import { Router } from 'express';
 import { aiRouter } from "./ai"; export { aiRouter };
 import { authenticate, requireOrgFeature, requirePermission } from '../middleware/auth';
 import { resolveUserPermissions } from '../services/authorization';
-import { ok, NotFoundError, ValidationError, AppError } from '../utils/response';
+import { ok, NotFoundError, ValidationError, AppError, ForbiddenError, created } from '../utils/response';
 import { startOfDay } from '../utils/auth';
 import prisma from '../utils/prisma';
 import { Prisma } from '@prisma/client';
 import { validate } from '../middleware/validate';
+import { idempotency } from '../middleware/idempotency';
+import { customReportDefinitionSchema, customReportSchema } from '../schemas/custom-reports';
 import { orgSettingsSchema, announcementSchema, attendanceSecuritySchema } from '../schemas';
 import { isScheduledForLater, publishAnnouncement, announcementAudienceWhere } from '../services/announcements';
 import { generateGeminiJson } from '../services/ai/gemini-json';
 import { recordAudit } from '../services/audit';
+import { decodeCursor, encodeCursor, keysetAfter } from '../utils/cursor';
+import { dateOnlyInTz } from '../utils/shift';
+import { attendanceDateKey, attendanceDateOffset, localAttendanceDate, localAttendanceMonthStart, shiftAttendanceDateKey } from '../services/attendanceAnalytics';
 
 // ─── PERFORMANCE ──────────────────────────────────────
 export const performanceRouter = Router();
@@ -422,16 +427,45 @@ async function calcAttendanceScore(userId: string, month: number, year: number):
 export const analyticsRouter = Router();
 analyticsRouter.use(authenticate, requirePermission('analytics.view'));
 
+/** Attendance dates are stored as local calendar dates; resolve them using the branch on the record. */
+async function getAnalyticsAttendance(orgId: string, now: Date, days: number) {
+  const [org, users] = await Promise.all([
+    prisma.organisation.findUnique({ where: { id: orgId }, select: { timezone: true } }),
+    prisma.user.findMany({
+      where: { org_id: orgId, is_active: true, deleted_at: null },
+      select: { id: true, primary_location: { select: { timezone: true } } },
+    }),
+  ]);
+  if (!users.length) return { orgTimezone: org?.timezone || 'UTC', users, records: [] };
+  const fallbackTimezone = org?.timezone || 'UTC';
+  const todayKeys = users.map(user => localAttendanceDate(now, user.primary_location?.timezone || fallbackTimezone));
+  const min = todayKeys.reduce((a, b) => a < b ? a : b);
+  const max = todayKeys.reduce((a, b) => a > b ? a : b);
+  const records = await prisma.attendanceRecord.findMany({
+    where: {
+      org_id: orgId,
+      user_id: { in: users.map(user => user.id) },
+      date: { gte: new Date(`${shiftAttendanceDateKey(min, -(days - 1) - 2)}T00:00:00.000Z`), lte: new Date(`${shiftAttendanceDateKey(max, 2)}T00:00:00.000Z`) },
+    },
+    include: {
+      location: { select: { timezone: true } },
+      user: { select: { name: true, primary_location: { select: { timezone: true } } } },
+    },
+  });
+  return { orgTimezone: fallbackTimezone, users, records };
+}
+
 // GET /analytics/overview
 analyticsRouter.get('/overview', async (req, res, next) => {
   try {
-    const today = startOfDay(new Date());
-    const where: Record<string, unknown> = { org_id: req.user!.org_id, date: today };
+    const now = new Date();
+    const { orgTimezone, users, records } = await getAnalyticsAttendance(req.user!.org_id, now, 1);
+    const todayRecords = records.filter(record => {
+      const timezone = record.location?.timezone || record.user?.primary_location?.timezone || orgTimezone;
+      return attendanceDateKey(record.date) === localAttendanceDate(now, timezone);
+    });
 
-    const records = await prisma.attendanceRecord.findMany({ where });
-    const allUsers = await prisma.user.count({ where: { org_id: req.user!.org_id, is_active: true, deleted_at: null } });
-
-    const counts = records.reduce((acc, r) => {
+    const counts = todayRecords.reduce((acc, r) => {
       acc[r.status] = (acc[r.status] || 0) + 1;
       return acc;
     }, {} as Record<string, number>);
@@ -442,7 +476,7 @@ analyticsRouter.get('/overview', async (req, res, next) => {
       remote:        counts['remote'] || 0,
       on_leave:      counts['leave'] || 0,
       absent:        counts['absent'] || 0,
-      total_employees: allUsers,
+      total_employees: users.length,
       updated_at:    new Date(),
     });
   } catch (e) { next(e); }
@@ -451,17 +485,30 @@ analyticsRouter.get('/overview', async (req, res, next) => {
 // GET /analytics/attendance-trend
 analyticsRouter.get('/attendance-trend', async (req, res, next) => {
   try {
-    const days = parseInt((req.query.days as string) || '30');
-    const data = [];
-
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(); d.setDate(d.getDate() - i);
-      const date = startOfDay(d);
-      const records = await prisma.attendanceRecord.findMany({ where: { org_id: req.user!.org_id, date } });
-      const present = records.filter(r => ['in','out','late','remote'].includes(r.status)).length;
-      const total   = records.length || 1;
-      data.push({ date: date.toISOString().split('T')[0], present, absent: records.filter(r => r.status === 'absent').length, late: records.filter(r => r.status === 'late').length, rate: Math.round((present / total) * 100) });
+    const requestedDays = Number.parseInt((req.query.days as string) || '30', 10);
+    const days = Number.isFinite(requestedDays) ? Math.min(90, Math.max(1, requestedDays)) : 30;
+    const now = new Date();
+    const { orgTimezone, records } = await getAnalyticsAttendance(req.user!.org_id, now, days);
+    const orgToday = localAttendanceDate(now, orgTimezone);
+    const buckets = Array.from({ length: days }, () => ({ present: 0, absent: 0, late: 0, total: 0 }));
+    for (const record of records) {
+      const timezone = record.location?.timezone || record.user?.primary_location?.timezone || orgTimezone;
+      const localToday = localAttendanceDate(now, timezone);
+      const offset = attendanceDateOffset(localToday, attendanceDateKey(record.date));
+      if (offset > 0 || offset < -(days - 1)) continue;
+      const bucket = buckets[days - 1 + offset];
+      bucket.total++;
+      if (['in', 'out', 'late', 'remote'].includes(record.status)) bucket.present++;
+      if (record.status === 'absent') bucket.absent++;
+      if (record.status === 'late') bucket.late++;
     }
+    const data = buckets.map((bucket, index) => ({
+      date: shiftAttendanceDateKey(orgToday, index - (days - 1)),
+      present: bucket.present,
+      absent: bucket.absent,
+      late: bucket.late,
+      rate: Math.round((bucket.present / Math.max(1, bucket.total)) * 100),
+    }));
     ok(res, data);
   } catch (e) { next(e); }
 });
@@ -469,12 +516,15 @@ analyticsRouter.get('/attendance-trend', async (req, res, next) => {
 // GET /analytics/late-arrivals
 analyticsRouter.get('/late-arrivals', async (req, res, next) => {
   try {
-    const start = new Date(); start.setDate(1); start.setHours(0,0,0,0);
-    const records = await prisma.attendanceRecord.findMany({
-      where: { org_id: req.user!.org_id, status: 'late', date: { gte: start } },
-      include: { user: { select: { name: true } } },
+    const now = new Date();
+    const { orgTimezone, records } = await getAnalyticsAttendance(req.user!.org_id, now, 32);
+    const currentMonthLate = records.filter(record => {
+      if (record.status !== 'late') return false;
+      const timezone = record.location?.timezone || record.user?.primary_location?.timezone || orgTimezone;
+      const localToday = localAttendanceDate(now, timezone);
+      return attendanceDateKey(record.date) >= localAttendanceMonthStart(now, timezone) && attendanceDateKey(record.date) <= localToday;
     });
-    const grouped = records.reduce((acc: Record<string, { name: string; count: number }>, r) => {
+    const grouped = currentMonthLate.reduce((acc: Record<string, { name: string; count: number }>, r) => {
       const name = r.user?.name || r.user_id;
       if (!acc[name]) acc[name] = { name, count: 0 };
       acc[name].count++;
@@ -633,7 +683,7 @@ orgRouter.use(authenticate);
 // - office_ips / office_ssids (managed via the gated office-network endpoints)
 const ORG_SETTINGS_SELECT = {
   id: true, name: true, logo_url: true, timezone: true, currency: true,
-  payroll_day: true, tax_rate: true, pension_rate: true, late_threshold: true,
+  payroll_day: true, monthly_pay_divisor: true, tax_rate: true, pension_rate: true, late_threshold: true,
   heartbeat_grace_mins: true, gap_forgiveness_mins: true,
   leave_accrual: true, late_policy: true,
   plan: true, status: true, subscription_status: true,
@@ -660,7 +710,7 @@ orgRouter.get('/settings', requirePermission('org.settings.view'), async (req, r
 orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ body: orgSettingsSchema }), async (req, res, next) => {
   try {
     const {
-      name, timezone, currency, payroll_day, tax_rate, pension_rate, late_threshold, totp_required,
+      name, timezone, currency, payroll_day, monthly_pay_divisor, tax_rate, pension_rate, late_threshold, totp_required,
       logo_url, address, phone, website, industry, registration_number,
     } = req.body;
     const data: Record<string, unknown> = {};
@@ -678,6 +728,11 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
       const day = parseInt(payroll_day);
       if (day < 1 || day > 28) throw new ValidationError('payroll_day must be between 1 and 28');
       data.payroll_day = day;
+    }
+    if (monthly_pay_divisor !== undefined) {
+      const divisor = parseInt(monthly_pay_divisor);
+      if (divisor < 20 || divisor > 31) throw new ValidationError('monthly_pay_divisor must be between 20 and 31 days');
+      data.monthly_pay_divisor = divisor;
     }
     if (tax_rate !== undefined) {
       const rate = parseFloat(tax_rate);
@@ -711,9 +766,11 @@ orgRouter.put('/settings', requirePermission('org.settings.update'), validate({ 
       if (mins < 0 || mins > 90) throw new ValidationError('gap_forgiveness_mins must be between 0 and 90');
       data.gap_forgiveness_mins = mins;
     }
-    const updated = await prisma.organisation.update({
-      where: { id: req.user!.org_id }, data,
-      select: ORG_SETTINGS_SELECT,
+    const updated = await prisma.$transaction(async tx => {
+      const org = await tx.organisation.update({ where: { id: req.user!.org_id }, data, select: ORG_SETTINGS_SELECT });
+      if (data.monthly_pay_divisor !== undefined) await tx.payrollRecord.updateMany({ where: { org_id: req.user!.org_id, status: 'draft' }, data: { inputs_stale: true } });
+      if (typeof data.timezone === 'string') await tx.location.updateMany({ where: { org_id: req.user!.org_id, is_main: true }, data: { timezone: data.timezone } });
+      return org;
     });
     ok(res, updated);
   } catch (e) { next(e); }
@@ -772,7 +829,8 @@ orgRouter.get('/audit-logs', requirePermission('org.audit.view'), async (req, re
     const parsedLimit = Number.parseInt(String(req.query.limit ?? (cursorMode ? '50' : '50')), 10);
     const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 50;
     const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
-    if (cursorMode && cursor) {
+    const position = cursorMode && cursor ? decodeCursor(cursor, where) : null;
+    if (cursorMode && cursor && !position) {
       const anchor = await prisma.auditLog.findFirst({
         where: { ...where, id: cursor },
         select: { id: true },
@@ -783,9 +841,9 @@ orgRouter.get('/audit-logs', requirePermission('org.audit.view'), async (req, re
     const page  = Math.max(1, parseInt(String(req.query.page  ?? '1')));
     const [rows, total] = await Promise.all([
       prisma.auditLog.findMany({
-        where,
+        where: position ? { ...where, AND: [keysetAfter(position, 'created_at')] } : where,
         ...(cursorMode
-          ? (cursor ? { cursor: { id: cursor }, skip: 1 } : {})
+          ? (!position && cursor ? { cursor: { id: cursor }, skip: 1 } : {})
           : { skip: (page - 1) * limit }),
         orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
         take: cursorMode ? limit + 1 : limit,
@@ -804,9 +862,32 @@ orgRouter.get('/audit-logs', requirePermission('org.audit.view'), async (req, re
     const nameById = new Map(actors.map(a => [a.id, a.name]));
     const outputItems = items.map(i => ({ ...i, actor_name: nameById.get(i.actor_id) ?? 'Unknown' }));
     ok(res, cursorMode
-      ? { items: outputItems, next_cursor: hasMore ? items[items.length - 1]?.id ?? null : null, has_more: hasMore, limit }
+      ? { items: outputItems, next_cursor: hasMore && items.length ? encodeCursor({ at: items[items.length - 1].created_at, id: items[items.length - 1].id }, where) : null, has_more: hasMore, limit }
       : { items: outputItems, total, page, limit });
   } catch (e) { next(e); }
+});
+
+orgRouter.get('/outbox/dead-letters', requirePermission('org.events.replay'), async (req, res, next) => {
+  try {
+    const events = await prisma.outboxEvent.findMany({
+      where: { org_id: req.user!.org_id, dead_lettered_at: { not: null } },
+      orderBy: { dead_lettered_at: 'desc' }, take: 100,
+      select: { id: true, event_type: true, entity_type: true, entity_id: true, attempts: true, last_error: true, created_at: true, dead_lettered_at: true },
+    });
+    ok(res, events);
+  } catch (error) { next(error); }
+});
+
+orgRouter.post('/outbox/dead-letters/:id/replay', requirePermission('org.events.replay'), async (req, res, next) => {
+  try {
+    const event = await prisma.outboxEvent.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id, dead_lettered_at: { not: null } } });
+    if (!event) throw new NotFoundError('Dead-lettered event');
+    await prisma.$transaction(async tx => {
+      await tx.outboxEvent.update({ where: { id: event.id }, data: { attempts: 0, last_error: null, dead_lettered_at: null, next_attempt_at: new Date(), claimed_at: null, claim_token: null } });
+      await tx.auditLog.create({ data: { org_id: req.user!.org_id, actor_id: req.user!.sub, action: 'outbox_event_replayed', entity_type: 'outbox_event', entity_id: event.id, before: { attempts: event.attempts, last_error: event.last_error, event_type: event.event_type }, after: { status: 'queued_for_replay' } } });
+    });
+    ok(res, { id: event.id, status: 'queued_for_replay' }, 202);
+  } catch (error) { next(error); }
 });
 
 // GET /org/my-ip — returns the client IP as seen by the server (useful for network auto-detection)
@@ -882,7 +963,11 @@ orgRouter.put('/office-ips', requirePermission('org.office.update'), async (req,
     const { ips } = req.body;
     if (!Array.isArray(ips)) throw new ValidationError('ips must be an array');
     if (ips.length > 20) throw new ValidationError('Maximum 20 entries allowed');
-    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data: { office_ips: ips } });
+    const updated = await prisma.$transaction(async tx => {
+      const org = await tx.organisation.update({ where: { id: req.user!.org_id }, data: { office_ips: ips } });
+      await tx.location.updateMany({ where: { org_id: req.user!.org_id, is_main: true }, data: { office_ips: ips } });
+      return org;
+    });
     ok(res, { ips: updated.office_ips, ssids: updated.office_ssids || [] });
   } catch (e) { next(e); }
 });
@@ -894,7 +979,11 @@ orgRouter.put('/office-ssids', requirePermission('org.office.update'), async (re
     if (!Array.isArray(ssids)) throw new ValidationError('ssids must be an array');
     if (ssids.length > 10) throw new ValidationError('Maximum 10 SSIDs allowed');
     const trimmed = ssids.map((s: string) => s.trim()).filter(Boolean);
-    const updated = await prisma.organisation.update({ where: { id: req.user!.org_id }, data: { office_ssids: trimmed } });
+    const updated = await prisma.$transaction(async tx => {
+      const org = await tx.organisation.update({ where: { id: req.user!.org_id }, data: { office_ssids: trimmed } });
+      await tx.location.updateMany({ where: { org_id: req.user!.org_id, is_main: true }, data: { office_ssids: trimmed } });
+      return org;
+    });
     ok(res, { ips: updated.office_ips, ssids: updated.office_ssids || [] });
   } catch (e) { next(e); }
 });
@@ -910,12 +999,25 @@ orgRouter.get('/whatsapp', requirePermission('org.whatsapp.update'), requireOrgF
       groups:          (org?.wa_groups as unknown[]) || [],
       events:          org?.wa_events || {},
       dept_groups:     org?.wa_dept_groups ?? {},
+      monthly_message_limit: org?.wa_monthly_message_limit ?? null,
+      alert_threshold_percent: org?.wa_alert_threshold_percent ?? 80,
+      estimated_cost_per_message: org?.wa_estimated_cost_per_message === null || org?.wa_estimated_cost_per_message === undefined ? null : Number(org.wa_estimated_cost_per_message),
+      currency: org?.currency ?? 'USD',
     });
   } catch (e) { next(e); }
 });
 
+orgRouter.get('/whatsapp/usage', requirePermission('whatsapp.logs.view'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+  try {
+    const month = typeof req.query.month === 'string' ? req.query.month : undefined;
+    if (month && !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) throw new ValidationError('Month must use YYYY-MM format.');
+    const usage = await (await import('../services/whatsappUsage')).getWhatsAppUsage(req.user!.org_id, month);
+    ok(res, usage);
+  } catch (e) { next(e); }
+});
+
 // PUT /org/whatsapp
-orgRouter.put('/whatsapp', requirePermission('org.whatsapp.update'), requireOrgFeature('whatsapp'), async (req, res, next) => {
+orgRouter.put('/whatsapp', requirePermission('org.whatsapp.update'), requireOrgFeature('whatsapp'), idempotency, async (req, res, next) => {
   try {
     const { enabled, phone_number_id, access_token, groups, events, dept_groups } = req.body;
     const data: Record<string, unknown> = {};
@@ -925,6 +1027,21 @@ orgRouter.put('/whatsapp', requirePermission('org.whatsapp.update'), requireOrgF
     if (events          !== undefined) data.wa_events          = events;
     if (dept_groups     !== undefined) data.wa_dept_groups     = dept_groups;
     if (access_token && access_token !== '***redacted***') data.wa_access_token = access_token;
+    if (Object.prototype.hasOwnProperty.call(req.body, 'monthly_message_limit')) {
+      const limit = req.body.monthly_message_limit;
+      if (limit !== null && (!Number.isInteger(limit) || limit < 1 || limit > 10_000_000)) throw new ValidationError('Monthly message limit must be between 1 and 10,000,000, or empty for no limit.');
+      data.wa_monthly_message_limit = limit;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, 'alert_threshold_percent')) {
+      const threshold = req.body.alert_threshold_percent;
+      if (!Number.isInteger(threshold) || threshold < 1 || threshold > 100) throw new ValidationError('Usage alert threshold must be a whole percentage from 1 to 100.');
+      data.wa_alert_threshold_percent = threshold;
+    }
+    if (Object.prototype.hasOwnProperty.call(req.body, 'estimated_cost_per_message')) {
+      const rate = req.body.estimated_cost_per_message;
+      if (rate !== null && (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > 10_000)) throw new ValidationError('Estimated message cost must be a non-negative number, or empty if unknown.');
+      data.wa_estimated_cost_per_message = rate === null ? null : rate === undefined ? undefined : new Prisma.Decimal(rate);
+    }
     await prisma.organisation.update({ where: { id: req.user!.org_id }, data });
     ok(res, { message: 'WhatsApp settings saved' });
   } catch (e) { next(e); }
@@ -999,59 +1116,154 @@ orgRouter.post('/qr-code/regenerate', requirePermission('org.qr.manage'), async 
 export const reportsRouter = Router();
 reportsRouter.use(authenticate, requirePermission('reports.export'));
 
-reportsRouter.post('/:type', async (req, res, next) => {
+reportsRouter.get('/schedules', async (req, res, next) => {
   try {
-    const { type } = req.params;
-    const { start_date, end_date, format: fmt = 'csv', month, year } = req.body;
+    const rows = await prisma.reportSchedule.findMany({
+      where: { org_id: req.user!.org_id, owner_id: req.user!.sub },
+      include: { runs: { orderBy: { created_at: 'desc' }, take: 1 } },
+      orderBy: { created_at: 'desc' },
+    });
+    ok(res, rows);
+  } catch (e) { next(e); }
+});
 
-    let downloadUrl: string | null = null;
+reportsRouter.get('/runs', async (req, res, next) => {
+  try {
+    const rows = await prisma.reportRun.findMany({
+      where: { org_id: req.user!.org_id, owner_id: req.user!.sub },
+      orderBy: { created_at: 'desc' }, take: 50,
+    });
+    ok(res, rows);
+  } catch (e) { next(e); }
+});
 
-    if (type === 'attendance' && start_date && end_date) {
-      const records = await prisma.attendanceRecord.findMany({
-        where: {
-          org_id: req.user!.org_id,
-          date: { gte: new Date(start_date), lte: new Date(end_date) },
-        },
-        include: { user: { select: { name: true, department: true } } },
-        orderBy: [{ date: 'asc' }],
-      });
-      const { generateAttendanceCsv } = await import('../services/csvExport');
-      downloadUrl = await generateAttendanceCsv(req.user!.org_id, records);
+reportsRouter.get('/custom/definitions', async (req, res, next) => {
+  try {
+    const rows = await prisma.reportDefinition.findMany({
+      where: { org_id: req.user!.org_id, owner_id: req.user!.sub },
+      orderBy: [{ updated_at: 'desc' }, { id: 'desc' }],
+      select: { id: true, name: true, definition: true, created_at: true, updated_at: true },
+    });
+    ok(res, rows);
+  } catch (error) { next(error); }
+});
 
-    } else if (type === 'payroll' && month && year) {
-      const records = await prisma.payrollRecord.findMany({
-        where: { org_id: req.user!.org_id, period_month: +month, period_year: +year },
-        include: { user: { select: { name: true, department: true } } },
-      });
-      const { generatePayrollCsv } = await import('../services/csvExport');
-      downloadUrl = await generatePayrollCsv(req.user!.org_id, records, +month, +year);
+reportsRouter.post('/custom/definitions', idempotency, validate({ body: customReportDefinitionSchema }), async (req, res, next) => {
+  try {
+    const existing = await prisma.reportDefinition.findFirst({ where: { org_id: req.user!.org_id, owner_id: req.user!.sub, name: req.body.name } });
+    if (existing) throw new AppError('A saved custom report already uses that name.', 409, 'REPORT_DEFINITION_NAME_EXISTS');
+    const row = await prisma.reportDefinition.create({ data: {
+      org_id: req.user!.org_id, owner_id: req.user!.sub, name: req.body.name,
+      definition: req.body.definition as Prisma.InputJsonValue,
+    }, select: { id: true, name: true, definition: true, created_at: true, updated_at: true } });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'report.definition.create', entityType: 'report_definition', entityId: row.id, after: { name: row.name } });
+    created(res, row);
+  } catch (error) { next(error); }
+});
 
-    } else if (type === 'leave' && start_date && end_date) {
-      const requests = await prisma.leaveRequest.findMany({
-        where: {
-          org_id: req.user!.org_id,
-          start_date: { lte: new Date(end_date) },
-          end_date:   { gte: new Date(start_date) },
-        },
-        include: {
-          user:     { select: { name: true, department: true } },
-          reviewer: { select: { name: true } },
-        },
-      });
-      const { generateLeaveCsv } = await import('../services/csvExport');
-      downloadUrl = await generateLeaveCsv(req.user!.org_id, requests);
+reportsRouter.put('/custom/definitions/:id', idempotency, validate({ body: customReportDefinitionSchema }), async (req, res, next) => {
+  try {
+    const existing = await prisma.reportDefinition.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id, owner_id: req.user!.sub } });
+    if (!existing) throw new NotFoundError('Saved custom report');
+    const nameConflict = await prisma.reportDefinition.findFirst({ where: { org_id: req.user!.org_id, owner_id: req.user!.sub, name: req.body.name, id: { not: existing.id } }, select: { id: true } });
+    if (nameConflict) throw new AppError('A saved custom report already uses that name.', 409, 'REPORT_DEFINITION_NAME_EXISTS');
+    const row = await prisma.reportDefinition.update({ where: { id: existing.id }, data: { name: req.body.name, definition: req.body.definition as Prisma.InputJsonValue }, select: { id: true, name: true, definition: true, created_at: true, updated_at: true } });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'report.definition.update', entityType: 'report_definition', entityId: row.id, before: { name: existing.name }, after: { name: row.name } });
+    ok(res, row);
+  } catch (error) { next(error); }
+});
 
-    } else if (type === 'performance' && month && year) {
-      const reviews = await prisma.performanceReview.findMany({
-        where: { org_id: req.user!.org_id, period_month: +month, period_year: +year },
-        include: { user: { select: { name: true, department: true } } },
-      });
-      const { generatePerformanceCsv } = await import('../services/csvExport');
-      downloadUrl = await generatePerformanceCsv(req.user!.org_id, reviews, +month, +year);
+reportsRouter.delete('/custom/definitions/:id', idempotency, async (req, res, next) => {
+  try {
+    const existing = await prisma.reportDefinition.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id, owner_id: req.user!.sub } });
+    if (!existing) throw new NotFoundError('Saved custom report');
+    await prisma.reportDefinition.delete({ where: { id: existing.id } });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'report.definition.delete', entityType: 'report_definition', entityId: existing.id, before: { name: existing.name } });
+    ok(res, { deleted: true });
+  } catch (error) { next(error); }
+});
+
+reportsRouter.post('/schedules', idempotency, async (req, res, next) => {
+  try {
+    const { name, type, params, frequency, local_time, recipients = [] } = req.body as Record<string, any>;
+    if (typeof name !== 'string' || !name.trim() || name.length > 160) throw new ValidationError('A report name (up to 160 characters) is required');
+    if (!['attendance', 'leave', 'payroll', 'performance', 'custom'].includes(type)) throw new ValidationError('Unsupported report type');
+    if (!['daily', 'weekly', 'monthly'].includes(frequency)) throw new ValidationError('Frequency must be daily, weekly, or monthly');
+    if (typeof local_time !== 'string' || !/^([01]\d|2[0-3]):[0-5]\d$/.test(local_time)) throw new ValidationError('Use a valid local time in HH:MM format');
+    if (type === 'payroll' && !req.permissions?.has('payroll.view')) throw new ForbiddenError('Payroll report access required');
+    const reportParams = params && typeof params === 'object' && !Array.isArray(params) ? params as Record<string, unknown> : {};
+    if (type === 'custom') {
+      const definitionId = typeof reportParams.definition_id === 'string' ? reportParams.definition_id : '';
+      const definition = definitionId ? await prisma.reportDefinition.findFirst({ where: { id: definitionId, org_id: req.user!.org_id, owner_id: req.user!.sub } }) : null;
+      if (!definition) throw new ValidationError('Choose one of your saved custom report setups.');
+      if (reportParams.relative_period !== true) throw new ValidationError('Custom report schedules must use a relative period.');
+      const parsed = customReportSchema.safeParse(definition.definition);
+      if (!parsed.success) throw new ValidationError('The saved custom report setup is invalid. Update or recreate it before scheduling.');
+      const allowed = await import('../services/customReports').then(module => module.canGenerateCustomDataset(parsed.data.dataset, req.permissions ?? new Set()));
+      if (!allowed) throw new ForbiddenError(`Permission to export the ${parsed.data.dataset} dataset is required.`);
     } else {
-      throw new ValidationError('Invalid report type or missing parameters');
+      (await import('../services/reportGeneration')).validateScheduledReportParameters(type, reportParams);
     }
+    if (Array.isArray(recipients) && recipients.some((email: unknown) => typeof email !== 'string' || email.toLowerCase() !== req.user!.email.toLowerCase())) {
+      throw new ValidationError('Scheduled reports can only be delivered to your own account email');
+    }
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { timezone: true } });
+    if (!org) throw new NotFoundError('Organisation');
+    const schedule = await prisma.reportSchedule.create({ data: {
+      org_id: req.user!.org_id, owner_id: req.user!.sub, name: name.trim(), report_type: type,
+      params: reportParams as Prisma.InputJsonValue,
+      frequency, local_time, timezone: org.timezone || 'UTC', recipients: [req.user!.email],
+      next_run_at: (await import('../services/scheduledReports')).nextReportRun(frequency, local_time, org.timezone || 'UTC', new Date()),
+    } });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'report.schedule.create', entityType: 'report_schedule', entityId: schedule.id, after: { name: schedule.name, report_type: schedule.report_type, frequency: schedule.frequency } });
+    created(res, schedule);
+  } catch (e) { next(e); }
+});
 
-    ok(res, { download_url: downloadUrl, type, generated_at: new Date() });
+reportsRouter.patch('/schedules/:id', idempotency, async (req, res, next) => {
+  try {
+    const existing = await prisma.reportSchedule.findFirst({ where: { id: req.params.id as string, org_id: req.user!.org_id, owner_id: req.user!.sub } });
+    if (!existing) throw new NotFoundError('Report schedule');
+    const status = req.body.status;
+    if (status !== 'active' && status !== 'paused') throw new ValidationError('Status must be active or paused');
+    const nextRun = status === 'active' && existing.next_run_at <= new Date()
+      ? (await import('../services/scheduledReports')).nextReportRun(existing.frequency, existing.local_time, existing.timezone, new Date())
+      : existing.next_run_at;
+    const updated = await prisma.reportSchedule.update({ where: { id: existing.id }, data: { status, next_run_at: nextRun } });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'report.schedule.update', entityType: 'report_schedule', entityId: updated.id, before: { status: existing.status }, after: { status: updated.status } });
+    ok(res, updated);
+  } catch (e) { next(e); }
+});
+
+reportsRouter.delete('/schedules/:id', idempotency, async (req, res, next) => {
+  try {
+    const existing = await prisma.reportSchedule.findFirst({ where: { id: req.params.id as string, org_id: req.user!.org_id, owner_id: req.user!.sub } });
+    if (!existing) throw new NotFoundError('Report schedule');
+    await prisma.reportSchedule.delete({ where: { id: existing.id } });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'report.schedule.delete', entityType: 'report_schedule', entityId: existing.id, before: { name: existing.name, report_type: existing.report_type } });
+    ok(res, { deleted: true });
+  } catch (e) { next(e); }
+});
+
+reportsRouter.post('/custom', idempotency, validate({ body: customReportSchema }), async (req, res, next) => {
+  try {
+    const result = await (await import('../services/customReports')).generateCustomReport(
+      req.user!.org_id,
+      req.user!.sub,
+      req.permissions ?? new Set<string>(),
+      req.body,
+    );
+    ok(res, result);
+  } catch (e) { next(e); }
+});
+
+reportsRouter.post('/:type', idempotency, async (req, res, next) => {
+  try {
+    const type = String(req.params.type);
+    if (type === 'payroll' && !req.permissions?.has('payroll.view')) throw new ForbiddenError('Payroll report access required');
+    const result = await (await import('../services/reportGeneration')).generateReport(
+      req.user!.org_id, type, req.body as Record<string, unknown>,
+    );
+    ok(res, result);
   } catch (e) { next(e); }
 });

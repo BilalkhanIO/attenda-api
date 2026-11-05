@@ -4,6 +4,7 @@ import { ok, created, NotFoundError, ValidationError, ForbiddenError } from '../
 import { PERMISSION_CATALOG } from '../constants/rbac';
 import { recordAudit } from '../services/audit';
 import prisma from '../utils/prisma';
+import { idempotency } from '../middleware/idempotency';
 
 const router = Router();
 router.use(authenticate);
@@ -47,7 +48,7 @@ router.get('/permissions', requirePermission('platform.roles.manage'), (_req, re
   ok(res, PERMISSION_CATALOG.filter(permission => permission.key.startsWith('platform.')));
 });
 
-router.post('/', requirePermission('platform.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/', requirePermission('platform.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
     const slug = slugify(typeof req.body.slug === 'string' ? req.body.slug : name);
@@ -75,7 +76,7 @@ router.post('/', requirePermission('platform.roles.manage'), async (req: Request
   }
 });
 
-router.put('/:slug', requirePermission('platform.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/:slug', requirePermission('platform.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const slug = String(req.params.slug);
     const role = await prisma.platformRole.findUnique({
@@ -110,7 +111,7 @@ router.put('/:slug', requirePermission('platform.roles.manage'), async (req: Req
   } catch (error) { next(error); }
 });
 
-router.delete('/:slug', requirePermission('platform.roles.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/:slug', requirePermission('platform.roles.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const slug = String(req.params.slug);
     if (slug === 'platform_admin') throw new ForbiddenError('The break-glass Platform Admin role cannot be deleted');

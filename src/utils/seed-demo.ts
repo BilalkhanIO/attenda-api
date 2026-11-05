@@ -37,6 +37,10 @@ async function main() {
     where: { id: 'SYSTEM' }, update: {},
     create: { id: 'SYSTEM', name: 'Attenda System', timezone: 'UTC', currency: 'USD', status: 'active', subscription_status: 'active' },
   });
+  await prisma.location.upsert({
+    where: { id: 'demo-system-main-location' }, update: {},
+    create: { id: 'demo-system-main-location', org_id: 'SYSTEM', name: 'Main office', timezone: 'UTC', is_main: true },
+  });
   await prisma.user.upsert({
     where: { id: 'demo-platform-admin' }, update: {},
     create: { id: 'demo-platform-admin', org_id: 'SYSTEM', name: 'Demo Platform Admin', email: 'platform.demo@attenda.app', password_hash: passwordHash, role: 'platform_admin', is_active: true, setup_complete: true },
@@ -57,6 +61,10 @@ async function main() {
         subscription_status: 'active',
       },
     });
+    const mainLocation = await prisma.location.upsert({
+      where: { id: `demo-${definition.key}-main-location` }, update: {},
+      create: { id: `demo-${definition.key}-main-location`, org_id: org.id, name: 'Main office', timezone: definition.timezone, office_ips: ['10.20.0.10', '10.20.0.11'], is_main: true },
+    });
 
     const prefix = definition.key;
     const people = [
@@ -76,6 +84,7 @@ async function main() {
         create: {
           id: userIds[person.key],
           org_id: org.id,
+          primary_location_id: mainLocation.id,
           name: person.name,
           email: `${prefix}.${person.local}@demo.attenda.app`,
           password_hash: passwordHash,
@@ -128,7 +137,7 @@ async function main() {
         const record = await prisma.attendanceRecord.upsert({
           where: { user_id_date: { user_id: userIds[key], date: day } }, update: {},
           create: {
-            user_id: userIds[key], org_id: org.id, date: day,
+            user_id: userIds[key], org_id: org.id, location_id: mainLocation.id, date: day,
             check_in_at: checkIn, check_out_at: checkOut, check_in_type: 'manual',
             status: lateMinutes > 15 ? 'late' : 'out', hours_worked: hours,
             net_hours_worked: hours, shift_id: shiftId,
@@ -140,7 +149,7 @@ async function main() {
         attendanceByDayAndUser.set(`${key}:${offset}`, record.id);
         await prisma.shiftAssignment.upsert({
           where: { user_id_date: { user_id: userIds[key], date: day } }, update: {},
-          create: { shift_id: shiftId, user_id: userIds[key], date: day },
+          create: { shift_id: shiftId, user_id: userIds[key], location_id: mainLocation.id, date: day },
         });
       }
     }
@@ -299,9 +308,9 @@ async function main() {
 
     for (const [index, dayOffset] of [-80, -20].entries()) {
       const holidayDate = dateOnly(dayOffset);
-      await prisma.orgHoliday.upsert({
-        where: { org_id_date: { org_id: org.id, date: holidayDate } }, update: {},
-        create: { org_id: org.id, date: holidayDate, name: index ? 'Founders Day' : 'Team Recharge Day' },
+      const holiday = await prisma.orgHoliday.findFirst({ where: { org_id: org.id, location_id: null, date: holidayDate } });
+      if (!holiday) await prisma.orgHoliday.create({
+        data: { org_id: org.id, date: holidayDate, name: index ? 'Founders Day' : 'Team Recharge Day' },
       });
     }
 

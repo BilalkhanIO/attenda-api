@@ -1,5 +1,6 @@
 import axios from 'axios';
 import prisma from '../utils/prisma';
+import { reserveWhatsAppAttempt } from './whatsappUsage';
 
 const META_API = 'https://graph.facebook.com/v19.0';
 const MAX_RETRIES = 3;
@@ -34,7 +35,7 @@ export type NotificationEvent =
   | 'remote' | 'remote_request' | 'leave_approved' | 'leave_rejected' | 'leave_request'
   | 'shift_reminder' | 'payslip_ready' | 'invite'
   | 'remote_morning' | 'remote_midday' | 'remote_eod' | 'remote_daily'
-  | 'overtime_approved' | 'overtime_rejected';
+  | 'overtime_approved' | 'overtime_rejected' | 'personal_notification';
 
 interface SendOptions {
   orgId:         string;
@@ -80,17 +81,17 @@ async function sendWhatsAppMessage(
 }
 
 // ─── Notify with retry + 2026 Error Logging ───────────
-export async function notify(opts: SendOptions): Promise<void> {
+export async function notify(opts: SendOptions): Promise<boolean> {
   const { orgId, event, message, recipientType, recipientId } = opts;
 
   const org = await prisma.organisation.findUnique({ where: { id: orgId } });
   if (!org?.wa_enabled || !org.wa_phone_number_id || !org.wa_access_token) {
     console.warn(`[WhatsApp] Skipping: Org ${orgId} not fully configured.`);
-    return;
+    return false;
   }
 
   const events = (org.wa_events as Record<string, boolean>) || {};
-  if (events[event] === false) return;
+  if (events[event] === false) return false;
 
   const log = await prisma.whatsappLog.create({
     data: { 
@@ -105,6 +106,15 @@ export async function notify(opts: SendOptions): Promise<void> {
 
   let lastError = '';
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const reservation = await reserveWhatsAppAttempt(org);
+    if (!reservation.allowed) {
+      await prisma.whatsappLog.update({
+        where: { id: log.id },
+        data: { status: 'suppressed', error_message: 'Organization WhatsApp monthly message limit reached' },
+      });
+      console.warn(`[WhatsApp] Monthly organization quota reached for ${orgId}; preserving in-app and push notification delivery.`);
+      return false;
+    }
     await prisma.whatsappLog.update({ where: { id: log.id }, data: { attempts: attempt } });
 
     const result = await sendWhatsAppMessage(
@@ -118,9 +128,14 @@ export async function notify(opts: SendOptions): Promise<void> {
     if (result.success) {
       await prisma.whatsappLog.update({
         where: { id: log.id },
-        data: { status: 'sent', sent_at: new Date(), error_message: null },
+        data: {
+          status: 'sent', sent_at: new Date(), error_message: null,
+          provider_message_id: result.messageId ?? null,
+          provider_status: result.messageId ? 'accepted' : null,
+          provider_status_at: result.messageId ? new Date() : null,
+        },
       });
-      return;
+      return true;
     }
 
     lastError = result.error || 'Failed';
@@ -137,6 +152,62 @@ export async function notify(opts: SendOptions): Promise<void> {
     data: { status: 'failed', error_message: lastError } 
   });
   console.error(`[WhatsApp] PERMANENT FAILURE for org ${orgId} event ${event}: ${lastError}`);
+  return false;
+}
+
+const providerStatusRank: Record<string, number> = { accepted: 0, sent: 1, delivered: 2, read: 3, failed: 4 };
+
+/** Apply Meta delivery callbacks idempotently and ignore stale/out-of-order callbacks. */
+export async function reconcileWhatsAppStatuses(payload: unknown): Promise<number> {
+  if (!payload || typeof payload !== 'object') return 0;
+  const entries = (payload as { entry?: unknown[] }).entry;
+  if (!Array.isArray(entries)) return 0;
+  let reconciled = 0;
+  for (const entry of entries) {
+    const changes = (entry as { changes?: unknown[] } | null)?.changes;
+    if (!Array.isArray(changes)) continue;
+    for (const change of changes) {
+      const value = (change as { value?: { statuses?: unknown[] } } | null)?.value;
+      if (!Array.isArray(value?.statuses)) continue;
+      for (const raw of value.statuses) {
+        if (!raw || typeof raw !== 'object') continue;
+        const status = raw as {
+          id?: unknown; status?: unknown; timestamp?: unknown;
+          pricing?: { category?: unknown; type?: unknown; billable?: unknown };
+        };
+        if (typeof status.id !== 'string' || !['sent', 'delivered', 'read', 'failed'].includes(String(status.status))) continue;
+        const existing = await prisma.whatsappLog.findUnique({ where: { provider_message_id: status.id }, select: { id: true, provider_status: true, provider_status_at: true } });
+        if (!existing) continue; // Ignore callbacks for messages not sent by this Attenda installation.
+        const eventTime = typeof status.timestamp === 'string' && /^\d{1,12}$/.test(status.timestamp)
+          ? new Date(Number(status.timestamp) * 1000) : new Date();
+        if (!Number.isFinite(eventTime.getTime())) continue;
+        const nextStatus = String(status.status);
+        const stale = existing.provider_status_at && eventTime < existing.provider_status_at;
+        const regresses = (providerStatusRank[nextStatus] ?? 0) < (providerStatusRank[existing.provider_status ?? 'accepted'] ?? 0);
+        if (stale || regresses) continue;
+        await prisma.whatsappLog.update({
+          where: { id: existing.id },
+          data: {
+            provider_status: nextStatus,
+            provider_status_at: eventTime,
+            ...(typeof status.pricing?.category === 'string' ? { pricing_category: status.pricing.category.slice(0, 40) } : {}),
+            ...(typeof status.pricing?.type === 'string' ? { pricing_model: status.pricing.type.slice(0, 40) } : {}),
+            ...(typeof status.pricing?.billable === 'boolean' ? { pricing_billable: status.pricing.billable } : {}),
+            ...(nextStatus === 'failed' ? { status: 'failed' } : {}),
+          },
+        });
+        reconciled++;
+      }
+    }
+  }
+  return reconciled;
+}
+
+export async function sendPersonalWhatsAppNotification(orgId: string, phone: string, message: string): Promise<{ sent: boolean; permanentFailure?: boolean }> {
+  const org = await prisma.organisation.findUnique({ where: { id: orgId }, select: { wa_enabled: true, wa_phone_number_id: true, wa_access_token: true } });
+  if (!org?.wa_enabled || !org.wa_phone_number_id || !org.wa_access_token) return { sent: false, permanentFailure: true };
+  const sent = await notify({ orgId, event: 'personal_notification', message: message.slice(0, 1000), recipientType: 'individual', recipientId: phone });
+  return { sent, permanentFailure: !sent };
 }
 
 // ─── High-level Event Dispatchers (2026 Modernized) ──

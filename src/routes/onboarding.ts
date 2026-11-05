@@ -1,5 +1,6 @@
 import { Router, Request } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { idempotency } from '../middleware/idempotency';
 import { validate } from '../middleware/validate';
 import { onboardingTemplateSchema, onboardingAssignSchema } from '../schemas';
 import { ok, created, NotFoundError, ForbiddenError, AppError } from '../utils/response';
@@ -66,7 +67,7 @@ router.get('/templates', requirePermission('onboarding.manage'), async (req, res
 });
 
 // ─── POST /onboarding/templates ────────────────────────
-router.post('/templates', requirePermission('onboarding.manage'), validate({ body: onboardingTemplateSchema }), async (req, res, next) => {
+router.post('/templates', requirePermission('onboarding.manage'), idempotency, validate({ body: onboardingTemplateSchema }), async (req, res, next) => {
   try {
     const { name, is_default, items } = req.body as {
       name: string; is_default?: boolean; items: TemplateItemInput[];
@@ -105,7 +106,7 @@ router.post('/templates', requirePermission('onboarding.manage'), validate({ bod
 
 // ─── PUT /onboarding/templates/:id ─────────────────────
 // Replaces fields and items wholesale (delete-and-recreate).
-router.put('/templates/:id', requirePermission('onboarding.manage'), validate({ body: onboardingTemplateSchema }), async (req, res, next) => {
+router.put('/templates/:id', requirePermission('onboarding.manage'), idempotency, validate({ body: onboardingTemplateSchema }), async (req, res, next) => {
   try {
     const { name, is_default, items } = req.body as {
       name: string; is_default?: boolean; items: TemplateItemInput[];
@@ -146,7 +147,7 @@ router.put('/templates/:id', requirePermission('onboarding.manage'), validate({ 
 });
 
 // ─── DELETE /onboarding/templates/:id ──────────────────
-router.delete('/templates/:id', requirePermission('onboarding.manage'), async (req, res, next) => {
+router.delete('/templates/:id', requirePermission('onboarding.manage'), idempotency, async (req, res, next) => {
   try {
     const existing = await prisma.onboardingTemplate.findFirst({
       where: { id: String(req.params.id), org_id: req.user!.org_id, deleted_at: null },
@@ -172,7 +173,7 @@ router.delete('/templates/:id', requirePermission('onboarding.manage'), async (r
 // ─── POST /onboarding/assign ───────────────────────────
 // Materializes the template's items as tasks for the hire. Idempotent per
 // (user, template) — re-assigning is a no-op with skipped: true.
-router.post('/assign', requirePermission('onboarding.manage'), validate({ body: onboardingAssignSchema }), async (req, res, next) => {
+router.post('/assign', requirePermission('onboarding.manage'), idempotency, validate({ body: onboardingAssignSchema }), async (req, res, next) => {
   try {
     const { user_id, template_id } = req.body as { user_id: string; template_id: string };
 
@@ -286,13 +287,13 @@ async function closeTask(
   return updated;
 }
 
-router.put('/tasks/:id/complete', async (req, res, next) => {
+router.put('/tasks/:id/complete', idempotency, async (req, res, next) => {
   try {
     ok(res, await closeTask(req, String(req.params.id), 'done'));
   } catch (e) { next(e); }
 });
 
-router.put('/tasks/:id/skip', async (req, res, next) => {
+router.put('/tasks/:id/skip', idempotency, async (req, res, next) => {
   try {
     ok(res, await closeTask(req, String(req.params.id), 'skipped'));
   } catch (e) { next(e); }

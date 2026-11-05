@@ -1,6 +1,6 @@
 import express from 'express';
 import { z } from 'zod';
-import { validate } from '../../middleware/validate';
+import { documentResponse, validate } from '../../middleware/validate';
 import { buildOpenApiDoc } from '../../services/openapi';
 
 describe('buildOpenApiDoc', () => {
@@ -8,12 +8,14 @@ describe('buildOpenApiDoc', () => {
   router.get('/', (_req, res) => { res.end(); });
   router.post('/', validate({ body: z.object({ name: z.string().min(1) }) }), (_req, res) => { res.end(); });
   router.put('/:id/approve', (_req, res) => { res.end(); });
+  router.get('/typed', documentResponse(z.object({ id: z.string(), count: z.number() })), (_req, res) => { res.end(); });
 
   const doc = buildOpenApiDoc([['/api/v1/widgets', router]]) as {
     openapi: string;
     paths: Record<string, Record<string, {
       tags: string[];
       parameters?: Array<{ name: string; in: string }>;
+      responses?: Record<string, { content?: Record<string, { schema: { properties?: Record<string, unknown> } }> }>;
       requestBody?: { content: { 'application/json': { schema: { properties?: Record<string, unknown>; required?: string[] } } } };
     }>>;
   };
@@ -22,6 +24,7 @@ describe('buildOpenApiDoc', () => {
     expect(doc.openapi).toBe('3.1.0');
     expect(Object.keys(doc.paths).sort()).toEqual([
       '/api/v1/widgets',
+      '/api/v1/widgets/typed',
       '/api/v1/widgets/{id}/approve',
     ]);
     expect(Object.keys(doc.paths['/api/v1/widgets']).sort()).toEqual(['get', 'post']);
@@ -43,5 +46,12 @@ describe('buildOpenApiDoc', () => {
 
   it('tags operations with the mount segment', () => {
     expect(doc.paths['/api/v1/widgets'].get.tags).toEqual(['widgets']);
+  });
+
+  it('emits documented response data schemas in the success envelope', () => {
+    const response = doc.paths['/api/v1/widgets/typed'].get.responses!['200'];
+    const data = response.content!['application/json'].schema.properties!.data as { properties: Record<string, unknown> };
+    expect(data.properties).toHaveProperty('id');
+    expect(data.properties).toHaveProperty('count');
   });
 });

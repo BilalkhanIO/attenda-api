@@ -14,19 +14,26 @@ export async function leaveBalancesTool(
   const where: any = { org_id: orgId };
   if (userId) where.user_id = userId;
   if (leaveType) where.leave_type = leaveType;
-
-  const balances = await prisma.leaveBalance.findMany({
+  const balances = await prisma.leaveLedgerEntry.groupBy({
+    by: ['user_id', 'leave_type', 'year'],
     where,
-    include: { user: { select: { id: true, name: true, email: true } } },
+    _sum: { total_delta: true, used_delta: true },
   });
-
-return balances.map(b => ({
-    userId: b.user_id,
-    userName: b.user?.name,
-    email: b.user?.email,
-    leaveType: b.leave_type,
-    totalDays: Number(b.total_days ?? 0),
-    usedDays: Number(b.used_days ?? 0),
-    balance: Number(b.total_days ?? 0) - Number(b.used_days ?? 0),
-  }));
+  const users = await prisma.user.findMany({ where: { org_id: orgId, id: { in: [...new Set(balances.map(b => b.user_id))] } }, select: { id: true, name: true, email: true } });
+  const userById = new Map(users.map(user => [user.id, user]));
+  return balances.map(balance => {
+    const totalDays = Number(balance._sum.total_delta ?? 0);
+    const usedDays = Number(balance._sum.used_delta ?? 0);
+    const user = userById.get(balance.user_id);
+    return {
+      userId: balance.user_id,
+      userName: user?.name,
+      email: user?.email,
+      leaveType: balance.leave_type,
+      year: balance.year,
+      totalDays,
+      usedDays,
+      balance: Math.round((totalDays - usedDays) * 100) / 100,
+    };
+  });
 }

@@ -90,7 +90,9 @@ export const createUserSchema = z.object({
   job_title: z.string().max(100).nullish(),
   phone: z.string().max(30).nullish(),
   hourly_rate: z.coerce.number().min(0).optional(),
+  hourly_rate_effective_from: dateStr.optional(),
   manager_id: z.string().nullish(),
+  primary_location_id: z.string().nullish(),
   employment_type: z.string().max(30).nullish(),
   joined_at: dateStr.nullish(),
   national_id: z.string().max(100).nullish(),
@@ -101,6 +103,10 @@ export const updateUserSchema = createUserSchema
   .extend({
     email: z.string().email().optional(),
     password: z.string().min(8).optional(),
+  }).superRefine((value, context) => {
+    if (value.hourly_rate_effective_from !== undefined && value.hourly_rate === undefined) {
+      context.addIssue({ code: 'custom', path: ['hourly_rate'], message: 'An hourly rate is required when setting an effective date.' });
+    }
   });
 
 // ─── Wave 2 (attendance / shifts / overtime / payroll / org / departments) ──
@@ -111,7 +117,7 @@ export const updateUserSchema = createUserSchema
 export const checkinSchema = z.object({
   type: z.enum(['manual', 'qr', 'remote']).optional(),
   qr_code: z.string().optional(),
-  duration_type: z.string().max(30).optional(),
+  duration_type: z.enum(['full_day', 'morning', 'afternoon']).optional(),
   idempotency_key: z.string().min(16).max(100).optional(),
   client_event_at: z.string().datetime().optional(),
   offline: z.boolean().optional(),
@@ -120,6 +126,12 @@ export const checkinSchema = z.object({
   clock_epoch: z.string().min(8).max(80).optional(),
   server_anchor_epoch: z.string().min(8).max(80).optional(),
   attendance_clock_anchor: z.string().min(40).max(1000).optional(),
+  device_proof: z.object({
+    device_id: z.string().uuid(),
+    challenge: z.string().min(20).max(100),
+    signature: z.string().min(40).max(1000),
+    signed_payload: z.string().min(2).max(32_768),
+  }).optional(),
   latitude: z.coerce.number().min(-90).max(90).optional(),
   longitude: z.coerce.number().min(-180).max(180).optional(),
   accuracy_m: z.coerce.number().min(0).max(10000).optional(),
@@ -147,19 +159,39 @@ export const attendanceReviewResolveSchema = z.object({
   note: z.string().trim().min(5).max(2000),
 });
 
+const offlineEventFields = {
+  idempotency_key: z.string().min(16).max(100).optional(),
+  client_event_at: z.string().datetime().optional(),
+  offline: z.boolean().optional(),
+  device_uptime_ms: z.number().nonnegative().optional(),
+  server_anchor_uptime_ms: z.number().nonnegative().optional(),
+  clock_epoch: z.string().min(8).max(80).optional(),
+  server_anchor_epoch: z.string().min(8).max(80).optional(),
+  attendance_clock_anchor: z.string().min(40).max(1000).optional(),
+};
+const requireOfflineEventProof = (value: Record<string, unknown>, ctx: z.RefinementCtx) => {
+  if (!value.offline) return;
+  for (const key of ['idempotency_key', 'client_event_at', 'device_uptime_ms', 'server_anchor_uptime_ms', 'clock_epoch', 'server_anchor_epoch', 'attendance_clock_anchor']) {
+    if (value[key] === undefined) ctx.addIssue({ code: 'custom', path: [key], message: `${key} is required for offline attendance sync` });
+  }
+};
+
 export const checkoutSchema = z.object({
   extra_office_minutes: z.coerce.number().int().min(0).optional(),
   force_checkout: z.boolean().optional(),
-}).passthrough();
+  ...offlineEventFields,
+}).passthrough().superRefine(requireOfflineEventProof);
 
 export const breakStartSchema = z.object({
   break_type: z.string().max(60).optional(),
   shift_break_id: z.string().optional(),
-}).passthrough();
+  ...offlineEventFields,
+}).passthrough().superRefine(requireOfflineEventProof);
 
 export const breakEndSchema = z.object({
   wifi_connected: z.boolean().optional(),
-}).passthrough();
+  ...offlineEventFields,
+}).passthrough().superRefine(requireOfflineEventProof);
 
 export const heartbeatSchema = z.object({
   ip: z.string().max(64).optional(),
@@ -251,6 +283,15 @@ export const publishScheduleSchema = z.object({
     path: ['to_date'],
   });
 
+export const shiftAcknowledgementSchema = z.object({
+  status: z.enum(['acknowledged', 'conflict', 'help_requested']),
+  note: z.string().trim().max(1000).optional(),
+}).superRefine((value, context) => {
+  if (value.status !== 'acknowledged' && (value.note?.length ?? 0) < 5) {
+    context.addIssue({ code: 'custom', path: ['note'], message: 'Please explain the conflict or help request (at least 5 characters).' });
+  }
+});
+
 export const swapRequestSchema = z.object({
   target_id: z.string().min(1),
   reason: z.string().max(1000).optional(),
@@ -296,6 +337,13 @@ export const payrollAdjustSchema = z.object({
 export const payrollRecallSchema = z.object({
   reason: z.string().min(10).max(1000),
 }).passthrough();
+
+export const payRateSchema = z.object({
+  amount: z.coerce.number().positive().max(1_000_000_000),
+  basis: z.enum(['hourly', 'daily', 'monthly']),
+  currency: z.string().trim().toUpperCase().regex(/^[A-Z]{3,10}$/).optional(),
+  effective_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+}).strict();
 
 // ─── Attendance corrections ───────────────────────────
 export const correctionRequestSchema = z.object({
@@ -379,6 +427,7 @@ export const holidaySchema = z.object({
   date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD'),
   name: z.string().trim().min(1).max(120),
   recurring: z.coerce.boolean().optional(),
+  location_id: z.string().nullish(),
 }).passthrough();
 
 // ─── Outbound org webhooks ────────────────────────────
@@ -391,9 +440,35 @@ export const WEBHOOK_EVENT_TYPES = [
   'remote_changed',
   'swap_changed',
   'expense_changed',
+  'project_changed',
   'shift_changed',
+  'timesheet_changed',
 ] as const;
 export type WebhookEventType = (typeof WEBHOOK_EVENT_TYPES)[number];
+export const WEBHOOK_SCHEMA_VERSION = 1;
+const WEBHOOK_EVENT_DESCRIPTIONS: Record<WebhookEventType, string> = {
+  attendance_changed: 'Attendance check-in, check-out, or correction state changed.',
+  leave_changed: 'A leave request was submitted, edited, or reviewed.',
+  overtime_changed: 'An overtime request or decision changed.',
+  remote_changed: 'A remote-work request or check-in changed.',
+  swap_changed: 'A shift-swap request or decision changed.',
+  expense_changed: 'An expense claim or review changed.',
+  project_changed: 'A project or project task changed.',
+  shift_changed: 'A shift, assignment, or schedule publication changed.',
+  timesheet_changed: 'A project timesheet was submitted, reviewed, or changed.',
+};
+export const WEBHOOK_EVENT_CATALOG = WEBHOOK_EVENT_TYPES.map(event => ({
+  event,
+  schema_version: WEBHOOK_SCHEMA_VERSION,
+  description: WEBHOOK_EVENT_DESCRIPTIONS[event],
+  payload: {
+    id: 'string (stable event ID)',
+    event: 'string (matches this catalogue entry)',
+    schema_version: 'integer',
+    org_id: 'string',
+    timestamp: 'ISO-8601 UTC timestamp',
+  },
+}));
 
 export const orgWebhookSchema = z.object({
   url: z.string().url().max(1000)
@@ -416,6 +491,7 @@ export const orgSettingsSchema = z.object({
   timezone: z.string().max(100).optional(),
   currency: z.string().max(10).optional(),
   payroll_day: z.coerce.number().int().min(1).max(28).optional(),
+  monthly_pay_divisor: z.coerce.number().int().min(20).max(31).optional(),
   tax_rate: z.coerce.number().min(0).max(100).optional(),
   pension_rate: z.coerce.number().min(0).max(100).optional(),
   late_threshold: z.coerce.number().int().min(0).max(120).optional(),

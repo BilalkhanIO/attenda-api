@@ -2,7 +2,8 @@
 
 jest.mock('../../utils/prisma', () => ({ __esModule: true, default: {} }));
 
-import { expandHolidays, workingDaysExcluding, HolidayRow } from '../../services/holidays';
+import { expandHolidays, workingDaysExcluding, holidaySetForRange, HolidayRow } from '../../services/holidays';
+import prisma from '../../utils/prisma';
 
 const d = (s: string) => new Date(`${s}T00:00:00.000Z`);
 const row = (date: string, recurring = false): HolidayRow => ({ date: d(date), name: 'x', recurring });
@@ -48,5 +49,30 @@ describe('workingDaysExcluding', () => {
   it('ignores holidays that fall on weekends', () => {
     const holidays = new Set(['2026-08-01']); // Saturday
     expect(workingDaysExcluding(d('2026-07-31'), d('2026-08-03'), holidays)).toBe(2); // Fri + Mon
+  });
+});
+
+describe('holidaySetForRange location scope', () => {
+  it('includes global and the requested location holiday rows', async () => {
+    const findMany = jest.fn().mockResolvedValue([row('2026-08-14')]);
+    (prisma as unknown as { orgHoliday: { findMany: typeof findMany } }).orgHoliday = { findMany };
+
+    const holidays = await holidaySetForRange('org-1', d('2026-08-01'), d('2026-08-31'), 'loc-2');
+
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { org_id: 'org-1', OR: [{ location_id: null }, { location_id: 'loc-2' }] },
+    }));
+    expect(holidays.has('2026-08-14')).toBe(true);
+  });
+
+  it('uses only global holidays for legacy requests without a location snapshot', async () => {
+    const findMany = jest.fn().mockResolvedValue([]);
+    (prisma as unknown as { orgHoliday: { findMany: typeof findMany } }).orgHoliday = { findMany };
+
+    await holidaySetForRange('org-1', d('2026-08-01'), d('2026-08-31'));
+
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { org_id: 'org-1', location_id: null },
+    }));
   });
 });

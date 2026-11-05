@@ -1,4 +1,5 @@
 import { Request, Response, NextFunction } from 'express';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { verifyAccessToken, JwtPayload } from '../utils/auth';
 import { UnauthorizedError, ForbiddenError } from '../utils/response';
 import redis from '../utils/redis';
@@ -19,9 +20,46 @@ declare global {
       user?: JwtPayload;
       /** Effective permission set, populated by requirePermission for handler-level scoping. */
       permissions?: Set<string>;
+      apiKey?: { id: string; scopes: Set<string> };
     }
   }
 }
+
+/** Authenticate a scoped organization API key on the versioned integrations API only. */
+export async function authenticateApiKey(req: Request, _res: Response, next: NextFunction) {
+  try {
+    const authorization = req.headers.authorization;
+    if (!authorization?.startsWith('Bearer ')) throw new UnauthorizedError('Invalid API key');
+    const rawKey = authorization.slice(7);
+    const match = /^attenda_([a-f0-9]{16})_([A-Za-z0-9_-]{32,})$/.exec(rawKey);
+    if (!match) throw new UnauthorizedError('Invalid API key');
+    const [, prefix] = match;
+    const apiKey = await prisma.publicApiKey.findUnique({ where: { key_prefix: prefix } });
+    if (!apiKey || apiKey.revoked_at || (apiKey.expires_at && apiKey.expires_at <= new Date())) throw new UnauthorizedError('Invalid API key');
+    const actualHash = createHash('sha256').update(rawKey).digest();
+    const expectedHash = Buffer.from(apiKey.key_hash, 'hex');
+    if (actualHash.length !== expectedHash.length || !timingSafeEqual(actualHash, expectedHash)) throw new UnauthorizedError('Invalid API key');
+
+    const user = await prisma.user.findFirst({
+      where: { id: apiKey.user_id, org_id: apiKey.org_id, is_active: true, deleted_at: null },
+      select: { id: true, org_id: true, role: true, name: true, email: true },
+    });
+    if (!user) throw new UnauthorizedError('Invalid API key');
+    if (!hasFeature(await resolveOrgFeatures(apiKey.org_id), 'api_access')) throw new ForbiddenError('API access is not available on this organization plan');
+
+    req.user = { sub: user.id, org_id: user.org_id, role: user.role, name: user.name, email: user.email, jti: `api-key:${apiKey.id}` };
+    req.apiKey = { id: apiKey.id, scopes: new Set(apiKey.scopes) };
+    const lastUseThreshold = new Date(Date.now() - 5 * 60_000);
+    void prisma.publicApiKey.updateMany({
+      where: { id: apiKey.id, OR: [{ last_used_at: null }, { last_used_at: { lt: lastUseThreshold } }] },
+      data: { last_used_at: new Date() },
+    }).catch(() => {});
+    next();
+  } catch (error) {
+    next(error);
+  }
+}
+Object.assign(authenticateApiKey, { __openapi: { auth: 'apiKey' as const } });
 
 const ROLE_HIERARCHY: Record<string, number> = {
   employee:       1,
@@ -86,6 +124,7 @@ Object.assign(authenticate, { __openapi: { auth: 'required' as const } });
 export function requireRole(...roles: string[]) {
   const middleware = (req: Request, _res: Response, next: NextFunction) => {
     if (!req.user) return next(new UnauthorizedError());
+    if (req.apiKey) return next(new ForbiddenError('This API key can only access permission-scoped API routes'));
     if (req.user.role === 'platform_admin' && !roles.includes('platform_admin')) {
       return next(new ForbiddenError());
     }
@@ -112,6 +151,7 @@ export function requirePermission(...permissionKeys: string[]) {
       if (!req.user) return next(new UnauthorizedError());
 
       if (req.user.role === 'platform_admin') {
+        if (req.apiKey) return next(new ForbiddenError());
         const platformPerms = await resolvePlatformPermissions(req.user.sub);
         if (permissionKeys.some(k => can(platformPerms, k))) {
           req.permissions = platformPerms;
@@ -120,7 +160,8 @@ export function requirePermission(...permissionKeys: string[]) {
         return next(new ForbiddenError());
       }
 
-      const perms = await resolveUserPermissions(req.user.sub, req.user.org_id);
+      const resolved = await resolveUserPermissions(req.user.sub, req.user.org_id);
+      const perms = req.apiKey ? new Set([...resolved].filter(key => req.apiKey!.scopes.has(key))) : resolved;
       if (permissionKeys.some(k => can(perms, k))) {
         req.permissions = perms;
         return next();

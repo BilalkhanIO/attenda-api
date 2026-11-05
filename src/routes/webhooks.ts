@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { createHmac } from 'crypto';
-import { handleWebhookReply } from '../services/whatsapp';
+import { handleWebhookReply, reconcileWhatsAppStatuses } from '../services/whatsapp';
 
 const router = Router();
 
@@ -53,7 +53,7 @@ router.post('/whatsapp', async (req: Request, res: Response) => {
 
     const body = req.body;
     if (body?.object === 'whatsapp_business_account') {
-      await handleWebhookReply(body);
+      await Promise.all([handleWebhookReply(body), reconcileWhatsAppStatuses(body)]);
     }
   } catch (err) {
     console.error('[Webhook] WhatsApp processing error:', err);

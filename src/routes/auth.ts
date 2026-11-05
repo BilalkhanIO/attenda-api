@@ -16,6 +16,7 @@ import redis from '../utils/redis';
 import { generateSecret, verifySync, generateURI } from 'otplib';
 import jwt from 'jsonwebtoken';
 import crypto from 'crypto';
+import { idempotency, publicIdempotency, publicSensitiveIdempotency, sensitiveResponseIdempotency } from '../middleware/idempotency';
 
 const router = Router();
 
@@ -66,7 +67,7 @@ async function blacklistToken(jti: string, expUnix: number): Promise<void> {
 }
 
 // ─── POST /auth/register ───────────────────────────────
-router.post('/register', validate({ body: registerSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/register', publicSensitiveIdempotency(req => `email:${String(req.body?.email ?? '').trim().toLowerCase()}`), validate({ body: registerSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { org_name, timezone, currency, name, email, password } = req.body;
     if (!org_name || !name || !email || !password) throw new ValidationError('Missing required fields');
@@ -79,11 +80,12 @@ router.post('/register', validate({ body: registerSchema }), async (req: Request
     const org = await prisma.organisation.create({
       data: { name: org_name, timezone: timezone || 'UTC', currency: currency || 'USD' },
     });
+    const mainLocation = await prisma.location.create({ data: { org_id: org.id, name: 'Main office', timezone: timezone || 'UTC', is_main: true } });
 
     const hash = await hashPassword(password);
     const user = await prisma.user.create({
       data: {
-        org_id: org.id, name, email, password_hash: hash,
+        org_id: org.id, primary_location_id: mainLocation.id, name, email, password_hash: hash,
         role: 'super_admin', setup_complete: true,
       },
     });
@@ -100,6 +102,11 @@ router.post('/register', validate({ body: registerSchema }), async (req: Request
         where: { user_id: user.id },
         update: { org_role_id: orgRole.id },
         create: { user_id: user.id, org_role_id: orgRole.id },
+      });
+      await prisma.locationManager.upsert({
+        where: { location_id_user_id: { location_id: mainLocation.id, user_id: user.id } },
+        update: {},
+        create: { location_id: mainLocation.id, user_id: user.id },
       });
     }
 
@@ -125,7 +132,7 @@ router.post('/register', validate({ body: registerSchema }), async (req: Request
 });
 
 // ─── POST /auth/login ──────────────────────────────────
-router.post('/login', validate({ body: loginSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/login', publicSensitiveIdempotency(req => `email:${String(req.body?.email ?? '').trim().toLowerCase()}`), validate({ body: loginSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) throw new ValidationError('Email and password required');
@@ -248,7 +255,7 @@ router.get('/sessions', authenticate, async (req: Request, res: Response, next: 
   } catch (e) { next(e); }
 });
 
-router.delete('/sessions/:sessionId', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/sessions/:sessionId', publicIdempotency(req => `access:${req.get('Authorization') ?? ''}`), authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const sessionId = String(req.params.sessionId);
     const revoked = await revokeSession(req.user!.sub, sessionId);
@@ -260,7 +267,7 @@ router.delete('/sessions/:sessionId', authenticate, async (req: Request, res: Re
   } catch (e) { next(e); }
 });
 
-router.post('/logout', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/logout', publicIdempotency(req => `access:${req.get('Authorization') ?? ''}`), authenticate, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const jti = req.user!.jti;
     const exp = (req.user as unknown as { exp: number }).exp;
@@ -272,7 +279,7 @@ router.post('/logout', authenticate, async (req: Request, res: Response, next: N
 });
 
 // ─── POST /auth/refresh ────────────────────────────────
-router.post('/refresh', validate({ body: refreshSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/refresh', publicSensitiveIdempotency(req => `refresh:${String(req.body?.refresh_token ?? '')}`), validate({ body: refreshSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { refresh_token } = req.body;
     if (!refresh_token) throw new ValidationError('Refresh token required');
@@ -289,7 +296,7 @@ router.post('/refresh', validate({ body: refreshSchema }), async (req: Request, 
 });
 
 // ─── POST /auth/forgot-password ────────────────────────
-router.post('/forgot-password', validate({ body: forgotPasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/forgot-password', publicIdempotency(req => `email:${String(req.body?.email ?? '').trim().toLowerCase()}`), validate({ body: forgotPasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { email } = req.body;
     if (!email) throw new ValidationError('Email required');
@@ -309,7 +316,7 @@ router.post('/forgot-password', validate({ body: forgotPasswordSchema }), async 
 });
 
 // ─── POST /auth/reset-password ─────────────────────────
-router.post('/reset-password', validate({ body: resetPasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/reset-password', publicIdempotency(req => `reset:${String(req.body?.token ?? '')}`), validate({ body: resetPasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { token, password } = req.body;
     if (!token || !password) throw new ValidationError('Token and password required');
@@ -331,7 +338,7 @@ router.post('/reset-password', validate({ body: resetPasswordSchema }), async (r
 });
 
 // ─── POST /auth/setup-account ──────────────────────────
-router.post('/setup-account', validate({ body: setupAccountSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/setup-account', publicSensitiveIdempotency(req => `invite:${String(req.body?.token ?? '')}`), validate({ body: setupAccountSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { token, password } = req.body;
     if (!token || !password) throw new ValidationError('Token and password required');
@@ -353,7 +360,7 @@ router.post('/setup-account', validate({ body: setupAccountSchema }), async (req
 });
 
 // ─── PUT /auth/change-password ─────────────────────────
-router.put('/change-password', authenticate, validate({ body: changePasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/change-password', publicIdempotency(req => `access:${req.get('Authorization') ?? ''}`), authenticate, validate({ body: changePasswordSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { current_password, new_password } = req.body;
     if (!current_password || !new_password) throw new ValidationError('current_password and new_password required');
@@ -382,7 +389,7 @@ router.put('/change-password', authenticate, validate({ body: changePasswordSche
 });
 
 // ─── POST /auth/2fa/authenticate ───────────────────────
-router.post('/2fa/authenticate', validate({ body: totpAuthenticateSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/authenticate', publicSensitiveIdempotency(req => `2fa:${String(req.body?.partial_token ?? '')}`), validate({ body: totpAuthenticateSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { partial_token, code } = req.body;
     if (!partial_token || !code) throw new ValidationError('partial_token and code required');
@@ -440,7 +447,7 @@ router.post('/2fa/authenticate', validate({ body: totpAuthenticateSchema }), asy
 });
 
 // ─── POST /auth/2fa/setup ──────────────────────────────
-router.post('/2fa/setup', authenticate, async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/setup', authenticate, sensitiveResponseIdempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user!.sub } });
     if (!user) throw new AppError('User not found', 404, 'NOT_FOUND');
@@ -457,7 +464,7 @@ router.post('/2fa/setup', authenticate, async (req: Request, res: Response, next
 });
 
 // ─── POST /auth/2fa/verify ─────────────────────────────
-router.post('/2fa/verify', authenticate, validate({ body: totpVerifySchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/2fa/verify', authenticate, idempotency, validate({ body: totpVerifySchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.body;
     if (!code) throw new ValidationError('code required');
@@ -476,7 +483,7 @@ router.post('/2fa/verify', authenticate, validate({ body: totpVerifySchema }), a
 });
 
 // ─── DELETE /auth/2fa (disable 2FA — requires TOTP code) ─
-router.delete('/2fa', authenticate, validate({ body: totpVerifySchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/2fa', authenticate, idempotency, validate({ body: totpVerifySchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.body as { code: string };
     if (!code) throw new AppError('Verification code required', 400, 'VALIDATION_ERROR');
@@ -562,7 +569,7 @@ router.get('/sso/google/callback', async (req: Request, res: Response, next: Nex
 
 // ─── POST /auth/sso/exchange ──────────────────────────
 // Exchange one-time SSO code for access + refresh tokens
-router.post('/sso/exchange', async (req: Request, res: Response, next: NextFunction) => {
+router.post('/sso/exchange', publicSensitiveIdempotency(req => `sso:${String(req.body?.code ?? '')}`), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { code } = req.body as { code?: string };
     if (!code) throw new ValidationError('code is required');

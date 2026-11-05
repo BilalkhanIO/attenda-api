@@ -5,12 +5,13 @@ import { overtimeRequestSchema, createOvertimeRuleSchema, updateOvertimeRuleSche
 import { authenticate, requirePermission } from '../middleware/auth';
 import { ok, created, noContent, ValidationError, NotFoundError } from '../utils/response';
 import { emitOrgEvent } from '../services/notifications';
+import { idempotency } from '../middleware/idempotency';
 
 const router = Router();
 router.use(authenticate);
 
 // ─── POST /overtime/requests ──────────────────────────
-router.post('/requests', validate({ body: overtimeRequestSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/requests', idempotency, validate({ body: overtimeRequestSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { submitOvertimeRequest } = await import('../services/overtime-request');
     const request = await submitOvertimeRequest(req.user!.sub, req.user!.org_id, req.body);
@@ -48,7 +49,7 @@ router.get('/requests/me', async (req: Request, res: Response, next: NextFunctio
 });
 
 // ─── PUT /overtime/requests/:id/approve ───────────────
-router.put('/requests/:id/approve', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/requests/:id/approve', requirePermission('overtime.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     const request = await prisma.overtimeRequest.findFirst({
@@ -86,7 +87,7 @@ router.put('/requests/:id/approve', requirePermission('overtime.manage'), async 
 });
 
 // ─── PUT /overtime/requests/:id/reject ────────────────
-router.put('/requests/:id/reject', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/requests/:id/reject', requirePermission('overtime.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const id = req.params.id as string;
     const { reason } = req.body;
@@ -125,7 +126,7 @@ router.get('/rules', requirePermission('overtime.manage'), async (req: Request, 
 });
 
 // ─── POST /overtime/rules ──────────────────────────────
-router.post('/rules', requirePermission('overtime.manage'), validate({ body: createOvertimeRuleSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.post('/rules', requirePermission('overtime.manage'), idempotency, validate({ body: createOvertimeRuleSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { name, rule_type, threshold_hours, multiplier, priority } = req.body;
     if (!name || !rule_type || !threshold_hours || !multiplier) {
@@ -149,7 +150,7 @@ router.post('/rules', requirePermission('overtime.manage'), validate({ body: cre
 });
 
 // ─── PUT /overtime/rules/:id ───────────────────────────
-router.put('/rules/:id', requirePermission('overtime.manage'), validate({ body: updateOvertimeRuleSchema }), async (req: Request, res: Response, next: NextFunction) => {
+router.put('/rules/:id', requirePermission('overtime.manage'), idempotency, validate({ body: updateOvertimeRuleSchema }), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rule = await prisma.overtimeRule.findFirst({
       where: { id: req.params.id as string, org_id: req.user!.org_id },
@@ -172,7 +173,7 @@ router.put('/rules/:id', requirePermission('overtime.manage'), validate({ body: 
 });
 
 // ─── DELETE /overtime/rules/:id ───────────────────────
-router.delete('/rules/:id', requirePermission('overtime.manage'), async (req: Request, res: Response, next: NextFunction) => {
+router.delete('/rules/:id', requirePermission('overtime.manage'), idempotency, async (req: Request, res: Response, next: NextFunction) => {
   try {
     const rule = await prisma.overtimeRule.findFirst({
       where: { id: req.params.id as string, org_id: req.user!.org_id },

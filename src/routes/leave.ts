@@ -1,11 +1,15 @@
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
 import { validate } from '../middleware/validate';
+import { idempotency } from '../middleware/idempotency';
 import { leaveRequestSchema } from '../schemas';
 import { ok, paginated, NotFoundError, ForbiddenError, ValidationError } from '../utils/response';
 import prisma from '../utils/prisma';
 import { recordAudit } from '../services/audit';
 import { emitOrgEvent } from '../services/notifications';
+import { decodeCursor, encodeCursor, keysetAfter } from '../utils/cursor';
+import { getLeaveLedgerBalances, setLeaveLedgerContext } from '../services/leaveLedger';
+import { holidaySetForRange } from '../services/holidays';
 
 const router = Router();
 router.use(authenticate);
@@ -13,13 +17,36 @@ router.use(authenticate);
 const LEAVE_INCLUDE = {
   user: { select: { id: true, name: true, avatar_url: true, department: true, email: true } },
   reviewer: { select: { id: true, name: true } },
+  location: { select: { id: true, name: true, timezone: true } },
 } as const;
 
 // ─── GET /leave/requests/me ────────────────────────────
 router.get('/requests/me', async (req, res, next) => {
   try {
+    const where = { user_id: req.user!.sub };
+    const cursorMode = req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string';
+    if (cursorMode) {
+      const parsedLimit = Number.parseInt(String(req.query.limit ?? '25'), 10);
+      const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 25;
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+      const position = cursor ? decodeCursor(cursor, where) : null;
+      if (cursor && !position) {
+        const anchor = await prisma.leaveRequest.findFirst({ where: { ...where, id: cursor }, select: { id: true } });
+        if (!anchor) throw new ValidationError('Invalid leave-request cursor');
+      }
+      const rows = await prisma.leaveRequest.findMany({
+        where: position ? { ...where, AND: [keysetAfter(position, 'created_at')] } : where,
+        ...(!position && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        include: LEAVE_INCLUDE, orderBy: [{ created_at: 'desc' }, { id: 'desc' }], take: limit + 1,
+      });
+      const hasMore = rows.length > limit;
+      const items = hasMore ? rows.slice(0, limit) : rows;
+      const last = items[items.length - 1];
+      ok(res, { items, next_cursor: hasMore && last ? encodeCursor({ at: last.created_at, id: last.id }, where) : null, has_more: hasMore, limit });
+      return;
+    }
     const requests = await prisma.leaveRequest.findMany({
-      where: { user_id: req.user!.sub },
+      where,
       include: LEAVE_INCLUDE,
       orderBy: { created_at: 'desc' },
     });
@@ -34,8 +61,32 @@ router.get('/requests/team', requirePermission('leave.view_team', 'leave.approve
       where: { manager_id: req.user!.sub, is_active: true, org_id: req.user!.org_id },
       select: { id: true },
     });
+    const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+    if (status && !['pending', 'approved', 'rejected', 'cancelled'].includes(status)) throw new ValidationError('Invalid leave request status');
+    const where = { org_id: req.user!.org_id, user_id: { in: team.map(u => u.id) }, ...(status ? { status } : {}) };
+    const cursorMode = req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string';
+    if (cursorMode) {
+      const parsedLimit = Number.parseInt(String(req.query.limit ?? '25'), 10);
+      const limit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 25;
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+      const position = cursor ? decodeCursor(cursor, where) : null;
+      if (cursor && !position) {
+        const anchor = await prisma.leaveRequest.findFirst({ where: { ...where, id: cursor }, select: { id: true } });
+        if (!anchor) throw new ValidationError('Invalid leave-request cursor');
+      }
+      const rows = await prisma.leaveRequest.findMany({
+        where: position ? { ...where, AND: [keysetAfter(position, 'created_at')] } : where,
+        ...(!position && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        include: LEAVE_INCLUDE, orderBy: [{ created_at: 'desc' }, { id: 'desc' }], take: limit + 1,
+      });
+      const hasMore = rows.length > limit;
+      const items = hasMore ? rows.slice(0, limit) : rows;
+      const last = items[items.length - 1];
+      ok(res, { items, next_cursor: hasMore && last ? encodeCursor({ at: last.created_at, id: last.id }, where) : null, has_more: hasMore, limit });
+      return;
+    }
     const requests = await prisma.leaveRequest.findMany({
-      where: { user_id: { in: team.map(u => u.id) } },
+      where,
       include: LEAVE_INCLUDE,
       orderBy: { created_at: 'desc' },
     });
@@ -54,6 +105,30 @@ router.get('/requests', requirePermission('leave.view_all'), async (req, res, ne
       where.user_id = { in: deptUsers.map(u => u.id) };
     }
     if (q) where.user = { name: { contains: q, mode: 'insensitive' } };
+
+    const cursorMode = req.query.cursor_mode === 'true' || req.query.cursor_mode === '1' || typeof req.query.cursor === 'string';
+    if (cursorMode) {
+      const parsedLimit = Number.parseInt(String(req.query.limit ?? '25'), 10);
+      const cursorLimit = Number.isFinite(parsedLimit) ? Math.max(1, Math.min(100, parsedLimit)) : 25;
+      const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+      const position = cursor ? decodeCursor(cursor, where) : null;
+      if (cursor && !position) {
+        const anchor = await prisma.leaveRequest.findFirst({ where: { ...where, id: cursor }, select: { id: true } });
+        if (!anchor) throw new ValidationError('Invalid leave-request cursor');
+      }
+      const rows = await prisma.leaveRequest.findMany({
+        where: position ? { ...where, AND: [keysetAfter(position, 'created_at')] } : where,
+        ...(!position && cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        include: LEAVE_INCLUDE,
+        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+        take: cursorLimit + 1,
+      });
+      const hasMore = rows.length > cursorLimit;
+      const items = hasMore ? rows.slice(0, cursorLimit) : rows;
+      const last = items[items.length - 1];
+      ok(res, { items, next_cursor: hasMore && last ? encodeCursor({ at: last.created_at, id: last.id }, where) : null, has_more: hasMore, limit: cursorLimit });
+      return;
+    }
 
     const SORTABLE = new Set(['created_at', 'start_date', 'end_date', 'status', 'leave_type']);
     const orderBy = { [SORTABLE.has(sort) ? sort : 'created_at']: order === 'asc' ? 'asc' as const : 'desc' as const };
@@ -80,7 +155,7 @@ router.get('/requests', requirePermission('leave.view_all'), async (req, res, ne
 // Supports both full-day and half-day leave:
 //   is_half_day: true + half_day_period: 'morning'|'afternoon'
 //   → start_date = end_date (single day), working_days = 0.5
-router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res, next) => {
+router.post('/requests', idempotency, validate({ body: leaveRequestSchema }), async (req, res, next) => {
   try {
     const { submitLeaveRequest } = await import('../services/leave-request');
     const request = await submitLeaveRequest(req.user!.sub, req.user!.org_id, req.body);
@@ -89,7 +164,7 @@ router.post('/requests', validate({ body: leaveRequestSchema }), async (req, res
 });
 
 // ─── DELETE /leave/requests/:id ────────────────────────
-router.delete('/requests/:id', async (req, res, next) => {
+router.delete('/requests/:id', idempotency, async (req, res, next) => {
   try {
     const request = await prisma.leaveRequest.findFirst({
       where: { id: String(req.params.id), user_id: req.user!.sub },
@@ -102,7 +177,7 @@ router.delete('/requests/:id', async (req, res, next) => {
 });
 
 // ─── PUT /leave/requests/:id/approve ──────────────────
-router.put('/requests/:id/approve', requirePermission('leave.approve'), async (req, res, next) => {
+router.put('/requests/:id/approve', requirePermission('leave.approve'), idempotency, async (req, res, next) => {
   try {
     const request = await prisma.leaveRequest.findFirst({
       where: { id: String(req.params.id), org_id: req.user!.org_id, status: 'pending' },
@@ -118,14 +193,17 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
       if (!requester) throw new ForbiddenError('You can only approve leave for your direct reports');
     }
 
+    const holidays = await holidaySetForRange(request.org_id, request.start_date, request.end_date, request.location_id);
     await prisma.$transaction(async (tx) => {
-      await tx.leaveRequest.update({
-        where: { id: String(req.params.id) },
+      const claimed = await tx.leaveRequest.updateMany({
+        where: { id: String(req.params.id), org_id: req.user!.org_id, status: 'pending' },
         data: { status: 'approved', reviewed_by: req.user!.sub, reviewed_at: new Date() },
       });
+      if (!claimed.count) throw new ValidationError('This request has already been reviewed');
+      await setLeaveLedgerContext(tx, { reason: 'usage', refId: request.id, actorId: req.user!.sub, note: 'Approved leave request' });
       // Deduct from leave balance
       await tx.leaveBalance.updateMany({
-        where: { user_id: request.user_id, leave_type: request.leave_type, year: request.start_date.getFullYear() },
+        where: { user_id: request.user_id, leave_type: request.leave_type, year: request.start_date.getUTCFullYear() },
         data: { used_days: { increment: request.working_days } },
       });
       // Update attendance records to 'leave'.
@@ -135,7 +213,8 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
       const leaveStatus = isPartialLeave ? 'half_leave' : 'leave';
       const cur = new Date(request.start_date);
       while (cur <= request.end_date) {
-        if (cur.getDay() !== 0 && cur.getDay() !== 6) {
+        const dateKey = cur.toISOString().slice(0, 10);
+        if (cur.getUTCDay() !== 0 && cur.getUTCDay() !== 6 && !holidays.has(dateKey)) {
           // For half-day: if the record already has a check-in (employee worked
           // one half), preserve the check-in data but update status only
           const existingRecord = await tx.attendanceRecord.findUnique({
@@ -158,7 +237,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
             });
           }
         }
-        cur.setDate(cur.getDate() + 1);
+        cur.setUTCDate(cur.getUTCDate() + 1);
       }
     });
 
@@ -194,7 +273,7 @@ router.put('/requests/:id/approve', requirePermission('leave.approve'), async (r
 });
 
 // ─── PUT /leave/requests/:id/reject ───────────────────
-router.put('/requests/:id/reject', requirePermission('leave.approve'), async (req, res, next) => {
+router.put('/requests/:id/reject', requirePermission('leave.approve'), idempotency, async (req, res, next) => {
   try {
     const { reason } = req.body;
     if (!reason) throw new ValidationError('Rejection reason required');
@@ -251,13 +330,11 @@ router.put('/requests/:id/reject', requirePermission('leave.approve'), async (re
 router.get('/balance/me', async (req, res, next) => {
   try {
     const year = new Date().getFullYear();
-    const balances = await prisma.leaveBalance.findMany({
-      where: { user_id: req.user!.sub, year },
-    });
+    const balances = await getLeaveLedgerBalances({ userId: req.user!.sub, orgId: req.user!.org_id, year });
 
     // Annotate rows with the org's accrual policy (additive — clients that
     // don't know the field ignore it) so employees can see how balances grow.
-    const { parseAccrualConfig, monthlyIncrement, toDays } = await import('../services/leaveAccrual');
+    const { parseAccrualConfig, monthlyIncrement, toDays, availableDays } = await import('../services/leaveAccrual');
     const org = await prisma.organisation.findUnique({
       where: { id: req.user!.org_id },
       select: { leave_accrual: true },
@@ -266,7 +343,7 @@ router.get('/balance/me', async (req, res, next) => {
     const annotated = balances.map(b => {
       const policy = accrual?.[b.leave_type];
       // Decimal columns serialize as strings — clients expect numbers
-      const row = { ...b, total_days: toDays(b.total_days), used_days: toDays(b.used_days) };
+      const row = { ...b, total_days: toDays(b.total_days), used_days: toDays(b.used_days), available_days: availableDays(b.total_days, b.used_days) };
       return policy
         ? { ...row, accrual: { days_per_year: policy.days_per_year, monthly: monthlyIncrement(policy), carry_over_max: policy.carry_over_max ?? 0 } }
         : row;
@@ -276,6 +353,43 @@ router.get('/balance/me', async (req, res, next) => {
 });
 
 // ─── GET /leave/balance/:userId ────────────────────────
+router.get('/balance/me/ledger', async (req, res, next) => {
+  try {
+    const parsedYear = Number.parseInt(String(req.query.year ?? new Date().getFullYear()), 10);
+    const year = Number.isFinite(parsedYear) ? parsedYear : new Date().getFullYear();
+    const leaveType = typeof req.query.leave_type === 'string' ? req.query.leave_type : undefined;
+    const limitValue = Number.parseInt(String(req.query.limit ?? '50'), 10);
+    const limit = Number.isFinite(limitValue) ? Math.max(1, Math.min(100, limitValue)) : 50;
+    const entries = await prisma.leaveLedgerEntry.findMany({
+      where: { org_id: req.user!.org_id, user_id: req.user!.sub, year, ...(leaveType ? { leave_type: leaveType } : {}) },
+      include: { actor: { select: { id: true, name: true } } },
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }], take: limit,
+    });
+    ok(res, { items: entries, limit, year });
+  } catch (e) { next(e); }
+});
+
+router.get('/balance/:userId/ledger', requirePermission('leave.view_team', 'leave.balance.manage', 'leave.view_all'), async (req, res, next) => {
+  try {
+    const userId = String(req.params.userId);
+    const target = await prisma.user.findFirst({ where: { id: userId, org_id: req.user!.org_id, deleted_at: null }, select: { id: true, manager_id: true } });
+    if (!target) throw new NotFoundError('User');
+    const canManageAll = req.permissions?.has('leave.balance.manage') || req.permissions?.has('leave.view_all');
+    if (!canManageAll && target.manager_id !== req.user!.sub) throw new ForbiddenError('You can only view leave history for your direct reports');
+    const parsedYear = Number.parseInt(String(req.query.year ?? new Date().getFullYear()), 10);
+    const year = Number.isFinite(parsedYear) ? parsedYear : new Date().getFullYear();
+    const leaveType = typeof req.query.leave_type === 'string' ? req.query.leave_type : undefined;
+    const limitValue = Number.parseInt(String(req.query.limit ?? '50'), 10);
+    const limit = Number.isFinite(limitValue) ? Math.max(1, Math.min(100, limitValue)) : 50;
+    const entries = await prisma.leaveLedgerEntry.findMany({
+      where: { org_id: req.user!.org_id, user_id: userId, year, ...(leaveType ? { leave_type: leaveType } : {}) },
+      include: { actor: { select: { id: true, name: true } } },
+      orderBy: [{ created_at: 'desc' }, { id: 'desc' }], take: limit,
+    });
+    ok(res, { items: entries, limit, year });
+  } catch (e) { next(e); }
+});
+
 router.get('/balance/:userId', requirePermission('leave.view_team', 'leave.balance.manage'), async (req, res, next) => {
   try {
     const year = parseInt((req.query.year as string) || String(new Date().getFullYear()));
@@ -283,16 +397,13 @@ router.get('/balance/:userId', requirePermission('leave.view_team', 'leave.balan
       where: { id: String(req.params.userId), org_id: req.user!.org_id },
     });
     if (!targetUser) throw new NotFoundError('User');
-    const balances = await prisma.leaveBalance.findMany({
-      where: { user_id: String(req.params.userId), year },
-    });
-    const { toDays } = await import('../services/leaveAccrual');
-    ok(res, balances.map(b => ({ ...b, total_days: toDays(b.total_days), used_days: toDays(b.used_days) })));
+    const balances = await getLeaveLedgerBalances({ userId: String(req.params.userId), orgId: req.user!.org_id, year });
+    ok(res, balances.map(balance => ({ ...balance, available_days: Math.round((balance.total_days - balance.used_days) * 100) / 100 })));
   } catch (e) { next(e); }
 });
 
 // ─── PUT /leave/balance/:userId ────────────────────────
-router.put('/balance/:userId', requirePermission('leave.balance.manage'), async (req, res, next) => {
+router.put('/balance/:userId', requirePermission('leave.balance.manage'), idempotency, async (req, res, next) => {
   try {
     const { leave_type, adjustment, reason } = req.body;
     if (!leave_type || adjustment === undefined || !reason) throw new ValidationError('leave_type, adjustment and reason required');
@@ -312,10 +423,10 @@ router.put('/balance/:userId', requirePermission('leave.balance.manage'), async 
     });
     if (!balance) throw new NotFoundError('Leave balance');
 
-    const { toDays, accruedTotal } = await import('../services/leaveAccrual');
-    const updated = await prisma.leaveBalance.update({
-      where: { id: balance.id },
-      data: { total_days: accruedTotal(balance.total_days, adj) },
+    const { toDays } = await import('../services/leaveAccrual');
+    const updated = await prisma.$transaction(async tx => {
+      await setLeaveLedgerContext(tx, { reason: 'adjustment', note: String(reason), actorId: req.user!.sub });
+      return tx.leaveBalance.update({ where: { id: balance.id }, data: { total_days: { increment: adj } } });
     });
     recordAudit({
       orgId: req.user!.org_id, actorId: req.user!.sub,

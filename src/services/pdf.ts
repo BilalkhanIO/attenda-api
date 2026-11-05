@@ -25,6 +25,9 @@ interface PayslipData {
     regularHours:  number;
     overtimeHours: number;
     hourlyRate:    number;
+    payBasis: 'hourly' | 'daily' | 'monthly';
+    payRateAmount: number;
+    monthlyDivisor: number;
     basePay:       number;
     overtimePay:   number;
   };
@@ -32,8 +35,13 @@ interface PayslipData {
     unpaidDays:      number;
     unpaidDeduction: number;
     manualAdjustment: number;
+    incomeTax: number;
+    pension: number;
+    employeeStatutory: Array<{ label: string; amount: number }>;
   };
+  employerStatutory: Array<{ label: string; amount: number }>;
   grossPay:      number;
+  netPay:        number;
   processedAt:   Date;
   processedBy?:  string;
 }
@@ -114,11 +122,15 @@ function buildPDF(data: PayslipData): Promise<Buffer> {
     sectionHeader(doc, 'EARNINGS', y);
     y += 22;
 
+    const basisLabel = earnings.payBasis === 'monthly' ? 'Monthly salary' : earnings.payBasis === 'daily' ? 'Daily rate' : 'Hourly rate';
+    const basisUnit = earnings.payBasis === 'monthly' ? '/month' : earnings.payBasis === 'daily' ? '/day' : '/hr';
+    const baseUnits = earnings.payBasis === 'monthly' ? '1 month' : earnings.payBasis === 'daily' ? `${(earnings.regularHours / 8).toFixed(2)} day equivalents` : `${earnings.regularHours.toFixed(2)} hrs`;
+    const baseRate = earnings.payRateAmount;
     const rows: [string, string, string, string][] = [
-      ['Regular Hours',  fmt(earnings.hourlyRate) + '/hr', `${earnings.regularHours.toFixed(2)} hrs`, fmt(earnings.basePay)],
+      [basisLabel, fmt(baseRate) + basisUnit, baseUnits, fmt(earnings.basePay)],
     ];
     if (earnings.overtimeHours > 0) {
-      rows.push(['Overtime (1.5×)', fmt(earnings.hourlyRate * 1.5) + '/hr', `${earnings.overtimeHours.toFixed(2)} hrs`, fmt(earnings.overtimePay)]);
+      rows.push(['Overtime', fmt(earnings.overtimePay / earnings.overtimeHours) + '/hr (weighted)', `${earnings.overtimeHours.toFixed(2)} hrs`, fmt(earnings.overtimePay)]);
     }
     tableHeader(doc, ['Description', 'Rate', 'Units', 'Amount'], y);
     y += 20;
@@ -132,7 +144,8 @@ function buildPDF(data: PayslipData): Promise<Buffer> {
 
     // ── Deductions table ─────────────────────────────
     y += 15;
-    const hasDeductions = deductions.unpaidDeduction > 0 || deductions.manualAdjustment !== 0;
+    const totalDeductions = deductions.unpaidDeduction + Math.max(0, -deductions.manualAdjustment) + deductions.incomeTax + deductions.pension + deductions.employeeStatutory.reduce((sum, item) => sum + item.amount, 0);
+    const hasDeductions = totalDeductions > 0 || deductions.manualAdjustment > 0;
 
     if (hasDeductions) {
       sectionHeader(doc, 'DEDUCTIONS', y);
@@ -149,9 +162,34 @@ function buildPDF(data: PayslipData): Promise<Buffer> {
         tableRow(doc, ['Manual Adjustment', '', '', `${isPos ? '+' : ''}${fmt(deductions.manualAdjustment)}`], y, !isPos);
         y += 20;
       }
+      if (deductions.incomeTax > 0) {
+        tableRow(doc, ['Income tax', '', '', `-${fmt(deductions.incomeTax)}`], y, true);
+        y += 20;
+      }
+      if (deductions.pension > 0) {
+        tableRow(doc, ['Pension / retirement', '', '', `-${fmt(deductions.pension)}`], y, true);
+        y += 20;
+      }
+      for (const contribution of deductions.employeeStatutory) {
+        tableRow(doc, [contribution.label, '', '', `-${fmt(contribution.amount)}`], y, true);
+        y += 20;
+      }
       y += 5;
       doc.moveTo(50, y).lineTo(doc.page.width - 50, y).strokeColor(C.border).lineWidth(0.5).stroke();
       y += 10;
+    }
+
+    if (data.employerStatutory.length) {
+      y += hasDeductions ? 4 : 16;
+      sectionHeader(doc, 'EMPLOYER STATUTORY CONTRIBUTIONS', y);
+      y += 22;
+      tableHeader(doc, ['Description', '', '', 'Employer amount'], y);
+      y += 20;
+      for (const contribution of data.employerStatutory) {
+        tableRow(doc, [contribution.label, '', '', fmt(contribution.amount)], y);
+        y += 20;
+      }
+      doc.moveTo(50, y + 5).lineTo(doc.page.width - 50, y + 5).strokeColor(C.border).lineWidth(0.5).stroke();
     }
 
     // ── Gross Pay Summary ────────────────────────────
@@ -167,8 +205,8 @@ function buildPDF(data: PayslipData): Promise<Buffer> {
     doc.rect(50, y, doc.page.width - 100, 70).fill(C.light).stroke(C.border);
     const summaryItems = [
       ['Total Earnings',   fmt(earnings.basePay + earnings.overtimePay)],
-      ['Total Deductions', fmt(deductions.unpaidDeduction + Math.max(0, -deductions.manualAdjustment))],
-      ['Net Gross Pay',    fmt(grossPay)],
+      ['Total Deductions', fmt(totalDeductions)],
+      ['Net Pay',          fmt(data.netPay)],
     ];
     const colW = (doc.page.width - 100) / 3;
     summaryItems.forEach(([label, value], i) => {

@@ -13,11 +13,13 @@ const ROLE_DISPLAY_NAMES: Record<string, string> = {
 };
 
 // Permission sets defined inline (formerly LEGACY_ROLE_PERMISSIONS in constants/rbac.ts)
-const EMPLOYEE_PERMS: string[] = ['projects.view'];
+const EMPLOYEE_PERMS: string[] = ['projects.view', 'time.view'];
 
 const MANAGER_PERMS = [
   ...EMPLOYEE_PERMS,
   'employees.view_team',
+  'employees.view_location',
+  'org.locations.view',
   'attendance.view_team',
   'attendance.override',
   'attendance.late_notices.manage',
@@ -28,6 +30,8 @@ const MANAGER_PERMS = [
   'shifts.assign',
   'shifts.availability.manage',
   'shifts.coverage.manage',
+  'labor_cost.view',
+  'compliance.view',
   'shifts.breaks.manage',
   'shifts.checkpoints.manage',
   'shifts.swaps.approve',
@@ -35,6 +39,8 @@ const MANAGER_PERMS = [
   'performance.manage',
   'projects.manage',
   'projects.tasks.manage',
+  'time.view_team',
+  'time.approve',
   'analytics.view',
   'remote.approve',
   'expenses.view',
@@ -50,11 +56,16 @@ const HR_ADMIN_PERMS = [
   'employees.deactivate',
   'employees.import',
   'attendance.export',
+  'attendance.devices.manage',
   'leave.view_all',
   'leave.balance.manage',
   'shifts.manage',
   'shifts.assign',
   'shifts.ai_schedule',
+  'labor_cost.manage',
+  'compliance.manage',
+  'compliance.override',
+  'org.events.replay',
   'payroll.view',
   'payroll.manage',
   'payroll.process',
@@ -66,9 +77,12 @@ const HR_ADMIN_PERMS = [
   'expenses.manage',
   'documents.manage',
   'onboarding.manage',
+  'offboarding.manage',
+  'offboarding.view_team',
   'whatsapp.test',
   'whatsapp.logs.view',
   'org.settings.view',
+  'org.locations.view',
   'org.qr.manage',
   'org.departments.manage',
   // The announcements endpoint always required this key, but it was never in
@@ -79,7 +93,9 @@ const HR_ADMIN_PERMS = [
 const SUPER_ADMIN_PERMS = [
   ...HR_ADMIN_PERMS,
   'org.audit.view',
+  'org.events.replay',
   'org.settings.update',
+  'org.locations.manage',
   'org.office.update',
   'org.whatsapp.update',
   'org.roles.manage',

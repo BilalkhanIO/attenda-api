@@ -7,7 +7,22 @@ jest.mock('../../utils/logger', () => ({
   jobLogger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
 }));
 
-import { parseAccrualConfig, monthlyIncrement, carryOver, toDays, accruedTotal, availableDays } from '../../services/leaveAccrual';
+import { parseAccrualConfig, monthlyIncrement, carryOver, toDays, accruedTotal, availableDays, accrualPeriodForLocation } from '../../services/leaveAccrual';
+
+describe('accrualPeriodForLocation', () => {
+  it('uses the employee location month when it differs from the organization date', () => {
+    const instant = new Date('2026-11-01T01:00:00.000Z');
+    expect(accrualPeriodForLocation(instant, 'America/Los_Angeles')).toBeNull();
+    expect(accrualPeriodForLocation(instant, 'Asia/Karachi')).toEqual({
+      year: 2026, month: 11, effectiveDate: new Date('2026-11-01T00:00:00.000Z'),
+    });
+  });
+
+  it('allows a one-day timezone catch-up window but not later accruals', () => {
+    expect(accrualPeriodForLocation(new Date('2026-11-02T12:00:00.000Z'), 'UTC')?.month).toBe(11);
+    expect(accrualPeriodForLocation(new Date('2026-11-03T12:00:00.000Z'), 'UTC')).toBeNull();
+  });
+});
 
 describe('parseAccrualConfig', () => {
   it('returns null for non-object input', () => {

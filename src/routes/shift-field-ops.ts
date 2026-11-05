@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Router } from "express";
+import { idempotency } from "../middleware/idempotency";
 import prisma from "../utils/prisma";
 import {
   ConflictError,
@@ -160,7 +161,7 @@ router.get("/open-shifts", requireOrgFeature("shifts"), async (req, res, next) =
   } catch (error) { next(error); }
 });
 
-router.post("/open-shifts", requireOrgFeature("shifts"), requirePermission("shifts.assign"), async (req, res, next) => {
+router.post("/open-shifts", requireOrgFeature("shifts"), requirePermission("shifts.assign"), idempotency, async (req, res, next) => {
   try {
     const { shift_id, date, note } = req.body ?? {};
     if (typeof shift_id !== "string" || !shift_id) throw new ValidationError("shift_id is required");
@@ -194,7 +195,7 @@ router.post("/open-shifts", requireOrgFeature("shifts"), requirePermission("shif
   } catch (error) { next(error); }
 });
 
-router.post("/open-shifts/:id/claim", requireOrgFeature("shifts"), async (req, res, next) => {
+router.post("/open-shifts/:id/claim", requireOrgFeature("shifts"), idempotency, async (req, res, next) => {
   try {
     const offerId = String(req.params.id);
     const userId = req.user!.sub;
@@ -216,7 +217,7 @@ router.post("/open-shifts/:id/claim", requireOrgFeature("shifts"), async (req, r
       });
       if (claimLock.count !== 1) throw new ConflictError("Another employee has already claimed this shift");
       const [user, sameDayAssignment, leave, unavailable] = await Promise.all([
-        tx.user.findFirst({ where: { id: userId, org_id: orgId, is_active: true, deleted_at: null }, select: { id: true, name: true } }),
+        tx.user.findFirst({ where: { id: userId, org_id: orgId, is_active: true, deleted_at: null }, select: { id: true, name: true, primary_location_id: true } }),
         tx.shiftAssignment.findFirst({ where: { user_id: userId, date: offer.date }, select: { id: true } }),
         tx.leaveRequest.findFirst({ where: { user_id: userId, status: "approved", start_date: { lte: offer.date }, end_date: { gte: offer.date } }, select: { id: true } }),
         tx.shiftAvailability.findMany({
@@ -253,7 +254,7 @@ router.post("/open-shifts/:id/claim", requireOrgFeature("shifts"), async (req, r
         }
       }
       const assignment = await tx.shiftAssignment.create({
-        data: { shift_id: offer.shift_id, user_id: userId, date: offer.date, is_published: true },
+        data: { shift_id: offer.shift_id, user_id: userId, date: offer.date, location_id: user.primary_location_id, is_published: true },
         include: { shift: true },
       });
       await tx.emergencyShiftOffer.update({ where: { id: offerId }, data: { assignment_id: assignment.id } });
@@ -281,7 +282,7 @@ router.post("/open-shifts/:id/claim", requireOrgFeature("shifts"), async (req, r
   }
 });
 
-router.post("/open-shifts/:id/cancel", requireOrgFeature("shifts"), requirePermission("shifts.assign"), async (req, res, next) => {
+router.post("/open-shifts/:id/cancel", requireOrgFeature("shifts"), requirePermission("shifts.assign"), idempotency, async (req, res, next) => {
   try {
     const offer = await prisma.emergencyShiftOffer.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id, status: "open" } });
     if (!offer) throw new NotFoundError("Open emergency shift");
@@ -304,7 +305,7 @@ router.get("/:shiftId/checkpoints", requireOrgFeature("shifts"), requirePermissi
   } catch (error) { next(error); }
 });
 
-router.post("/:shiftId/checkpoints", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), async (req, res, next) => {
+router.post("/:shiftId/checkpoints", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), idempotency, async (req, res, next) => {
   try {
     const shiftId = String(req.params.shiftId);
     const { name, instructions } = req.body ?? {};
@@ -323,7 +324,7 @@ router.post("/:shiftId/checkpoints", requireOrgFeature("shifts"), requirePermiss
   } catch (error) { next(error); }
 });
 
-router.put("/:shiftId/checkpoints/:checkpointId", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), async (req, res, next) => {
+router.put("/:shiftId/checkpoints/:checkpointId", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), idempotency, async (req, res, next) => {
   try {
     const item = await prisma.shiftCheckpoint.findFirst({ where: { id: String(req.params.checkpointId), shift_id: String(req.params.shiftId), org_id: req.user!.org_id } });
     if (!item) throw new NotFoundError("Checkpoint");
@@ -339,7 +340,7 @@ router.put("/:shiftId/checkpoints/:checkpointId", requireOrgFeature("shifts"), r
   } catch (error) { next(error); }
 });
 
-router.post("/:shiftId/checkpoints/:checkpointId/rotate-qr", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), async (req, res, next) => {
+router.post("/:shiftId/checkpoints/:checkpointId/rotate-qr", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), idempotency, async (req, res, next) => {
   try {
     const item = await prisma.shiftCheckpoint.findFirst({ where: { id: String(req.params.checkpointId), shift_id: String(req.params.shiftId), org_id: req.user!.org_id } });
     if (!item) throw new NotFoundError("Checkpoint");
@@ -349,7 +350,7 @@ router.post("/:shiftId/checkpoints/:checkpointId/rotate-qr", requireOrgFeature("
   } catch (error) { next(error); }
 });
 
-router.delete("/:shiftId/checkpoints/:checkpointId", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), async (req, res, next) => {
+router.delete("/:shiftId/checkpoints/:checkpointId", requireOrgFeature("shifts"), requirePermission("shifts.checkpoints.manage"), idempotency, async (req, res, next) => {
   try {
     const item = await prisma.shiftCheckpoint.findFirst({ where: { id: String(req.params.checkpointId), shift_id: String(req.params.shiftId), org_id: req.user!.org_id } });
     if (!item) throw new NotFoundError("Checkpoint");
@@ -375,7 +376,7 @@ router.get("/assignments/:assignmentId/checkpoints", requireOrgFeature("shifts")
   } catch (error) { next(error); }
 });
 
-router.post("/checkpoints/scan", requireOrgFeature("shifts"), async (req, res, next) => {
+router.post("/checkpoints/scan", requireOrgFeature("shifts"), idempotency, async (req, res, next) => {
   try {
     const assignmentId = String(req.body?.assignment_id ?? "");
     const rawCode = String(req.body?.qr_code ?? "").trim();

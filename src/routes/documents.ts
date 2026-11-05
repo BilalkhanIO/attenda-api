@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authenticate, requirePermission } from '../middleware/auth';
+import { idempotency } from '../middleware/idempotency';
 import { validate } from '../middleware/validate';
 import { documentUploadUrlSchema, documentCreateSchema } from '../schemas';
 import { ok, created, NotFoundError, ValidationError, ForbiddenError, AppError } from '../utils/response';
@@ -98,7 +99,7 @@ router.post('/upload-url', validate({ body: documentUploadUrlSchema }), async (r
 
 // ─── POST /documents ───────────────────────────────────
 // Register a document after the S3 upload succeeded.
-router.post('/', validate({ body: documentCreateSchema }), async (req, res, next) => {
+router.post('/', idempotency, validate({ body: documentCreateSchema }), async (req, res, next) => {
   try {
     const { user_id, title, category, file_key, file_name, file_size, mime_type, expires_at } = req.body;
     assertUploadable(mime_type, Number(file_size));
@@ -210,7 +211,7 @@ router.get('/:id/download', async (req, res, next) => {
 // ─── DELETE /documents/:id ─────────────────────────────
 // Owner may delete documents they uploaded themselves; anything else
 // requires documents.manage. Soft delete — the S3 object stays.
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', idempotency, async (req, res, next) => {
   try {
     const doc = await prisma.employeeDocument.findFirst({
       where: { id: String(req.params.id), org_id: req.user!.org_id, deleted_at: null },

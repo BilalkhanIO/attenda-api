@@ -25,13 +25,12 @@ COPY --from=builder /app/dist        ./dist
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json  ./package.json
 COPY --from=builder /app/prisma        ./prisma
-COPY --from=builder /app/scripts       ./scripts
 
 USER attenda
 
 EXPOSE 5000
 
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
   CMD wget -qO- http://localhost:5000/health || exit 1
 
-CMD ["sh", "-c", "node scripts/migrate.js && node dist/server.js"]
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]

@@ -1,10 +1,10 @@
 # Local development stack — mirrors the production topology (Railway):
-#   api  → this repo's Dockerfile (migrate + seed-repair on start)
+#   api  → this repo's Dockerfile (Prisma migrations on start; seeding is explicit)
 #   db   → PostgreSQL 16
 #   redis→ token blacklist, rate limits, job locks, SSE fan-out (future)
 #
 #   cp .env.example .env   # then: docker compose up --build
-#   Demo login after first boot: admin@demo.attenda.app / Demo1234!
+#   Seed a local demo explicitly with `npm run db:seed:demo` from the API package.
 services:
   api:
     build: .

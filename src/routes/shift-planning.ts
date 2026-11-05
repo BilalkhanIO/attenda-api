@@ -5,6 +5,9 @@ import prisma from '../utils/prisma';
 import { createNotification, emitOrgEvent } from '../services/notifications';
 import { submitShiftAvailability } from '../services/shift-availability';
 import { fromZonedTime } from 'date-fns-tz';
+import { idempotency } from '../middleware/idempotency';
+import { scopedEmployeeIds } from '../services/locationScope';
+import { getScheduleIssues } from '../services/scheduleIssues';
 
 const router = Router();
 router.use(authenticate);
@@ -21,13 +24,6 @@ function weekEnd(start: Date) { return addDays(start, 6); }
 function isMonday(date: Date) { return date.getUTCDay() === 1; }
 function toMinutes(value: string) { const [hours, minutes] = value.split(':').map(Number); return hours * 60 + minutes; }
 function wallMinutes(shift: { start_time: string; end_time: string }) { const duration = toMinutes(shift.end_time) - toMinutes(shift.start_time); return duration <= 0 ? duration + 1440 : duration; }
-function timeRangesOverlap(shift: { start_time: string; end_time: string }, rule: { start_time: string | null; end_time: string | null }) {
-  if (!rule.start_time || !rule.end_time) return true;
-  const split = (start: number, end: number) => end > start ? [[start, end]] : [[start, 1440], [0, end]];
-  const left = split(toMinutes(shift.start_time), toMinutes(shift.end_time));
-  const right = split(toMinutes(rule.start_time), toMinutes(rule.end_time));
-  return left.some(([a, b]) => right.some(([c, d]) => a < d && b > c));
-}
 function shiftMinutes(shift: { start_time: string; end_time: string; breaks?: Array<{ break_minutes: number; is_paid: boolean }> }) {
   let duration = toMinutes(shift.end_time) - toMinutes(shift.start_time);
   if (duration <= 0) duration += 1440;
@@ -45,7 +41,7 @@ router.get('/availability/me', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-router.post('/availability', async (req, res, next) => {
+router.post('/availability', idempotency, async (req, res, next) => {
   try {
     const item = await submitShiftAvailability(req.user!.sub, req.user!.org_id, req.body ?? {});
     await event(req.user!.org_id, req.user!.sub, 'availability_submitted', 'availability', item.id, { kind: item.kind, date: item.date, weekday: item.weekday });
@@ -54,7 +50,7 @@ router.post('/availability', async (req, res, next) => {
   } catch (error) { next(error); }
 });
 
-router.delete('/availability/:id', async (req, res, next) => {
+router.delete('/availability/:id', idempotency, async (req, res, next) => {
   try {
     const item = await prisma.shiftAvailability.findFirst({ where: { id: String(req.params.id), org_id: req.user!.org_id, user_id: req.user!.sub, status: 'pending' } });
     if (!item) throw new NotFoundError('Pending availability request');
@@ -75,7 +71,7 @@ router.get('/availability', requirePermission('shifts.availability.manage'), asy
   } catch (error) { next(error); }
 });
 
-router.put('/availability/:id/review', requirePermission('shifts.availability.manage'), async (req, res, next) => {
+router.put('/availability/:id/review', requirePermission('shifts.availability.manage'), idempotency, async (req, res, next) => {
   try {
     const status = req.body?.status;
     if (!['approved', 'rejected'].includes(status)) throw new ValidationError('status must be approved or rejected');
@@ -99,7 +95,7 @@ router.get('/coverage', requirePermission('shifts.view'), async (req, res, next)
   } catch (error) { next(error); }
 });
 
-router.put('/coverage', requirePermission('shifts.coverage.manage'), async (req, res, next) => {
+router.put('/coverage', requirePermission('shifts.coverage.manage'), idempotency, async (req, res, next) => {
   try {
     if (!Array.isArray(req.body?.rules) || req.body.rules.length > 500) throw new ValidationError('rules must be an array of at most 500 entries');
     const rules = req.body.rules.map((rule: any) => {
@@ -123,51 +119,7 @@ router.put('/coverage', requirePermission('shifts.coverage.manage'), async (req,
 router.get('/issues', requirePermission('shifts.view'), async (req, res, next) => {
   try {
     const from = typeof req.query.week_start === 'string' ? dateOnly(req.query.week_start, 'week_start') : (() => { const d = new Date(); const monday = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())); monday.setUTCDate(monday.getUTCDate() - ((monday.getUTCDay() + 6) % 7)); return monday; })();
-    const to = weekEnd(from);
-    const [assignments, leaves, availability, coverage] = await Promise.all([
-      prisma.shiftAssignment.findMany({ where: { date: { gte: addDays(from, -1), lte: addDays(to, 1) }, shift: { org_id: req.user!.org_id } }, include: { shift: { include: { breaks: true } }, user: { select: { id: true, name: true, department: true } } }, orderBy: { date: 'asc' } }),
-      prisma.leaveRequest.findMany({ where: { org_id: req.user!.org_id, status: 'approved', start_date: { lte: to }, end_date: { gte: from } }, select: { user_id: true, start_date: true, end_date: true } }),
-      prisma.shiftAvailability.findMany({ where: { org_id: req.user!.org_id, status: 'approved', OR: [{ date: { gte: from, lte: to } }, { weekday: { not: null } }] } }),
-      prisma.shiftCoverageRule.findMany({ where: { org_id: req.user!.org_id }, include: { shift: true } }),
-    ]);
-    const issues: Array<{ code: string; severity: 'warning'; assignment_id?: string; user_id?: string; user_name?: string; date?: string; message: string }> = [];
-    const current = assignments.filter(item => item.date >= from && item.date <= to);
-    for (const item of current) {
-      const date = dayKey(item.date);
-      if (leaves.some(leave => leave.user_id === item.user_id && leave.start_date <= item.date && leave.end_date >= item.date)) issues.push({ code: 'approved_leave', severity: 'warning', assignment_id: item.id, user_id: item.user_id, user_name: item.user.name, date, message: `${item.user.name} is scheduled during approved leave.` });
-      const weekday = (item.date.getUTCDay() + 6) % 7;
-      const unavailable = availability.some(rule => rule.user_id === item.user_id && rule.kind === 'unavailable' && ((rule.date && dayKey(rule.date) === date) || (rule.weekday === weekday && (!rule.starts_on || rule.starts_on <= item.date) && (!rule.ends_on || rule.ends_on >= item.date))) && timeRangesOverlap(item.shift, rule));
-      if (unavailable) issues.push({ code: 'unavailable', severity: 'warning', assignment_id: item.id, user_id: item.user_id, user_name: item.user.name, date, message: `${item.user.name} is scheduled during approved unavailable time.` });
-      const activeDay = (item.date.getUTCDay() + 6) % 7;
-      if (item.shift.active_days.length && !item.shift.active_days.includes(activeDay)) issues.push({ code: 'off_day', severity: 'warning', assignment_id: item.id, user_id: item.user_id, user_name: item.user.name, date, message: `${item.shift.name} is assigned outside its active weekdays.` });
-      const previous = assignments.find(other => other.user_id === item.user_id && other.id !== item.id && dayKey(other.date) === dayKey(addDays(item.date, -1)));
-      const next = assignments.find(other => other.user_id === item.user_id && other.id !== item.id && dayKey(other.date) === dayKey(addDays(item.date, 1)));
-      const start = toMinutes(item.shift.start_time);
-      const end = start + wallMinutes(item.shift);
-      if (previous) {
-        const prevStart = toMinutes(previous.shift.start_time) - 1440;
-        const prevEnd = prevStart + wallMinutes(previous.shift);
-        const gap = start - prevEnd;
-        const needed = Math.max(previous.shift.min_rest_hours, item.shift.min_rest_hours) * 60;
-        if (gap < 0) issues.push({ code: 'overlap', severity: 'warning', assignment_id: item.id, user_id: item.user_id, user_name: item.user.name, date, message: `${item.user.name}'s shifts overlap across these dates.` });
-        else if (gap < needed) issues.push({ code: 'insufficient_rest', severity: 'warning', assignment_id: item.id, user_id: item.user_id, user_name: item.user.name, date, message: `${item.user.name} has only ${Math.round(gap / 60)}h rest before this shift; policy requires ${needed / 60}h.` });
-      }
-      if (next) {
-        const nextStart = 1440 + toMinutes(next.shift.start_time);
-        const gap = nextStart - end;
-        const needed = Math.max(next.shift.min_rest_hours, item.shift.min_rest_hours) * 60;
-        if (gap < 0) issues.push({ code: 'overlap', severity: 'warning', assignment_id: item.id, user_id: item.user_id, user_name: item.user.name, date, message: `${item.user.name}'s shifts overlap across these dates.` });
-        else if (gap < needed) issues.push({ code: 'insufficient_rest', severity: 'warning', assignment_id: item.id, user_id: item.user_id, user_name: item.user.name, date, message: `${item.user.name} has only ${Math.round(gap / 60)}h rest after this shift; policy requires ${needed / 60}h.` });
-      }
-    }
-    for (let offset = 0; offset < 7; offset++) {
-      const date = addDays(from, offset); const weekday = (date.getUTCDay() + 6) % 7;
-      for (const rule of coverage.filter(value => value.weekday === weekday)) {
-        const assigned = current.filter(item => item.shift_id === rule.shift_id && dayKey(item.date) === dayKey(date) && (!rule.department || item.user.department === rule.department)).length;
-        if (assigned < rule.required_count) issues.push({ code: 'understaffed', severity: 'warning', date: dayKey(date), message: `${rule.shift.name} needs ${rule.required_count} ${rule.department ? `${rule.department} ` : ''}people on ${dayKey(date)}; ${assigned} assigned.` });
-      }
-    }
-    ok(res, { week_start: dayKey(from), issues });
+    ok(res, await getScheduleIssues(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), from));
   } catch (error) { next(error); }
 });
 
@@ -175,7 +127,8 @@ router.get('/workload', requirePermission('shifts.view'), async (req, res, next)
   try {
     const from = dateOnly(String(req.query.week_start ?? new Date().toISOString().slice(0, 10)), 'week_start');
     const to = weekEnd(from);
-    const assignments = await prisma.shiftAssignment.findMany({ where: { date: { gte: from, lte: to }, shift: { org_id: req.user!.org_id } }, include: { shift: { include: { breaks: true } }, user: { select: { id: true, name: true, department: true } } }, orderBy: { date: 'asc' } });
+    const employeeIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
+    const assignments = await prisma.shiftAssignment.findMany({ where: { date: { gte: from, lte: to }, shift: { org_id: req.user!.org_id }, ...(employeeIds ? { user_id: { in: employeeIds } } : {}) }, include: { shift: { include: { breaks: true } }, user: { select: { id: true, name: true, department: true } } }, orderBy: { date: 'asc' } });
     const grouped = new Map<string, { user: { id: string; name: string; department: string | null }; assignments: number; minutes: number; days: Set<string> }>();
     for (const item of assignments) {
       const current = grouped.get(item.user_id) ?? { user: item.user, assignments: 0, minutes: 0, days: new Set<string>() };
@@ -185,15 +138,134 @@ router.get('/workload', requirePermission('shifts.view'), async (req, res, next)
   } catch (error) { next(error); }
 });
 
-router.post('/copy-week', requirePermission('shifts.assign'), async (req, res, next) => {
+// Aggregate-only labor planning. Individual pay rates are never returned to managers.
+router.get('/cost', requirePermission('labor_cost.view'), async (req, res, next) => {
+  try {
+    const from = dateOnly(String(req.query.week_start ?? new Date().toISOString().slice(0, 10)), 'week_start');
+    if (!isMonday(from)) throw new ValidationError('week_start must be a Monday');
+    const to = weekEnd(from);
+    const employeeIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'labor_cost.manage');
+    const [assignments, storedBudgets, org] = await Promise.all([prisma.shiftAssignment.findMany({
+      where: { date: { gte: from, lte: to }, shift: { org_id: req.user!.org_id }, ...(employeeIds ? { user_id: { in: employeeIds } } : {}) },
+      include: { location: { select: { id: true, name: true } }, shift: { include: { breaks: true } }, user: { select: {
+        id: true, department: true, hourly_rate: true, primary_location_id: true,
+        primary_location: { select: { name: true } },
+        pay_rates: { where: { effective_from: { lte: to }, OR: [{ effective_to: null }, { effective_to: { gte: from } }] }, orderBy: { effective_from: 'desc' } },
+      } } },
+      orderBy: [{ user_id: 'asc' }, { date: 'asc' }, { created_at: 'asc' }],
+    }), prisma.laborBudget.findMany({ where: { org_id: req.user!.org_id, week_start: from }, include: { location: { select: { id: true, name: true } } } }), prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { currency: true, monthly_pay_divisor: true } })]);
+    const currency = org?.currency ?? 'PKR';
+    const visibleLocationIds = new Set(assignments.map(item => item.location_id ?? item.user.primary_location_id).filter((id): id is string => !!id));
+    const visibleDepartments = new Set(assignments.map(item => item.user.department).filter((value): value is string => !!value));
+    // Scoped managers only see budgets for locations/departments represented
+    // by their visible assignments; org-wide budget figures remain payroll-like.
+    const budgets = employeeIds === null ? storedBudgets : storedBudgets.filter(item =>
+      !!item.location_id && visibleLocationIds.has(item.location_id)
+      && (!item.department || visibleDepartments.has(item.department)),
+    );
+    const spentByDay = new Map<string, { date: string; department: string | null; location_id: string | null; location_name: string | null; scheduled_hours: number; projected_cost: number; published_cost: number; draft_cost: number }>();
+    const userMinutes = new Map<string, number>();
+    let overtimeExposureMinutes = 0;
+    let projectedCost = 0;
+    let publishedCost = 0;
+    let draftCost = 0;
+    for (const assignment of assignments) {
+      const minutes = shiftMinutes(assignment.shift);
+      const cumulative = userMinutes.get(assignment.user_id) ?? 0;
+      // 48 hours is a planning warning baseline only; statutory rule packs are
+      // still required before using this estimate for compliance or payroll.
+      const overtimeMinutes = Math.max(0, cumulative + minutes - 48 * 60) - Math.max(0, cumulative - 48 * 60);
+      userMinutes.set(assignment.user_id, cumulative + minutes);
+      overtimeExposureMinutes += overtimeMinutes;
+      const baseHours = minutes / 60;
+      const overtimeHours = overtimeMinutes / 60;
+      const effectiveRate = assignment.user.pay_rates.find(rate => rate.effective_from <= assignment.date && (!rate.effective_to || rate.effective_to >= assignment.date));
+      const rateAmount = effectiveRate ? Number(effectiveRate.amount) : Number(assignment.user.hourly_rate);
+      const rateBasis = effectiveRate?.basis ?? 'hourly';
+      const monthlyDivisor = Math.max(1, Number(org?.monthly_pay_divisor) || 26);
+      const rate = rateBasis === 'daily' ? rateAmount / 8 : rateBasis === 'monthly' ? rateAmount / monthlyDivisor / 8 : rateAmount;
+      const multiplier = Number(assignment.shift.overtime_multiplier) || 1.5;
+      const cost = rate * (baseHours + (assignment.shift.overtime_enabled ? overtimeHours * Math.max(0, multiplier - 1) : 0));
+      const date = dayKey(assignment.date);
+      const department = assignment.user.department;
+      const locationId = assignment.location_id ?? assignment.user.primary_location_id;
+      const locationName = assignment.location?.name ?? assignment.user.primary_location?.name ?? null;
+      const key = `${date}:${department ?? ''}:${locationId ?? ''}`;
+      const row = spentByDay.get(key) ?? { date, department, location_id: locationId, location_name: locationName, scheduled_hours: 0, projected_cost: 0, published_cost: 0, draft_cost: 0 };
+      row.scheduled_hours += baseHours;
+      row.projected_cost += cost;
+      if (assignment.is_published) row.published_cost += cost; else row.draft_cost += cost;
+      spentByDay.set(key, row);
+      projectedCost += cost;
+      if (assignment.is_published) publishedCost += cost; else draftCost += cost;
+    }
+    const orgBudget = budgets.find(item => item.department === '' && !item.location_id);
+    const budgetRows = budgets.map(item => {
+      const matchingSpend = [...spentByDay.values()].filter(row =>
+        (!item.location_id || row.location_id === item.location_id)
+        && (!item.department || row.department === item.department),
+      ).reduce((sum, row) => sum + row.projected_cost, 0);
+      const amount = Number(item.amount);
+      const comparable = item.currency === currency;
+      const variance = comparable ? Math.round((matchingSpend - amount) * 100) / 100 : null;
+      return { department: item.department || null, location_id: item.location_id, location_name: item.location?.name ?? null, amount, projected_cost: Math.round(matchingSpend * 100) / 100, variance, over_budget: comparable && matchingSpend > amount, currency: item.currency, currency_mismatch: !comparable };
+    });
+    const scopedOverBudget = budgetRows.some(item => !item.currency_mismatch && item.over_budget);
+    ok(res, {
+      week_start: dayKey(from), week_end: dayKey(to), currency,
+      totals: { projected_cost: Math.round(projectedCost * 100) / 100, published_cost: Math.round(publishedCost * 100) / 100, draft_cost: Math.round(draftCost * 100) / 100, scheduled_hours: Math.round(assignments.reduce((sum, item) => sum + shiftMinutes(item.shift), 0) / 6) / 10, overtime_exposure_hours: Math.round(overtimeExposureMinutes / 6) / 10 },
+      budget: budgets.length ? {
+        amount: orgBudget ? Number(orgBudget.amount) : null,
+        variance: orgBudget ? Math.round((projectedCost - Number(orgBudget.amount)) * 100) / 100 : null,
+        over_budget: orgBudget ? projectedCost > Number(orgBudget.amount) : scopedOverBudget,
+        rows: budgetRows,
+      } : null,
+      days: [...spentByDay.values()].map(row => ({ ...row, scheduled_hours: Math.round(row.scheduled_hours * 10) / 10, projected_cost: Math.round(row.projected_cost * 100) / 100, published_cost: Math.round(row.published_cost * 100) / 100, draft_cost: Math.round(row.draft_cost * 100) / 100 })),
+    });
+  } catch (error) { next(error); }
+});
+
+router.put('/budget', requirePermission('labor_cost.manage'), idempotency, async (req, res, next) => {
+  try {
+    const weekStartDate = dateOnly(req.body?.week_start, 'week_start');
+    if (!isMonday(weekStartDate)) throw new ValidationError('week_start must be a Monday');
+    const amount = Number(req.body?.amount);
+    if (!Number.isFinite(amount) || amount < 0 || amount > 1_000_000_000_000) throw new ValidationError('amount must be a non-negative valid amount');
+    const department = typeof req.body?.department === 'string' ? req.body.department.trim() : '';
+    if (department && department.length > 100) throw new ValidationError('department is too long');
+    const locationId = typeof req.body?.location_id === 'string' && req.body.location_id.trim() ? req.body.location_id.trim() : null;
+    if (locationId) {
+      const location = await prisma.location.findFirst({ where: { id: locationId, org_id: req.user!.org_id, is_active: true }, select: { id: true } });
+      if (!location) throw new ValidationError('Choose an active location in this organization');
+    }
+    const org = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { currency: true } });
+    const currency = typeof req.body?.currency === 'string' ? req.body.currency.trim().toUpperCase() : org?.currency ?? 'PKR';
+    if (!/^[A-Z]{3,10}$/.test(currency)) throw new ValidationError('currency must be a valid currency code');
+    if (org?.currency && currency !== org.currency) throw new ValidationError(`Budget currency must match the organization currency (${org.currency})`);
+    const where = locationId
+      ? { org_id_week_start_department_location_id: { org_id: req.user!.org_id, week_start: weekStartDate, department, location_id: locationId } }
+      : { org_id_week_start_department: { org_id: req.user!.org_id, week_start: weekStartDate, department } };
+    const budget = await prisma.laborBudget.upsert({
+      where,
+      create: { org_id: req.user!.org_id, location_id: locationId, week_start: weekStartDate, department, amount, currency, created_by: req.user!.sub, updated_by: req.user!.sub },
+      update: { amount, currency, updated_by: req.user!.sub },
+    });
+    await event(req.user!.org_id, req.user!.sub, 'labor_budget_updated', 'labor_budget', budget.id, { week_start: dayKey(weekStartDate), department: department || null, location_id: locationId, currency });
+    emitOrgEvent(req.user!.org_id, 'shift_changed');
+    ok(res, budget);
+  } catch (error) { next(error); }
+});
+
+router.post('/copy-week', requirePermission('shifts.assign'), idempotency, async (req, res, next) => {
   try {
     const from = dateOnly(req.body?.from_week_start, 'from_week_start');
     const to = dateOnly(req.body?.to_week_start, 'to_week_start');
     if (!isMonday(from) || !isMonday(to)) throw new ValidationError('Both dates must be Mondays');
     if (to <= from || to > addDays(from, 370)) throw new ValidationError('Choose a later week within the next 53 weeks');
     const sourceEnd = weekEnd(from); const offset = Math.round((to.getTime() - from.getTime()) / 86400000);
-    const source = await prisma.shiftAssignment.findMany({ where: { date: { gte: from, lte: sourceEnd }, shift: { org_id: req.user!.org_id } }, select: { user_id: true, shift_id: true, date: true } });
-    const candidates = source.map(item => ({ user_id: item.user_id, shift_id: item.shift_id, date: addDays(item.date, offset) }));
+    const employeeIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
+    const source = await prisma.shiftAssignment.findMany({ where: { date: { gte: from, lte: sourceEnd }, shift: { org_id: req.user!.org_id }, ...(employeeIds ? { user_id: { in: employeeIds } } : {}) }, select: { user_id: true, shift_id: true, date: true, location_id: true } });
+    const candidates = source.map(item => ({ user_id: item.user_id, shift_id: item.shift_id, date: addDays(item.date, offset), location_id: item.location_id }));
     const existing = candidates.length ? await prisma.shiftAssignment.findMany({ where: { user_id: { in: [...new Set(candidates.map(item => item.user_id))] }, date: { gte: to, lte: weekEnd(to) } }, select: { user_id: true, date: true } }) : [];
     const occupied = new Set(existing.map(item => `${item.user_id}:${dayKey(item.date)}`));
     const eligible = candidates.filter(item => !occupied.has(`${item.user_id}:${dayKey(item.date)}`));
@@ -216,7 +288,8 @@ router.get('/export.ics', requirePermission('shifts.view'), async (req, res, nex
     const from = dateOnly(String(req.query.from ?? new Date().toISOString().slice(0, 10)), 'from');
     const to = dateOnly(String(req.query.to ?? dayKey(addDays(from, 90))), 'to');
     if (to < from || to > addDays(from, 366)) throw new ValidationError('Export range must be at most 367 days');
-    const assignments = await prisma.shiftAssignment.findMany({ where: { date: { gte: from, lte: to }, shift: { org_id: req.user!.org_id } }, include: { shift: true, user: { select: { name: true } } }, orderBy: { date: 'asc' } });
+    const employeeIds = await scopedEmployeeIds(req.user!.org_id, req.user!.sub, req.permissions ?? new Set(), 'shifts.manage');
+    const assignments = await prisma.shiftAssignment.findMany({ where: { date: { gte: from, lte: to }, shift: { org_id: req.user!.org_id }, ...(employeeIds ? { user_id: { in: employeeIds } } : {}) }, include: { shift: true, user: { select: { name: true } } }, orderBy: { date: 'asc' } });
     const organisation = await prisma.organisation.findUnique({ where: { id: req.user!.org_id }, select: { timezone: true } });
     const timezone = organisation?.timezone || 'UTC';
     const esc = (text: string) => text.replace(/\\/g, '\\\\').replace(/,/g, '\\,').replace(/;/g, '\\;').replace(/\n/g, '\\n');
