@@ -36,6 +36,19 @@ export function errorHandler(
     });
   }
 
+  // Attendance period guard raised by the PostgreSQL trigger. Keep the user
+  // facing recovery action clear while retaining the database guard as the
+  // final protection for background and import writes.
+  const prismaMeta = (err as { meta?: Record<string, unknown> }).meta;
+  const errorDetails = `${err.message} ${JSON.stringify(prismaMeta ?? {})}`;
+  if ((err as { code?: string }).code === 'P2004' && /attendance_processed_payroll_locked|processed payroll period must be recalled/i.test(errorDetails)) {
+    return res.status(409).json({
+      success: false,
+      error: 'This attendance period is already in processed payroll. Recall the payroll run before changing attendance.',
+      code: 'ATTENDANCE_PERIOD_PAYROLL_PROCESSED',
+    });
+  }
+
   logger.error({ err, method: req.method, path: req.originalUrl, userId: req.user?.sub }, 'Unhandled API error');
 
   res.status(500).json({
