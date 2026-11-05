@@ -1708,7 +1708,7 @@ router.post('/checkout', validate({ body: checkoutSchema }), idempotency, async 
     // timer in the same transaction. A second checkout waits for the claim and
     // sees check_out_at set; any timer/break database error rolls the checkout
     // back instead of returning a misleading success.
-    const { updated, rawEarlyMins, earlyMins, stoppedTimerId } = await prisma.$transaction(async tx => {
+    const { updated, stoppedTimerId } = await prisma.$transaction(async tx => {
       const claimed = await tx.attendanceRecord.updateMany({
         where: { id: record.id, org_id: req.user!.org_id, user_id: req.user!.sub, check_out_at: null },
         data: {
@@ -1752,7 +1752,7 @@ router.post('/checkout', validate({ body: checkoutSchema }), idempotency, async 
         });
         if (stopped.count) stoppedTimerId = runningTimer.id;
       }
-      return { updated, rawEarlyMins, earlyMins, stoppedTimerId };
+      return { updated, stoppedTimerId };
     });
     if (stoppedTimerId) recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'time.timer.auto_stop', entityType: 'time_entry', entityId: stoppedTimerId, after: { attendance_id: record.id, ended_at: now.toISOString() } });
     if (req.body?.offline && requiresReview) await notifyOfflineAttendanceReview(req.user!.sub, req.user!.org_id, record.id, 'check-out');

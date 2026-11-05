@@ -10,6 +10,7 @@ import { validate } from '../middleware/validate';
 import { idempotency } from '../middleware/idempotency';
 import { payrollPeriodSchema, payrollAdjustSchema, payrollRecallSchema, payRateSchema } from '../schemas';
 import { recordAudit } from '../services/audit';
+import { deleteFile } from '../services/s3';
 import { statutoryParameterSetSchema } from '../schemas/statutory-payroll';
 import { applyStatutoryPayroll } from '../services/statutoryPayroll';
 import { buildPayrollJournal } from '../services/payrollJournal';
@@ -559,7 +560,6 @@ router.put('/:id/adjust', requirePermission('payroll.manage'), idempotency, vali
     ok(res, updated);
   } catch (e) { next(e); }
   finally { await releaseConfigurationLease?.().catch(() => {}); await releaseLease?.().catch(() => {}); }
-  finally { await releaseLease?.().catch(() => {}); }
 });
 
 // ─── POST /payroll/:id/recall ──────────────────────────
@@ -670,6 +670,7 @@ router.post('/process-full', requirePermission('payroll.process'), idempotency, 
 
     for (const record of records) {
       let stage: 'payslip_generation' | 'payroll_record_update' = 'payslip_generation';
+      let uploadedPayslipKey: string | undefined;
       try {
         // Generate PDF payslip
         const { key } = await generatePayslipPDF({
@@ -708,6 +709,7 @@ router.post('/process-full', requirePermission('payroll.process'), idempotency, 
           processedAt: new Date(),
           processedBy: req.user!.name,
         });
+        uploadedPayslipKey = key;
 
         // Update record with payslip URL
         stage = 'payroll_record_update';
@@ -753,6 +755,21 @@ router.post('/process-full', requirePermission('payroll.process'), idempotency, 
           notification_status: 'recorded',
         });
       } catch (err) {
+        // Upload and database finalization cannot share a transaction. Remove
+        // the just-uploaded PDF when the conditional payroll transition fails;
+        // otherwise an employee can retain an orphaned or stale payslip object.
+        if (uploadedPayslipKey) {
+          try {
+            await deleteFile(uploadedPayslipKey);
+          } catch (cleanupError) {
+            logger.error({
+              err: cleanupError,
+              orgId: req.user!.org_id,
+              payrollRecordId: record.id,
+              objectKey: uploadedPayslipKey,
+            }, 'orphaned payslip cleanup failed');
+          }
+        }
         logger.error({ err, orgId: req.user!.org_id, actorId: req.user!.sub, payrollRecordId: record.id, year: y, month: m }, 'payroll record finalization failed');
         failures.push({
           payroll_record_id: record.id,

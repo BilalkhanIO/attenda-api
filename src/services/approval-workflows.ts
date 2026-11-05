@@ -429,7 +429,7 @@ export async function reviewApproval(
           entity_id: auditEntityId,
           before: auditBefore ?? undefined,
           after: auditAfter,
-          reason: action === 'reject' ? reason : request.reason,
+          reason: request.reason,
         },
       });
       await tx.outboxEvent.create({
