@@ -14,6 +14,7 @@ import { mkdir, writeFile, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Prisma } from '@prisma/client';
+import { refreshProjectGoalProgress } from '../services/projectGoalProgress';
 
 const router = Router();
 router.use(authenticate);
@@ -354,12 +355,7 @@ router.put('/tasks/:taskId', ensureTaskUpdateAccess, idempotency, async (req, re
       createNotification({ userId: task.assignee_id, orgId: req.user!.org_id, type: 'project_task_updated', title: 'A project task changed', body: `${updated.title} · ${status.replace('_', ' ')}`, actionType: 'project_task', actionId: updated.id }).catch(() => {});
     }
     if (updated.performance_goal_id) {
-      const goal = await prisma.performanceGoal.findUnique({ where: { id: updated.performance_goal_id } });
-      if (goal) {
-        const linked = await prisma.projectTask.findMany({ where: { performance_goal_id: goal.id }, select: { status: true } });
-        const completion = linked.length ? Math.round(linked.filter(item => item.status === 'done').length * 100 / linked.length) : 0;
-        await prisma.performanceGoal.update({ where: { id: goal.id }, data: { completion } });
-      }
+      await refreshProjectGoalProgress(updated.performance_goal_id, req.user!.org_id);
     }
     emitOrgEvent(req.user!.org_id, 'project_changed');
     ok(res, updated);
