@@ -1,5 +1,7 @@
 # Developer onboarding
 
+For the reproducible API + web + mobile local path and the pre-PR check matrix, start with [Local development quickstart](LOCAL_DEVELOPMENT.md). This page is the cross-repository map and change guide; avoid maintaining a second setup procedure here.
+
 Start with the workspace [system feature guide](../../SYSTEM_FEATURE_GUIDE.md), then use the guide for the app you are changing:
 
 - API behavior and permissions: [`BACKEND_API_AND_LOGIC.md`](../BACKEND_API_AND_LOGIC.md)
@@ -9,26 +11,7 @@ Start with the workspace [system feature guide](../../SYSTEM_FEATURE_GUIDE.md), 
 
 ## Run the applications
 
-```bash
-# API (requires PostgreSQL and Redis; configure attenda-api/.env)
-cd attenda-api
-npm install
-npx prisma migrate deploy
-npm run db:seed
-npm run dev
-
-# Web (set NEXT_PUBLIC_API_URL or the rewrite's BACKEND_API_URL)
-cd ../Attenda-web
-npm install
-npm run dev
-
-# Mobile (Android emulator reaches host API through 10.0.2.2)
-cd ../Attenda-mobile
-flutter pub get
-flutter run --dart-define=API_URL=http://10.0.2.2:5000/api/v1
-```
-
-See each app's README for platform-specific setup. Do not copy production secrets into local examples.
+Follow the Local development quickstart for the single supported workflow. App READMEs retain only app-specific details. Do not copy production secrets into local examples.
 
 Both local deployment commands and the Docker image use Prisma migration history. A database previously created by the retired raw-SQL runner may need a one-time, staging-verified baseline; follow the [deployment runbook](DEPLOYMENT.md) before upgrading it.
 
