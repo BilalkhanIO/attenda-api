@@ -125,16 +125,20 @@ router.post('/timer/start', requirePermission('time.view'), idempotency, async (
 
 router.post('/timer/stop', requirePermission('time.view'), idempotency, async (req, res, next) => {
   try {
-    const now = new Date();
-    const entry = await prisma.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null } });
-    if (!entry) throw new NotFoundError('Running timer');
-    const minutes = Math.max(1, Math.round((now.getTime() - entry.started_at.getTime()) / 60000));
-    const attendance = await attendanceForWorkDate(req.user!.org_id, req.user!.sub, entry.started_at);
-    const updated = await prisma.timeEntry.updateMany({ where: { id: entry.id, ended_at: null, status: 'draft' }, data: { ended_at: now, minutes, attendance_id: attendance?.id ?? entry.attendance_id } });
-    if (!updated.count) throw new AppError('Timer has already been stopped.', 409, 'TIMER_ALREADY_STOPPED');
-    const saved = await prisma.timeEntry.findUnique({ where: { id: entry.id }, include: { project: { select: { id: true, name: true } }, task: { select: { id: true, title: true } } } });
-    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'time.timer.stop', entityType: 'time_entry', entityId: entry.id, after: { minutes } });
-    created(res, saved);
+    const stopped = await prisma.$transaction(async tx => {
+      await lockUserTimeEntries(tx, req.user!.org_id, req.user!.sub);
+      const entry = await tx.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null } });
+      if (!entry) throw new NotFoundError('Running timer');
+      const now = new Date();
+      const minutes = Math.max(1, Math.round((now.getTime() - entry.started_at.getTime()) / 60000));
+      const attendance = await attendanceForWorkDate(req.user!.org_id, req.user!.sub, entry.started_at);
+      const updated = await tx.timeEntry.updateMany({ where: { id: entry.id, org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null, status: 'draft' }, data: { ended_at: now, minutes, attendance_id: attendance?.id ?? entry.attendance_id } });
+      if (!updated.count) throw new AppError('Timer has already been stopped.', 409, 'TIMER_ALREADY_STOPPED');
+      const saved = await tx.timeEntry.findUnique({ where: { id: entry.id }, include: { project: { select: { id: true, name: true } }, task: { select: { id: true, title: true } } } });
+      return { entry, saved, minutes };
+    });
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'time.timer.stop', entityType: 'time_entry', entityId: stopped.entry.id, after: { minutes: stopped.minutes } });
+    created(res, stopped.saved);
   } catch (error) { next(error); }
 });
 
@@ -228,14 +232,15 @@ router.get('/timesheets/me', requirePermission('time.view'), async (req, res, ne
 router.post('/timesheets/submit', requirePermission('time.view'), idempotency, async (req, res, next) => {
   try {
     const { start, end } = weekRange(req.body.week_start);
-    const pendingTimer = await prisma.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null, started_at: { gte: start, lt: end } }, select: { id: true } });
-    if (pendingTimer) throw new ValidationError('Stop the running timer before submitting this week');
-    const count = await prisma.timeEntry.count({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, started_at: { gte: start, lt: end }, ended_at: { not: null } } });
-    if (!count) throw new ValidationError('Add at least one completed time entry before submitting');
     const sheet = await prisma.$transaction(async tx => {
+      await lockUserTimeEntries(tx, req.user!.org_id, req.user!.sub);
+      const pendingTimer = await tx.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null, started_at: { gte: start, lt: end } }, select: { id: true } });
+      if (pendingTimer) throw new ValidationError('Stop the running timer before submitting this week');
       const existing = await tx.timesheet.findUnique({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: start } } });
       if (existing?.status === 'approved' || existing?.status === 'locked') throw new ValidationError('This timesheet is already approved and locked');
-      await tx.timeEntry.updateMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, started_at: { gte: start, lt: end }, status: { in: ['draft', 'rejected'] }, ended_at: { not: null } }, data: { status: 'submitted' } });
+      if (existing?.status === 'submitted') throw new AppError('This timesheet is already awaiting review.', 409, 'TIMESHEET_ALREADY_SUBMITTED');
+      const submittedEntries = await tx.timeEntry.updateMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, started_at: { gte: start, lt: end }, status: { in: ['draft', 'rejected'] }, ended_at: { not: null } }, data: { status: 'submitted' } });
+      if (!submittedEntries.count) throw new ValidationError('Add at least one completed, editable time entry before submitting');
       return tx.timesheet.upsert({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: start } }, create: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: start, status: 'submitted', submitted_at: new Date() }, update: { status: 'submitted', submitted_at: new Date(), reviewed_by: null, reviewed_at: null, review_note: null } });
     });
     recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'timesheet.submit', entityType: 'timesheet', entityId: sheet.id, after: { week_start: start.toISOString() } });

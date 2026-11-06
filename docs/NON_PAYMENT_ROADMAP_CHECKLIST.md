@@ -62,7 +62,7 @@ This tracker consolidates the implemented roadmap across the API, web, and mobil
 ## Projects, reports, and integrations
 
 - [x] Complete project collaboration across API/web/mobile: custom task statuses, task search and filters, task details, subtasks/milestones, members, files, comments, dependencies, calendar export, activity, and project time. Task assignment is restricted to project members; member removal is blocked while open tasks remain assigned; selected member mentions notify through the transactional outbox. Web provides board/list/calendar/timeline views; mobile has project and task search/filter controls.
-- [x] Project/task timers, manual time entries, timesheet submission/review, and checkout timer stop.
+- [x] Project/task timers, manual time entries, timesheet submission/review, and checkout timer stop. Timer start/stop, manual entry edits, and weekly submission serialize on a per-user transaction lock; submission atomically verifies there is no running timer, claims editable entries, and rejects duplicate awaiting-review submissions.
 - [x] Project task dependency updates reject cycles and serialize graph edits per project; dependency changes are included in task audit history.
 - [x] Time entries resolve and attach the matching employee-local attendance work date; checkout links the timer it closes. A nullable attendance foreign key and index are applied locally.
 - [x] Project hours and all-time budget-burn reporting, with a bounded date-range report by task, day, and employee.
