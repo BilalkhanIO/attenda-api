@@ -7,7 +7,7 @@ Start with the workspace [system feature guide](../../SYSTEM_FEATURE_GUIDE.md), 
 - API behavior and permissions: [`BACKEND_API_AND_LOGIC.md`](../BACKEND_API_AND_LOGIC.md)
 - Web routes and UI conventions: [`Attenda-web/FRONTEND_ARCHITECTURE.md`](../../Attenda-web/docs/FRONTEND_ARCHITECTURE.md)
 - Mobile routes and UI conventions: [`Attenda-mobile/docs/FEATURES_AND_ARCHITECTURE.md`](../../Attenda-mobile/docs/FEATURES_AND_ARCHITECTURE.md)
-- Feature status: [`NON_PAYMENT_ROADMAP_CHECKLIST.md`](../../NON_PAYMENT_ROADMAP_CHECKLIST.md)
+- Feature status: [non-payment roadmap checklist](NON_PAYMENT_ROADMAP_CHECKLIST.md)
 
 ## Run the applications
 

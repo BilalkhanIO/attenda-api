@@ -21,4 +21,4 @@ npx prisma migrate deploy
 npx prisma generate
 ```
 
-Schema changes that affect attendance, payroll, leave, approvals, or organization scoping must also update [Backend API and Logic](../BACKEND_API_AND_LOGIC.md) and the [feature checklist](../../NON_PAYMENT_ROADMAP_CHECKLIST.md).
+Schema changes that affect attendance, payroll, leave, approvals, or organization scoping must also update [Backend API and Logic](../BACKEND_API_AND_LOGIC.md) and the [feature checklist](NON_PAYMENT_ROADMAP_CHECKLIST.md).

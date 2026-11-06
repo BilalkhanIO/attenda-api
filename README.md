@@ -22,6 +22,6 @@ The API listens on port `5000` by default. Use `GET /health` for process livenes
 - [Deployment](docs/DEPLOYMENT.md) — runtime requirements and operations.
 - [Developer onboarding](docs/ONBOARDING.md) — local setup and code map.
 - [Workspace quickstart](docs/LOCAL_DEVELOPMENT.md) — API, web, and mobile local setup and pre-PR checks.
-- [Non-payment roadmap](../NON_PAYMENT_ROADMAP_CHECKLIST.md) — current completion status and known gaps.
+- [Non-payment roadmap](docs/NON_PAYMENT_ROADMAP_CHECKLIST.md) — current completion status and known gaps.
 
 The backend route handlers and Zod schemas are authoritative. The former hand-maintained API catalogs were removed because they had drifted from the live route table; use the generated OpenAPI document for endpoint contracts.
