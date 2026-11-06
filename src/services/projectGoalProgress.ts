@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import prisma from '../utils/prisma';
 
 /**
@@ -5,14 +6,18 @@ import prisma from '../utils/prisma';
  * Both sides are tenant-scoped: this prevents a malformed/stale task link
  * from changing another organization's goal or including its tasks.
  */
-export async function refreshProjectGoalProgress(goalId: string, orgId: string): Promise<void> {
-  const goal = await prisma.performanceGoal.findFirst({
+export async function refreshProjectGoalProgress(
+  client: Pick<Prisma.TransactionClient, 'performanceGoal' | 'projectTask'>,
+  goalId: string,
+  orgId: string,
+): Promise<void> {
+  const goal = await client.performanceGoal.findFirst({
     where: { id: goalId, user: { org_id: orgId } },
     select: { id: true },
   });
   if (!goal) return;
 
-  const linkedTasks = await prisma.projectTask.findMany({
+  const linkedTasks = await client.projectTask.findMany({
     where: { performance_goal_id: goal.id, project: { org_id: orgId } },
     select: { status: true },
   });
@@ -22,7 +27,7 @@ export async function refreshProjectGoalProgress(goalId: string, orgId: string):
 
   // Keep the tenant condition on the write too; do not rely on the preceding
   // read as the only authorization boundary.
-  await prisma.performanceGoal.updateMany({
+  await client.performanceGoal.updateMany({
     where: { id: goal.id, user: { org_id: orgId } },
     data: { completion },
   });

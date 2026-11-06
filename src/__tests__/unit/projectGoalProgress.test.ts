@@ -15,12 +15,13 @@ const db = prisma as unknown as {
 };
 
 describe('refreshProjectGoalProgress tenant boundaries', () => {
+  const tx = db as unknown as Parameters<typeof refreshProjectGoalProgress>[0];
   beforeEach(() => jest.clearAllMocks());
 
   it('does not read tasks or write when the goal belongs to another organization', async () => {
     db.performanceGoal.findFirst.mockResolvedValue(null);
 
-    await refreshProjectGoalProgress('goal-from-org-b', 'org-a');
+    await refreshProjectGoalProgress(tx, 'goal-from-org-b', 'org-a');
 
     expect(db.performanceGoal.findFirst).toHaveBeenCalledWith({
       where: { id: 'goal-from-org-b', user: { org_id: 'org-a' } },
@@ -35,7 +36,7 @@ describe('refreshProjectGoalProgress tenant boundaries', () => {
     db.projectTask.findMany.mockResolvedValue([{ status: 'done' }, { status: 'todo' }]);
     db.performanceGoal.updateMany.mockResolvedValue({ count: 1 });
 
-    await refreshProjectGoalProgress('goal-a', 'org-a');
+    await refreshProjectGoalProgress(tx, 'goal-a', 'org-a');
 
     expect(db.projectTask.findMany).toHaveBeenCalledWith({
       where: { performance_goal_id: 'goal-a', project: { org_id: 'org-a' } },

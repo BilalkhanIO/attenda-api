@@ -305,38 +305,42 @@ router.put('/tasks/:taskId', ensureTaskUpdateAccess, idempotency, async (req, re
       ...(canManage && uniqueDependencies !== undefined && { dependencies: { deleteMany: {}, create: uniqueDependencies.map(depends_on_id => ({ depends_on_id })) } }),
       ...(status && { status, completed_at: status === 'done' ? new Date() : null }),
     };
-    let previousDependencyIds: string[] | undefined;
     const updateTask = (client: Pick<Prisma.TransactionClient, 'projectTask'>) => client.projectTask.update({
       where: { id: task.id },
       data: updateData,
       include: { assignee: { select: { id: true, name: true, avatar_url: true } } },
     });
-    const updated = uniqueDependencies === undefined
-      ? await updateTask(prisma)
-      : await prisma.$transaction(async tx => {
-          // Serialize dependency graph edits per project so concurrent edits
-          // cannot both pass the cycle check and create a loop.
-          await tx.$queryRaw`SELECT "id" FROM "projects" WHERE "id" = ${task.project_id} FOR UPDATE`;
-          const edges = await tx.projectTaskDependency.findMany({
-            where: { task: { project_id: task.project_id }, task_id: { not: task.id } },
-            select: { task_id: true, depends_on_id: true },
-          });
-          previousDependencyIds = (await tx.projectTaskDependency.findMany({
-            where: { task_id: task.id }, select: { depends_on_id: true },
-          })).map(edge => edge.depends_on_id);
-          const graph = new Map<string, string[]>();
-          for (const edge of edges) graph.set(edge.task_id, [...(graph.get(edge.task_id) ?? []), edge.depends_on_id]);
-          const reachesTask = (node: string, visited = new Set<string>()): boolean => {
-            if (node === task.id) return true;
-            if (visited.has(node)) return false;
-            visited.add(node);
-            return (graph.get(node) ?? []).some(next => reachesTask(next, visited));
-          };
-          if (uniqueDependencies.some(dependencyId => reachesTask(dependencyId))) {
-            throw new ValidationError('These dependencies would create a cycle. Remove a dependency path that leads back to this task.');
-          }
-          return updateTask(tx);
+    const { updated, previousDependencyIds } = await prisma.$transaction(async tx => {
+      let previousDependencyIds: string[] | undefined;
+      if (uniqueDependencies !== undefined) {
+        // Serialize dependency graph edits per project so concurrent edits
+        // cannot both pass the cycle check and create a loop.
+        await tx.$queryRaw`SELECT "id" FROM "projects" WHERE "id" = ${task.project_id} FOR UPDATE`;
+        const edges = await tx.projectTaskDependency.findMany({
+          where: { task: { project_id: task.project_id }, task_id: { not: task.id } },
+          select: { task_id: true, depends_on_id: true },
         });
+        previousDependencyIds = (await tx.projectTaskDependency.findMany({
+          where: { task_id: task.id }, select: { depends_on_id: true },
+        })).map(edge => edge.depends_on_id);
+        const graph = new Map<string, string[]>();
+        for (const edge of edges) graph.set(edge.task_id, [...(graph.get(edge.task_id) ?? []), edge.depends_on_id]);
+        const reachesTask = (node: string, visited = new Set<string>()): boolean => {
+          if (node === task.id) return true;
+          if (visited.has(node)) return false;
+          visited.add(node);
+          return (graph.get(node) ?? []).some(next => reachesTask(next, visited));
+        };
+        if (uniqueDependencies.some(dependencyId => reachesTask(dependencyId))) {
+          throw new ValidationError('These dependencies would create a cycle. Remove a dependency path that leads back to this task.');
+        }
+      }
+      const updated = await updateTask(tx);
+      if (updated.performance_goal_id) {
+        await refreshProjectGoalProgress(tx, updated.performance_goal_id, req.user!.org_id);
+      }
+      return { updated, previousDependencyIds };
+    });
     if (Object.keys(updateData).length > 0) {
       recordAudit({
         orgId: req.user!.org_id,
@@ -353,9 +357,6 @@ router.put('/tasks/:taskId', ensureTaskUpdateAccess, idempotency, async (req, re
     }
     if (status && status !== task.status && task.assignee_id && task.assignee_id !== req.user!.sub) {
       createNotification({ userId: task.assignee_id, orgId: req.user!.org_id, type: 'project_task_updated', title: 'A project task changed', body: `${updated.title} · ${status.replace('_', ' ')}`, actionType: 'project_task', actionId: updated.id }).catch(() => {});
-    }
-    if (updated.performance_goal_id) {
-      await refreshProjectGoalProgress(updated.performance_goal_id, req.user!.org_id);
     }
     emitOrgEvent(req.user!.org_id, 'project_changed');
     ok(res, updated);
