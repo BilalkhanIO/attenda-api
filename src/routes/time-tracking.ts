@@ -7,7 +7,8 @@ import { recordAudit } from '../services/audit';
 import { resolveUserPermissions } from '../services/authorization';
 import { createNotification, emitOrgEvent } from '../services/notifications';
 import { reviewApproval } from '../services/approval-workflows';
-import { dateOnlyInTz } from '../utils/shift';
+import { dateOnlyInTz, localDateStr } from '../utils/shift';
+import { currentLocalWeekStart, localWeekRange } from '../utils/localWeek';
 import type { Prisma } from '@prisma/client';
 
 const router = Router();
@@ -34,11 +35,13 @@ function asDate(value: unknown, label: string): Date {
   if (!Number.isFinite(date.getTime())) throw new ValidationError(`${label} must be a valid date`);
   return date;
 }
-function weekRange(value: unknown) {
-  const start = asDate(value, 'week_start');
-  if (start.getUTCDay() !== 1 || start.toISOString().slice(11, 19) !== '00:00:00') throw new ValidationError('week_start must be a Monday at 00:00 UTC');
-  const end = new Date(start); end.setUTCDate(end.getUTCDate() + 7);
-  return { start, end };
+async function workTimezone(orgId: string, userId: string) {
+  const user = await prisma.user.findFirst({
+    where: { id: userId, org_id: orgId },
+    select: { primary_location: { select: { timezone: true } }, org: { select: { timezone: true } } },
+  });
+  if (!user) throw new NotFoundError('Employee');
+  return user.primary_location?.timezone ?? user.org.timezone ?? 'UTC';
 }
 async function attendanceForWorkDate(orgId: string, userId: string, at: Date) {
   const user = await prisma.user.findFirst({
@@ -212,39 +215,44 @@ router.put('/entries/:id', requirePermission('time.view'), idempotency, async (r
 
 router.get('/timesheets/me', requirePermission('time.view'), async (req, res, next) => {
   try {
-    const { start, end } = weekRange(req.query.week_start);
-    const [timesheet, entries, attendance] = await Promise.all([
-      prisma.timesheet.findUnique({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: start } } }),
-      prisma.timeEntry.findMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, started_at: { gte: start, lt: end } }, include: { project: { select: { id: true, name: true } }, task: { select: { id: true, title: true } } }, orderBy: { started_at: 'asc' } }),
-      prisma.attendanceRecord.findMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, date: { gte: start, lt: end } }, select: { date: true, net_hours_worked: true, hours_worked: true } }),
+    const timezone = await workTimezone(req.user!.org_id, req.user!.sub);
+    const weekStart = req.query.week_start ?? currentLocalWeekStart(new Date(), timezone).toISOString();
+    const week = localWeekRange(weekStart, timezone);
+    const [timesheet, entryRows, attendance] = await Promise.all([
+      prisma.timesheet.findUnique({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: week.startDate } } }),
+      prisma.timeEntry.findMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, started_at: { gte: week.startInstant, lt: week.endInstant } }, include: { project: { select: { id: true, name: true } }, task: { select: { id: true, title: true } } }, orderBy: { started_at: 'asc' } }),
+      prisma.attendanceRecord.findMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, date: { gte: week.startDate, lt: week.endDate } }, select: { date: true, net_hours_worked: true, hours_worked: true } }),
     ]);
     const loggedByDay = new Map<string, number>();
-    for (const entry of entries) {
-      const day = entry.started_at.toISOString().slice(0, 10);
+    for (const entry of entryRows) {
+      const day = localDateStr(entry.started_at, timezone);
       loggedByDay.set(day, (loggedByDay.get(day) ?? 0) + entry.minutes);
     }
     const attendanceByDay = new Map(attendance.map(row => [row.date.toISOString().slice(0, 10), Math.round(Number(row.net_hours_worked ?? row.hours_worked ?? 0) * 60)]));
     const allocationWarnings = [...loggedByDay].filter(([day, minutes]) => minutes > (attendanceByDay.get(day) ?? 0)).map(([date, logged_minutes]) => ({ date, logged_minutes, attendance_minutes: attendanceByDay.get(date) ?? 0 }));
-    ok(res, { timesheet, entries, total_minutes: entries.reduce((sum, item) => sum + item.minutes, 0), allocation_warnings: allocationWarnings });
+    const entries = entryRows.map(entry => ({ ...entry, work_date: localDateStr(entry.started_at, timezone) }));
+    ok(res, { timesheet, entries, timezone, week_start: week.startDate.toISOString(), total_minutes: entries.reduce((sum, item) => sum + item.minutes, 0), allocation_warnings: allocationWarnings });
   } catch (error) { next(error); }
 });
 
 router.post('/timesheets/submit', requirePermission('time.view'), idempotency, async (req, res, next) => {
   try {
-    const { start, end } = weekRange(req.body.week_start);
+    const timezone = await workTimezone(req.user!.org_id, req.user!.sub);
+    const weekStart = req.body.week_start ?? currentLocalWeekStart(new Date(), timezone).toISOString();
+    const week = localWeekRange(weekStart, timezone);
     const sheet = await prisma.$transaction(async tx => {
       await lockUserTimeEntries(tx, req.user!.org_id, req.user!.sub);
-      const pendingTimer = await tx.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null, started_at: { gte: start, lt: end } }, select: { id: true } });
+      const pendingTimer = await tx.timeEntry.findFirst({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, ended_at: null, started_at: { gte: week.startInstant, lt: week.endInstant } }, select: { id: true } });
       if (pendingTimer) throw new ValidationError('Stop the running timer before submitting this week');
-      const existing = await tx.timesheet.findUnique({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: start } } });
+      const existing = await tx.timesheet.findUnique({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: week.startDate } } });
       if (existing?.status === 'approved' || existing?.status === 'locked') throw new ValidationError('This timesheet is already approved and locked');
       if (existing?.status === 'submitted') throw new AppError('This timesheet is already awaiting review.', 409, 'TIMESHEET_ALREADY_SUBMITTED');
-      const submittedEntries = await tx.timeEntry.updateMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, started_at: { gte: start, lt: end }, status: { in: ['draft', 'rejected'] }, ended_at: { not: null } }, data: { status: 'submitted' } });
+      const submittedEntries = await tx.timeEntry.updateMany({ where: { org_id: req.user!.org_id, user_id: req.user!.sub, started_at: { gte: week.startInstant, lt: week.endInstant }, status: { in: ['draft', 'rejected'] }, ended_at: { not: null } }, data: { status: 'submitted' } });
       if (!submittedEntries.count) throw new ValidationError('Add at least one completed, editable time entry before submitting');
-      return tx.timesheet.upsert({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: start } }, create: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: start, status: 'submitted', submitted_at: new Date() }, update: { status: 'submitted', submitted_at: new Date(), reviewed_by: null, reviewed_at: null, review_note: null } });
+      return tx.timesheet.upsert({ where: { org_id_user_id_week_start: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: week.startDate } }, create: { org_id: req.user!.org_id, user_id: req.user!.sub, week_start: week.startDate, status: 'submitted', submitted_at: new Date() }, update: { status: 'submitted', submitted_at: new Date(), reviewed_by: null, reviewed_at: null, review_note: null } });
     });
-    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'timesheet.submit', entityType: 'timesheet', entityId: sheet.id, after: { week_start: start.toISOString() } });
-    notifyTimesheetApprovers(req.user!.org_id, req.user!.sub, sheet.id, start).catch(() => {});
+    recordAudit({ orgId: req.user!.org_id, actorId: req.user!.sub, action: 'timesheet.submit', entityType: 'timesheet', entityId: sheet.id, after: { week_start: week.startDate.toISOString() } });
+    notifyTimesheetApprovers(req.user!.org_id, req.user!.sub, sheet.id, week.startDate).catch(() => {});
     emitOrgEvent(req.user!.org_id, 'timesheet_changed');
     created(res, sheet);
   } catch (error) { next(error); }

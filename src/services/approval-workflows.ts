@@ -9,6 +9,7 @@ import { dateOnlyInTz } from '../utils/shift';
 import { decodeCursor, encodeCursor, keysetAfterAscending } from '../utils/cursor';
 import { holidaySetForRange } from './holidays';
 import { reviewableEmployeeIds } from './locationScope';
+import { localWeekRange } from '../utils/localWeek';
 
 export type ApprovalType = 'leave' | 'overtime' | 'remote' | 'swap' | 'late_notice' | 'expense' | 'correction' | 'timesheet';
 export type ApprovalAction = 'approve' | 'reject' | 'acknowledge';
@@ -448,16 +449,16 @@ export async function reviewApproval(
     summary = `${requesterName}'s attendance correction was ${actionPast}`;
     audit = undefined;
   } else if (type === 'timesheet') {
-    const sheet = await prisma.timesheet.findFirst({ where: { id, org_id: viewer.orgId, status: 'submitted' }, include: { user: { select: { id: true, name: true } } } });
+    const sheet = await prisma.timesheet.findFirst({ where: { id, org_id: viewer.orgId, status: 'submitted' }, include: { user: { select: { id: true, name: true, primary_location: { select: { timezone: true } }, org: { select: { timezone: true } } } } } });
     if (!sheet) throw new NotFoundError('Submitted timesheet');
     await assertReviewerScope(viewer, type, sheet.user_id);
     if (sheet.user_id === viewer.userId) throw new AppError('You cannot approve your own timesheet.', 403, 'MAKER_CHECKER_REQUIRED');
-    const end = new Date(sheet.week_start); end.setUTCDate(end.getUTCDate() + 7);
+    const week = localWeekRange(sheet.week_start.toISOString(), sheet.user.primary_location?.timezone ?? sheet.user.org.timezone ?? 'UTC');
     const targetStatus = action === 'approve' ? 'locked' : 'rejected';
     await prisma.$transaction(async tx => {
       const changed = await tx.timesheet.updateMany({ where: { id, org_id: viewer.orgId, status: 'submitted' }, data: { status: targetStatus, reviewed_by: viewer.userId, reviewed_at: now, review_note: action === 'reject' ? reason : note } });
       if (!changed.count) throw new ValidationError('This timesheet has already been reviewed');
-      await tx.timeEntry.updateMany({ where: { org_id: viewer.orgId, user_id: sheet.user_id, started_at: { gte: sheet.week_start, lt: end }, status: 'submitted' }, data: { status: targetStatus } });
+      await tx.timeEntry.updateMany({ where: { org_id: viewer.orgId, user_id: sheet.user_id, started_at: { gte: week.startInstant, lt: week.endInstant }, status: 'submitted' }, data: { status: targetStatus } });
     });
     requesterId = sheet.user_id; requesterName = sheet.user.name; event = 'timesheet_changed';
     notification = { type: action === 'approve' ? 'timesheet_approved' : 'timesheet_rejected', title: `Timesheet ${actionPast}`, body: action === 'approve' ? 'Your timesheet was approved and locked.' : `Your timesheet was returned: ${reason}`, actionType: 'timesheet' };
